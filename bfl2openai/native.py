@@ -247,7 +247,8 @@ def register(app: FastAPI) -> None:
                 if resolution in COMPOSITE_TIERS:
                     _COMPOSITES[poll_token] = {"phase": "gen", "target": resolution}
             else:
-                # text-to-image: no verified playground path; surfaced verbatim.
+                # text-to-image: verified 2026-10-09 (mode t2i, no image part,
+                # explicit aspect ratio -- "auto" is canvas-only semantics).
                 poll_token = await upstream.submit_generation(
                     image_png=b"",
                     prompt=prompt,

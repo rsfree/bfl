@@ -179,10 +179,21 @@ async def submit_generation(
         ("boxes", json.dumps(boxes or [])),
         ("references", json.dumps(references or [])),
     ]
+    if not image_png and aspect_ratio == "auto":
+        # "auto" means "derive from the canvas" -- without one the upstream
+        # demands an explicit ratio ("Choose an aspect ratio for the canvas.",
+        # measured 2026-10-09). Square is the neutral t2i default (t2i
+        # verified live the same day: 4k composite produced a real landscape).
+        fields[2] = ("aspectRatio", "1:1")
     mp = CurlMime()
     for name, value in fields:
         mp.addpart(name=name, data=str(value).encode())
-    mp.addpart(name="image", filename="image.png", content_type="image/png", data=image_png)
+    if image_png:
+        # An empty image part is NOT "no image": upstream answers
+        # 400 "A composition must not include a canvas image." (measured
+        # 2026-10-09 on a t2i attempt). Omit the part entirely instead.
+        mp.addpart(name="image", filename="image.png", content_type="image/png",
+                   data=image_png)
     async with _session() as s:
         r = await s.post(
             f"{base_url}/api/flux3-image/generate",
