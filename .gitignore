@@ -1,0 +1,28 @@
+# 凭证（生产配置，绝不入库）
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 会话记忆（工作区内部笔记）
+.workbuddy/
+
+# macOS
+.DS_Store
+
+# 大体积测试产物（可复现，不入库）
+tests/upscaled_4k_result.png
+tests/imageadapter_e2e_result.png
+tests/e2e_result*.png
+tests/e2e_response.json
+tests/smoke_response.json
+tests/smoke_result.png
+# 子目录修正：bfl2openai/tests 下的大产物
+bfl2openai/tests/upscaled_4k_result.png
+bfl2openai/tests/imageadapter_e2e_result.png
+bfl2openai/tests/e2e_result*.png
+bfl2openai/tests/e2e_response.json
+bfl2openai/tests/smoke_response.json
+bfl2openai/tests/smoke_result.png
