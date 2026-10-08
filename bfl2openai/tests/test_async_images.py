@@ -57,6 +57,9 @@ async def _ok_wait(token):
 def test_accept_returns_202_with_location(client, monkeypatch):
     monkeypatch.setattr(native, "_reference_png", lambda ref: RAW)
     monkeypatch.setattr(async_images, "native_submit", _ok_submit)
+    async def fake_media(token, base=None):
+        return RAW
+    monkeypatch.setattr(upstream, "fetch_media", fake_media)
     monkeypatch.setattr(upstream, "wait_for_result", _ok_wait)
     r = client.post("/async/v1/images/generations",
                     json={"prompt": "x", "images": [DATA_URI]})
@@ -105,6 +108,9 @@ def test_failure_answers_200_with_error(client, monkeypatch):
         raise upstream.UpstreamError("upstream exploded")
 
     monkeypatch.setattr(async_images, "native_submit", boom)
+    async def fail_media(token, base=None):
+        return RAW
+    monkeypatch.setattr(upstream, "fetch_media", fail_media)
     r = client.post("/async/v1/images/generations", json={"prompt": "x"})
     tid = r.json()["task_id"]
     import time as _t
@@ -122,6 +128,9 @@ def test_failure_answers_200_with_error(client, monkeypatch):
 
 def test_credential_isolation_on_get_and_list(client, monkeypatch):
     monkeypatch.setattr(async_images, "native_submit", _ok_submit)
+    async def fake_media(token, base=None):
+        return RAW
+    monkeypatch.setattr(upstream, "fetch_media", fake_media)
     monkeypatch.setattr(upstream, "wait_for_result", _ok_wait)
     r = client.post("/async/v1/images/generations", json={"prompt": "x"},
                     headers={"x-key": "key-A"})

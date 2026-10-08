@@ -15,8 +15,9 @@ services:
     user: "10001:10001"
     ports:
       - "127.0.0.1:39100:8000"           # 仅回环；公网入口走 bfl.1task.cn（nginx）
-    volumes:
-      - ./.env:/app/bfl2openai/.env:ro   # TENCENT_API_KEY / MPS_* / FALLBACK_PROXY
+    env_file: ./.env                    # 凭证/回退代理/PUBLIC_BASE 注入容器环境
+                                        # （compose 相对路径 = 本文件目录；
+                                        #   挂载文件的做法踩过红线 9：源不存在会被建目录）
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
       interval: 30s

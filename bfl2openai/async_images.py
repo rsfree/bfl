@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from typing import Any
@@ -47,6 +48,8 @@ from . import upscale as mps
 from .bridging import parse_boxes
 
 log = logging.getLogger("bfl2openai.async_images")
+
+PUBLIC_BASE = os.environ.get("BFL2OPENAI_PUBLIC_BASE", "").rstrip("/")
 
 _TASKS: dict[str, dict] = {}          # task_id -> record
 _ORDER: list[str] = []                # submission order, for listing
@@ -74,8 +77,8 @@ def _view(rec: dict) -> tuple[int, dict[str, Any]]:
     if status == "canceled":
         return 200, {"task_id": tid, "status": "canceled"}
     usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    return 200, {"id": tid, "created": rec["created"], "data": rec["data"],
-                 "usage": usage}
+    return 200, {"id": tid, "status": "success", "created": rec["created"],
+                 "data": rec["data"], "usage": usage}
 
 
 def _get_for_credential(task_id: str, credential: str) -> dict | None:
@@ -111,8 +114,9 @@ async def _run_task(task_id: str, payload: dict) -> None:
             sign_url = await mps.wait_done(mps_task)
             data = {"url": sign_url}  # managed COS link, ~1h validity
         else:
-            data = {"url": (f"https://flux-tools.bfl.ai/api/flux3-image"
-                            f"/media?imageToken={image_token}")}
+            # 永远不出上游原始链接：media token 短时效 + 直拉会被 429。
+            # 指到本服务的结果代理（curl_cffi 重试 + 池回退内建）。
+            data = {"url": f"{rec['base']}/v1/flux3-image/results/{image_token}"}
 
         rec["status"] = "success"
         rec["data"] = [data]
@@ -185,6 +189,7 @@ def register(app: FastAPI) -> None:
             _TASKS.pop(_ORDER.pop(0), None)
         rec = {
             "task_id": task_id, "credential": credential,
+            "base": PUBLIC_BASE or str(request.base_url).rstrip("/"),
             "status": "queued", "resolution": resolution,
             "upscale_to": upscale_to, "payload": payload,
             "created": int(time.time()), "data": [], "error": None,
