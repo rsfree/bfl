@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Resolve next version
+        id: ver
+        run: |
+          set -euo pipefail
+          PREV=$(git tag --list 'v*.*.*' --sort=-v:refname | head -n1 || true)
+          BASE=${PREV:-v0.0.0}
+          IFS=. read -r MA MI PA <<< "${BASE#v}"
+          NEW="v${MA}.${MI}.$((PA + 1))"
+          echo "prev=${PREV}" >> "$GITHUB_OUTPUT"
+          echo "next=${NEW}" >> "$GITHUB_OUTPUT"
+          echo "Previous: ${PREV:-<none>} -> Next: ${NEW}"
+
+      - name: Build changelog
+        id: log
+        run: |
+          set -euo pipefail
+          PREV='${{ steps.ver.outputs.prev }}'
+          if [ -z "$PREV" ]; then RANGE=HEAD; else RANGE="${PREV}..HEAD"; fi
+          {
+            echo 'body<<CHANGELOG_EOF'
+            echo '## Changes'
+            git log "$RANGE" --pretty='- %s (%h)' --no-merges || echo '- Initial release'
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Verify artifacts
+        run: |
+          set -euo pipefail
+          test -d dist || { echo "::error::dist/ not found after build"; exit 1; }
+          [ -n "$(ls -A dist)" ] || { echo "::error::dist/ is empty"; exit 1; }
+          ls -la dist
+
+      - name: Create tag
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -a '${{ steps.ver.outputs.next }}' -m 'Release ${{ steps.ver.outputs.next }}'
+          git push origin '${{ steps.ver.outputs.next }}'
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create '${{ steps.ver.outputs.next }}' \
+            --title 'Release ${{ steps.ver.outputs.next }}' \
+            --notes '${{ steps.log.outputs.body }}' \
+            dist/*
+
+      - name: Move latest tag
+        run: |
+          set -euo pipefail
+          git tag -f latest '${{ steps.ver.outputs.next }}'
+          git push -f origin latest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ steps.ver.outputs.next }}
+          path: dist/
+          retention-days: 30

@@ -26,3 +26,6 @@ bfl2openai/tests/e2e_result*.png
 bfl2openai/tests/e2e_response.json
 bfl2openai/tests/smoke_response.json
 bfl2openai/tests/smoke_result.png
+
+# 构建产物
+dist/
