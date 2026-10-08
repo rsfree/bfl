@@ -70,6 +70,8 @@ from . import uploads as uploads_mod
 
 log = logging.getLogger("bfl2openai.native")
 
+PUBLIC_BASE = os.environ.get("BFL2OPENAI_PUBLIC_BASE", "").rstrip("/")
+
 NATIVE_API_KEY = os.environ.get("BFL_NATIVE_API_KEY", "")  # optional enforcement
 RESOLUTIONS = ("768sq", "1k", "1.5k", "2k", "4k")
 MAX_IMAGES = 10
@@ -291,7 +293,9 @@ def register(app: FastAPI) -> None:
         out = {"id": id, "progress": None, "details": None, "preview": None}
         if status == "ready":
             out["status"] = "Ready"
-            base = str(request.base_url).rstrip("/")
+            # PUBLIC_BASE 优先：nginx 后面 request.base_url 会是 http，
+            # 交给调用方一个 http 链接会在 :80 吃 301（矩阵测试实测）。
+            base = PUBLIC_BASE or str(request.base_url).rstrip("/")
             out["result"] = {
                 "sample": f"{base}/v1/flux3-image/results/{state['imageToken']}"
             }
