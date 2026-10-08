@@ -32,6 +32,7 @@ import logging
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from curl_cffi import CurlMime
@@ -45,10 +46,32 @@ POLL_TIMEOUT_S = 300.0
 SUBMIT_TIMEOUT_S = 120.0
 MEDIA_TIMEOUT_S = 300.0
 
+
+def _load_project_env() -> None:
+    """Reads the deployment .env next to the package (missing file is fine).
+
+    Runs at import so every module-level env read below (FALLBACK_PROXY
+    included) sees the file. Real environment variables win: setdefault.
+    """
+    path = Path(__file__).resolve().parent / ".env"
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_project_env()
+
 #: Optional fallback egress for resilient GETs (media / reference fetches).
 #: When the direct attempts exhaust themselves on 429/403/503, the same GET
 #: retries through this proxy (a rotating pool URL works: new exit IP + fresh
-#: session). Empty = direct retries only.
+#: session). Empty = direct retries only. The pool's verified spelling is
+#: socks5h (its HTTP entry is flaky; measured 2026-10-09):
+#:   socks5h://<user>:<pass>@pool.livetest.cn:2088
 FALLBACK_PROXY = os.environ.get("BFL2OPENAI_FALLBACK_PROXY", "")
 
 _DIRECT_ATTEMPTS = 3

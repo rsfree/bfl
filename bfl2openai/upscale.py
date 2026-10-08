@@ -42,7 +42,6 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from . import upstream
@@ -53,26 +52,8 @@ HOST = "mps.tencentcloudapi.com"
 SERVICE = "mps"
 VERSION = "2019-06-12"
 
-
-def _load_project_env() -> None:
-    """Reads the deployment .env next to the package (missing file is fine).
-
-    Production keeps credentials here: the file is chmod 600 and lives in the
-    project directory. Real environment variables win over .env values
-    (setdefault), so an operator override stays possible without edits.
-    """
-    path = Path(__file__).resolve().parent / ".env"
-    if not path.is_file():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-_load_project_env()
+# the deployment .env is loaded by `upstream` at import (this module imports
+# it above), so the reads below already see TENCENT_API_KEY and friends.
 
 SECRET_ID = os.environ.get("MPS_SECRET_ID", "")
 SECRET_KEY = os.environ.get("MPS_SECRET_KEY", "")
