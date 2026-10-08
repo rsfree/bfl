@@ -20,7 +20,24 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from bfl2openai import async_images, native, upstream, upscale  # noqa: E402
+from bfl2openai import async_images, native, upstream, upscale
+
+async def _fake_media(image_token, base_url=None):
+    return RAW
+
+
+def _fake_cos(monkeypatch):
+    monkeypatch.setattr(upscale, "upload_to_cos", _fake_cos_upload)
+    monkeypatch.setattr(upscale, "cos_presigned_get",
+                        lambda path, ttl_s=3600: f"https://cos.example{path}?sig=1")
+
+
+async def _fake_cos_upload(data, object_key):
+    COS_UPLOADED.append(object_key)
+
+
+COS_UPLOADED: list[str] = []
+  # noqa: E402
 
 RAW = b"\x89PNG-clip"
 
@@ -46,7 +63,7 @@ def uploads_clean():
         uploads_mod_store._REFS.clear()
 
 
-async def _ok_submit(**kw):
+async def _ok_submit(*a, **kw):
     return "poll-tok"
 
 
@@ -55,11 +72,10 @@ async def _ok_wait(token):
 
 
 def test_accept_returns_202_with_location(client, monkeypatch):
+    _fake_cos(monkeypatch)
     monkeypatch.setattr(native, "_reference_png", lambda ref: RAW)
     monkeypatch.setattr(async_images, "native_submit", _ok_submit)
-    async def fake_media(token, base=None):
-        return RAW
-    monkeypatch.setattr(upstream, "fetch_media", fake_media)
+    monkeypatch.setattr(upstream, "fetch_media", _fake_media)
     monkeypatch.setattr(upstream, "wait_for_result", _ok_wait)
     r = client.post("/async/v1/images/generations",
                     json={"prompt": "x", "images": [DATA_URI]})
@@ -108,9 +124,7 @@ def test_failure_answers_200_with_error(client, monkeypatch):
         raise upstream.UpstreamError("upstream exploded")
 
     monkeypatch.setattr(async_images, "native_submit", boom)
-    async def fail_media(token, base=None):
-        return RAW
-    monkeypatch.setattr(upstream, "fetch_media", fail_media)
+    monkeypatch.setattr(upstream, "fetch_media", _fake_media)
     r = client.post("/async/v1/images/generations", json={"prompt": "x"})
     tid = r.json()["task_id"]
     import time as _t
@@ -127,10 +141,9 @@ def test_failure_answers_200_with_error(client, monkeypatch):
 
 
 def test_credential_isolation_on_get_and_list(client, monkeypatch):
+    _fake_cos(monkeypatch)
     monkeypatch.setattr(async_images, "native_submit", _ok_submit)
-    async def fake_media(token, base=None):
-        return RAW
-    monkeypatch.setattr(upstream, "fetch_media", fake_media)
+    monkeypatch.setattr(upstream, "fetch_media", _fake_media)
     monkeypatch.setattr(upstream, "wait_for_result", _ok_wait)
     r = client.post("/async/v1/images/generations", json={"prompt": "x"},
                     headers={"x-key": "key-A"})
@@ -177,3 +190,48 @@ def uploads_store(data: bytes, name: str, ordinal: int):
     uploads._REFS.clear()
     return uploads.store_upload(data, name, ordinal)
 
+
+
+def test_success_uploads_to_cos_and_returns_presigned(client, monkeypatch):
+    COS_UPLOADED.clear()
+    _fake_cos(monkeypatch)
+    monkeypatch.setattr(async_images, "native_submit", _ok_submit)
+    monkeypatch.setattr(upstream, "fetch_media", _fake_media)
+    monkeypatch.setattr(upstream, "wait_for_result", _ok_wait)
+    r = client.post("/async/v1/images/generations",
+                    json={"prompt": "x", "images": [DATA_URI], "resolution": "2k"})
+    tid = r.json()["task_id"]
+    import time as _t
+
+    body = None
+    for _ in range(50):
+        rr = client.get(f"/async/v1/images/generations/{tid}")
+        body = rr.json()
+        if rr.status_code != 202:
+            break
+        _t.sleep(0.05)
+    assert body["status"] == "success"
+    assert body["data"][0]["url"].startswith("https://cos.example/results/")
+    assert COS_UPLOADED and COS_UPLOADED[0].startswith("results/")
+
+
+def test_success_without_cos_falls_back_to_proxy(client, monkeypatch):
+    monkeypatch.setattr(upscale, "SECRET_ID", "")
+    monkeypatch.setattr(upscale, "SECRET_KEY", "")
+    monkeypatch.setattr(async_images, "native_submit", _ok_submit)
+    monkeypatch.setattr(upstream, "fetch_media", _fake_media)
+    monkeypatch.setattr(upstream, "wait_for_result", _ok_wait)
+    r = client.post("/async/v1/images/generations",
+                    json={"prompt": "x", "images": [DATA_URI], "resolution": "1k"})
+    tid = r.json()["task_id"]
+    import time as _t
+
+    body = None
+    for _ in range(50):
+        rr = client.get(f"/async/v1/images/generations/{tid}")
+        body = rr.json()
+        if rr.status_code != 202:
+            break
+        _t.sleep(0.05)
+    assert body["status"] == "success"
+    assert "/v1/flux3-image/results/" in body["data"][0]["url"]

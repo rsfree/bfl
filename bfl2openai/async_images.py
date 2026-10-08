@@ -114,9 +114,16 @@ async def _run_task(task_id: str, payload: dict) -> None:
             sign_url = await mps.wait_done(mps_task)
             data = {"url": sign_url}  # managed COS link, ~1h validity
         else:
-            # 永远不出上游原始链接：media token 短时效 + 直拉会被 429。
-            # 指到本服务的结果代理（curl_cffi 重试 + 池回退内建）。
-            data = {"url": f"{rec['base']}/v1/flux3-image/results/{image_token}"}
+            # 永远不出上游原始链接：media token 分钟级过期（实测 3 分钟即
+            # "Invalid or expired"）且直拉会被 429。COS 凭证在 ⇒ 结果落桶出
+            # 24h 预签名链（与 4k 复合一致）；无凭证时退回本服务结果代理。
+            media = await upstream.fetch_media(image_token)
+            if mps.configured():
+                key = f"results/{image_token[:16]}.png"
+                await mps.upload_to_cos(media, key)
+                data = {"url": mps.cos_presigned_get("/" + key, ttl_s=86400)}
+            else:
+                data = {"url": f"{rec['base']}/v1/flux3-image/results/{image_token}"}
 
         rec["status"] = "success"
         rec["data"] = [data]

@@ -29,3 +29,6 @@ bfl2openai/tests/smoke_result.png
 
 # 构建产物
 dist/
+
+# 本地留存的大图（不入库）
+saved_images/
