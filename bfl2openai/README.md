@@ -26,6 +26,28 @@
 未配置时 4k/8k 请求返回 503（**在任何生成消耗之前**拒绝）。参考设计：image-adapter
 `docs/08`（归档于 `../analysis/image-adapter-draft/`，本项目为独立实现）。
 
+## 上传句柄与异步任务（jimeng 形状）
+
+```
+POST /v1/uploads                            multipart file（可重复）
+→ {"files":[{"id","ref":"@image#1:Clipboard_Screenshot.png","filename","size","expires_in":3600}]}
+
+POST /async/v1/images/generations           受理：202 + {"task_id"} + Location
+                                            body = 原生 generate 形状；prompt 里可写
+                                            "@image#1:Clipboard_Screenshot.png" 句柄
+                                            （受理时即改写为 BFL <ref_image_K> 并并入 images）
+GET  /async/v1/images/generations/{task_id} 非终态 202 {task_id,status}；
+                                            success 200 {data:[{url}],created,usage}；
+                                            failure 200 {task_id,status:"failure",error}；
+                                            未知 404（存在性与属主合并，不泄漏）
+GET  /async/v1/images/generations           本凭证任务列表
+DELETE /async/v1/images/generations/{task}  终态才可删；in-flight 400（上游无取消）
+```
+
+任务五态：`queued / in_progress / success / failure / canceled`（顶层 status 一个字段判全程；
+失败也是 200，HTTP 5xx 会误触调用方重试）。句柄与任务都是**进程内存**（TTL 1h / 重启即失），
+要持久资产请直接传 URL/base64。鉴权：跟随全局开关（默认关）；属主按凭证指纹隔离。
+
 ## 弹性（拉取回退：重试 + 代理）
 
 所有对上游的 GET（media 取图、引用图下载）走 `_resilient_get`：

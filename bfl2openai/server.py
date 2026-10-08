@@ -30,6 +30,8 @@ from fastapi.responses import JSONResponse, Response
 from . import upstream
 from . import native
 from . import upscale as mps
+from . import uploads
+from . import async_images
 from .bridging import image_to_png, mask_to_boxes, parse_boxes, size_to_aspect_ratio
 from .upstream import UpstreamError
 
@@ -38,6 +40,8 @@ log = logging.getLogger("bfl2openai")
 
 app = FastAPI(title="bfl2openai", version="0.2.0")
 native.register(app)
+uploads.register(app)
+async_images.register(app)
 
 MODEL_ID = os.environ.get("BFL2OPENAI_MODEL", "flux-precise-edit")
 API_KEY = os.environ.get("BFL2OPENAI_API_KEY", "")  # optional; empty = auth disabled

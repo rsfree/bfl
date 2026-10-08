@@ -66,6 +66,7 @@ from PIL import Image
 
 from . import upstream
 from . import upscale as mps
+from . import uploads as uploads_mod
 
 log = logging.getLogger("bfl2openai.native")
 
@@ -192,6 +193,22 @@ def register(app: FastAPI) -> None:
                 status_code=422,
                 content={"detail": [{"loc": ["body", "images"],
                                      "msg": f"at most {MAX_IMAGES} images"}]},
+            )
+
+        # `@image#N:name` handles from /v1/uploads: rewritten into the BFL
+        # `<ref_image_K>` placeholders (layout convention) and appended to
+        # images after any caller-supplied ones.
+        try:
+            prompt, refs = uploads_mod.resolve_handles(prompt, refs or None)
+            refs = refs or []
+        except HTTPException:
+            raise
+        if len(refs) > MAX_IMAGES:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": [{"loc": ["body", "images"],
+                                     "msg": f"at most {MAX_IMAGES} images "
+                                            f"(uploads included)"}]},
             )
 
         boxes_raw = payload.get("bounding_boxes")

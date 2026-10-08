@@ -1,0 +1,24 @@
+# bfl2openai · ai-prod 部署声明（2026-10-09）
+#
+# 端口只绑回环（红线）：公网入口一律 nginx + bfl.1task.cn（见 nginx/）。
+# 镜像走「服务器构建」路径（无 GHCR 镜像）：context 指向仓库根（Dockerfile 在根）。
+# .env（凭证 + 回退代理）只挂载不进镜像；宿主上 chown root:10001 + chmod 640。
+name: bfl2openai
+
+services:
+  bfl2openai:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: bfl2openai
+    restart: unless-stopped
+    user: "10001:10001"
+    ports:
+      - "127.0.0.1:39100:8000"           # 仅回环；公网入口走 bfl.1task.cn（nginx）
+    volumes:
+      - ./.env:/app/bfl2openai/.env:ro   # TENCENT_API_KEY / MPS_* / FALLBACK_PROXY
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
