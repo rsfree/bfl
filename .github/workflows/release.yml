@@ -68,7 +68,9 @@ jobs:
           set -euo pipefail
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git tag -a '${{ steps.ver.outputs.next }}' -m 'Release ${{ steps.ver.outputs.next }}'
+          # 幂等：重跑时 tag 已存在不炸（Release 步骤自带幂等）
+          git rev-parse -q --verify "refs/tags/${{ steps.ver.outputs.next }}" \
+            || git tag -a '${{ steps.ver.outputs.next }}' -m 'Release ${{ steps.ver.outputs.next }}'
           git push origin '${{ steps.ver.outputs.next }}'
 
       - name: Create GitHub Release
@@ -76,9 +78,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # 幂等 + 防引号注入：notes 走文件（commit message 里的撇号曾打断
+          # --notes '...' 的引号，整条发版链挂在 zsh "no matches found" 上）
+          if gh release view '${{ steps.ver.outputs.next }}' >/dev/null 2>&1; then
+            echo "release ${{ steps.ver.outputs.next }} already exists -- skip"
+            exit 0
+          fi
+          echo '${{ steps.log.outputs.body }}' > /tmp/release_notes.md
           gh release create '${{ steps.ver.outputs.next }}' \
             --title 'Release ${{ steps.ver.outputs.next }}' \
-            --notes '${{ steps.log.outputs.body }}' \
+            --notes-file /tmp/release_notes.md \
             dist/*
 
       - name: Move latest tag
