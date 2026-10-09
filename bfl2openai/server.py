@@ -102,7 +102,8 @@ async def run_job(
     upscale_to: int | None = None,
 ) -> JSONResponse:
     async def one() -> dict[str, str]:
-        gen_resolution = "2k" if upscale_to else resolution
+        gen_resolution = bridging.ensure_resolution_capacity(
+            aspect_ratio, "2k" if upscale_to else resolution)
         poll_token = await upstream.submit_generation(
             image_png=image_png or b"",
             prompt=prompt,

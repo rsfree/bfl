@@ -269,3 +269,15 @@ def test_native_poll_maps_states(client, monkeypatch):
     body = r.json()
     assert body["status"] == "Error"
     assert body["details"]["error"] == "bad token"
+
+
+def test_ensure_resolution_capacity_lifts_1k_wide():
+    from bfl2openai.bridging import ensure_resolution_capacity as cap
+
+    assert cap("1:1", "1k") == "1k"       # 1.05MP，预算内
+    assert cap("3:2", "1k") == "1k"       # 1.04MP，实测可行
+    assert cap("16:9", "1k") == "2k"      # 1.86MP，实测作废 → 自动升档
+    assert cap("9:16", "1k") == "2k"
+    assert cap("16:9", "2k") == "2k"      # 2k 预算内
+    assert cap("16:9", "4k") == "4k"      # 未知档位不动
+    assert cap("auto", "1k") == "1k"      # auto 不解析，原样返回

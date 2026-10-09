@@ -45,7 +45,7 @@ from fastapi.responses import JSONResponse
 from . import native
 from . import upstream
 from . import upscale as mps
-from .bridging import parse_boxes
+from .bridging import ensure_resolution_capacity, parse_boxes
 
 log = logging.getLogger("bfl2openai.async_images")
 
@@ -142,7 +142,8 @@ async def native_submit(payload: dict, resolution: str,
     images = payload.get("images") or []
     boxes = parse_boxes(payload.get("boxes"))
     png = await native._reference_png(images[0]) if images else b""
-    gen_resolution = "2k" if upscale_to else resolution
+    gen_resolution = ensure_resolution_capacity(
+        aspect_ratio, "2k" if upscale_to else resolution)
     return await upstream.submit_generation(
         image_png=png,
         prompt=prompt,

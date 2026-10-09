@@ -140,3 +140,30 @@ def image_to_png(data: bytes) -> bytes:
     buf = io.BytesIO()
     img.convert("RGBA").save(buf, format="PNG")
     return buf.getvalue()
+
+
+# ---------- 分辨率×比例 有效域防御 ----------
+
+#: 上游各分辨率档接受的比例是**固定尺寸表**，不是连续缩放（实测 2026-10-09）：
+#: 1k: 1:1→1024²、3:2→1248×832、2:3→832×1248 均可行；16:9 不在 1k 表 —— 提交成功
+#: 但 pollToken 立即作废（"Invalid or expired image result token"）；16:9@2k 实测可行。
+#: 策略：1k 档只放行实测安全比例，其余升 2k（把"静默作废"变成"拿到图"）。
+_SAFE_1K_RATIOS = {"1:1", "3:2", "2:3", "4:3", "3:4"}
+
+
+def ensure_resolution_capacity(aspect_ratio: str, resolution: str) -> str:
+    """1k 档遇到表外比例（宽银幕等）自动升 2k，避免上游静默作废整单。
+
+    仅对显式 W:H 判定；"auto"（画布派生，全天实测正常）与无法解析的原样返回。
+    """
+    if resolution != "1k":
+        return resolution
+    ratio = aspect_ratio.lower().strip()
+    if ratio in _SAFE_1K_RATIOS:
+        return "1k"
+    try:
+        w_str, h_str = ratio.split(":")
+        float(w_str), float(h_str)   # 是 W:H 且不在安全表 ⇒ 表外比例，升档
+    except Exception:
+        return "1k"                  # "auto"/无法解析：不连坐
+    return "2k"
