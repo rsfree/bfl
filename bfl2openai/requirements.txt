@@ -3,3 +3,4 @@ uvicorn>=0.29
 curl_cffi>=0.7
 pillow>=10.0
 python-multipart>=0.0.9
+gunicorn>=22.0

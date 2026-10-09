@@ -22,6 +22,18 @@ ssh -i ~/.ssh/id_ed25519_ops root@210.121.44.245 \
 
 之后：投 :80 vhost → 加 DNS A 记录（bfl.1task.cn → 210.121.44.245）→ 跑 apply-https.sh。
 
+## 并发与 gunicorn
+
+镜像 CMD 已是 gunicorn（uvicorn worker），worker 数由 `GUNICORN_WORKERS` 控制（默认 1）：
+
+- **1 worker 也扛高并发**：服务是纯 I/O 型 asyncio——每个生成请求就是挂起 30s 等上游，
+  单 worker 可同时挂几百个在途请求；瓶颈在上游匿名配额，不在进程。
+- **调 worker 数**：compose 里加 `environment: [GUNICORN_WORKERS=2]`（或 .env）后重建。
+  ⚠️ N>1 时 native/async/uploads 三门的进程内状态（任务表/上传句柄/复合态）按 worker
+  分片：同一调用方的"受理→轮询"必须落在同一 worker——前置 nginx `ip_hash` 粘性路由，
+  或把状态外置 Redis/SQLite（参考 jimeng 的 SQLite store）。两者都没做就保持 1。
+- gunicorn 的价值：进程守护、graceful reload（改代码不掐在途生成，graceful_timeout=90s）。
+
 ## 暴露面
 
 - 服务默认免鉴权（BFL2OPENAI_API_KEY / BFL_NATIVE_API_KEY 未设）；

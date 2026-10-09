@@ -9,4 +9,5 @@ RUN pip install --no-cache-dir -r bfl2openai/requirements.txt
 COPY bfl2openai ./bfl2openai
 
 EXPOSE 8000
-CMD ["uvicorn", "bfl2openai.server:app", "--host", "0.0.0.0", "--port", "8000"]
+# GUNICORN_WORKERS>1 前先读 gunicorn_conf.py 的内存态说明（或前置 ip_hash）
+CMD ["gunicorn", "-c", "bfl2openai/gunicorn_conf.py", "bfl2openai.server:app"]
