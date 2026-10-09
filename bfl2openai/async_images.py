@@ -129,7 +129,9 @@ async def _run_task(task_id: str, payload: dict) -> None:
         rec["data"] = [data]
         rec["created"] = int(time.time())
         log.info("async task %s success", task_id[:12])
-    except (upstream.UpstreamError, mps.MPSError) as exc:
+    except Exception as exc:  # noqa: BLE001 - 任何异常都必须落到 failure 态，
+        # 否则任务永远 in_progress（curl_cffi 超时等不在旧 except 列表，
+        # asyncio task 的异常又无人 await ⇒ 静默吞掉，实测卡死 300s+）
         rec["status"] = "failure"
         rec["error"] = {"message": str(exc)[:300]}
         log.warning("async task %s failed: %s", task_id[:12], exc)

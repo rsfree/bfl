@@ -11,6 +11,7 @@
 """
 import base64
 import json
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -28,6 +29,7 @@ _OPENER = ur.build_opener(ur.ProxyHandler({}))
 def http(method, path, data=None, headers=None, timeout=300):
     hdrs = {"Content-Type": "application/json"}
     hdrs.update(headers or {})
+    hdrs.setdefault("Authorization", f"Bearer {KEY}")
     req = ur.Request(BASE + path, data=data, method=method, headers=hdrs)
     try:
         with _OPENER.open(req, timeout=timeout) as r:
@@ -65,10 +67,10 @@ def record(name, ok, detail):
     print(("PASS " if ok else "FAIL ") + name, json.dumps(detail, ensure_ascii=False))
 
 
-def poll_native(token, max_s=240):
+def poll_native(token, max_s=300):
     t0 = time.time()
     while time.time() - t0 < max_s:
-        time.sleep(3)
+        time.sleep(2)
         st, body, _ = http("GET", f"/v1/get_result?id={token}")
         d = json.loads(body)
         if d.get("status") == "Ready":
@@ -78,10 +80,10 @@ def poll_native(token, max_s=240):
     raise RuntimeError("native poll timeout")
 
 
-def poll_async(tid, max_s=240):
+def poll_async(tid, max_s=300):
     t0 = time.time()
     while time.time() - t0 < max_s:
-        time.sleep(3)
+        time.sleep(2)
         st, body, _ = http("GET", f"/async/v1/images/generations/{tid}")
         d = json.loads(body)
         if d.get("status") in ("success", "failure", "canceled"):
@@ -117,7 +119,7 @@ def case2():
     payload = {"prompt": "a serene mountain lake at dusk, minimalist composition",
                "aspect_ratio": "1:1", "resolution": "1k"}
     st, resp, _ = http("POST", "/v1/flux-3-image",
-                       json.dumps(payload).encode(), {"x-key": "matrix"})
+                       json.dumps(payload).encode(), {"x-key": "sk-bfl"})
     token = json.loads(resp)["id"]
     url = poll_native(token)
     st2, img, _ = fetch_image_retry(url)
@@ -160,7 +162,26 @@ def case4():
            {"http": st2, **info})
 
 
-ALL = (case1, case2, case3, case4)
+def case5():
+    """原生门 i2i + bounding_boxes（form boxes 字段 + 局部指令）。"""
+    payload = {"prompt": "keep the scene",
+               "images": ["data:image/png;base64,"
+                          + base64.b64encode(SAMPLE).decode()],
+               "boxes": [{"box": {"x": 0.2, "y": 0.2, "w": 0.6, "h": 0.6},
+                          "instruction": "replace the center with blooming flowers"}],
+               "resolution": "1k"}
+    st, resp, _ = http("POST", "/v1/flux-3-image",
+                       json.dumps(payload).encode(), {"x-key": "sk-bfl"})
+    token = json.loads(resp)["id"]
+    url = poll_native(token)
+    st2, img, _ = fetch_image_retry(url)
+    info = save("case5_native_i2i_bbox", img)
+    record("native_i2i+bounding_boxes(1k)",
+           st2 == 200 and info["size"] == [1024, 1024],
+           {"http": st2, **info})
+
+
+ALL = (case1, case2, case3, case4, case5)
 
 if __name__ == "__main__":
     only = set(sys.argv[1:]) or None
@@ -171,7 +192,7 @@ if __name__ == "__main__":
             case()
         except Exception as exc:  # noqa: BLE001
             record(case.__name__, False, {"error": str(exc)[:200]})
-        time.sleep(5)
+        time.sleep(2)
     ok = sum(r["ok"] for r in RESULTS)
     print("MATRIX:", "ALL PASS" if ok == len(RESULTS) else "HAS FAILURES",
           f"({ok}/{len(RESULTS)})")

@@ -1,0 +1,64 @@
+[
+ {
+  "case": "mp.case2",
+  "ok": false,
+  "error": "'id'"
+ },
+ {
+  "case": "mp.case1",
+  "ok": false,
+  "error": "'data'"
+ },
+ {
+  "case": "mp.case5",
+  "ok": false,
+  "error": "'id'"
+ },
+ {
+  "case": "sz.n1",
+  "ok": false,
+  "error": "'id'"
+ },
+ {
+  "case": "mp.case4",
+  "ok": false,
+  "error": "async poll timeout"
+ },
+ {
+  "case": "mp.case3",
+  "ok": false,
+  "error": "async poll timeout"
+ },
+ {
+  "case": "sz.a1",
+  "ok": false,
+  "error": "async poll timeout 300s"
+ },
+ {
+  "case": "openai_generations size=1024x1024",
+  "ok": true,
+  "http": 200,
+  "got": [
+   1024,
+   1024
+  ]
+ },
+ {
+  "case": "openai_generations size=1536x1024(3:2)",
+  "ok": true,
+  "http": 200,
+  "got": [
+   1248,
+   832
+  ]
+ },
+ {
+  "case": "openai_edits size=1024x1536(2:3)",
+  "ok": true,
+  "http": 200,
+  "got": [
+   832,
+   1248
+  ]
+ }
+]
