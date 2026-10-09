@@ -281,3 +281,35 @@ def test_ensure_resolution_capacity_lifts_1k_wide():
     assert cap("16:9", "2k") == "2k"      # 2k 预算内
     assert cap("16:9", "4k") == "4k"      # 未知档位不动
     assert cap("auto", "1k") == "1k"      # auto 不解析，原样返回
+
+
+def test_sync_generations_end_to_end_shape(monkeypatch):
+    """回归：sync generations 全路径（曾因 server.py 缺 bridging import 而
+    全量 500——单测没盖到端到端，这次钉死）。需要完整 server app。"""
+    import base64
+
+    from fastapi.testclient import TestClient
+
+    from bfl2openai import server as server_mod
+
+    # 本地 .env 若设了 API_KEY 会开鉴权——回归测试只验证生成路径，关掉
+    monkeypatch.setattr(server_mod, "API_KEY", "")
+    client = TestClient(server_mod.app)
+
+    async def fake_submit(**kw):
+        return "poll-x"
+
+    async def fake_wait(token, base_url=None):
+        return "img-x"
+
+    async def fake_media(image_token, base_url=None):
+        return b"\x89PNG\r\n\x1a\nfake"
+
+    monkeypatch.setattr("bfl2openai.server.upstream.submit_generation", fake_submit)
+    monkeypatch.setattr("bfl2openai.server.upstream.wait_for_result", fake_wait)
+    monkeypatch.setattr("bfl2openai.server.upstream.fetch_media", fake_media)
+    r = client.post("/v1/images/generations", json={
+        "prompt": "x", "model": "anything", "size": "1024x1024",
+        "resolution": "1k", "response_format": "b64_json"})
+    assert r.status_code == 200, r.text
+    assert base64.b64decode(r.json()["data"][0]["b64_json"])[:4] == b"\x89PNG"

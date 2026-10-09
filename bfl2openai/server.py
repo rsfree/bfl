@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse, Response
 
 from . import upstream
 from . import native
+from . import bridging
 from . import upscale as mps
 from . import uploads
 from . import async_images
