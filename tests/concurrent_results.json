@@ -1,52 +1,94 @@
 [
  {
-  "case": "mp.case4",
-  "ok": false,
-  "error": "name 'KEY' is not defined"
+  "case": "openai_edits+boxes(i2i,1k)",
+  "ok": true,
+  "http": 200,
+  "saved": "/Users/betterme/PycharmProjects/AI/reverse/bfl/saved_images/matrix/case1_openai_edits_boxes.png",
+  "format": "PNG",
+  "size": [
+   1024,
+   1024
+  ]
  },
  {
-  "case": "mp.case3",
-  "ok": false,
-  "error": "name 'KEY' is not defined"
+  "case": "async_t2i(2k)",
+  "ok": true,
+  "http": 200,
+  "saved": "/Users/betterme/PycharmProjects/AI/reverse/bfl/saved_images/matrix/case4_async_t2i_2k.png",
+  "format": "PNG",
+  "size": [
+   2048,
+   2048
+  ]
  },
  {
-  "case": "mp.case5",
-  "ok": false,
-  "error": "name 'KEY' is not defined"
- },
- {
-  "case": "mp.case1",
-  "ok": false,
-  "error": "name 'KEY' is not defined"
+  "case": "async_uploads_handle(i2i,1k)",
+  "ok": true,
+  "http": 200,
+  "saved": "/Users/betterme/PycharmProjects/AI/reverse/bfl/saved_images/matrix/case3_async_upload_handle.png",
+  "format": "PNG",
+  "size": [
+   1024,
+   1024
+  ]
  },
  {
   "case": "mp.case2",
   "ok": false,
-  "error": "name 'KEY' is not defined"
+  "error": "native poll timeout"
  },
  {
-  "case": "sz.g2",
+  "case": "mp.case5",
   "ok": false,
-  "error": "'data'"
+  "error": "native poll timeout"
  },
  {
-  "case": "sz.e1",
-  "ok": false,
-  "error": "'data'"
+  "case": "openai_generations size=1024x1024",
+  "ok": true,
+  "http": 200,
+  "got": [
+   1024,
+   1024
+  ]
  },
  {
-  "case": "sz.g1",
-  "ok": false,
-  "error": "'data'"
+  "case": "openai_generations size=1536x1024(3:2)",
+  "ok": true,
+  "http": 200,
+  "got": [
+   1248,
+   832
+  ]
  },
  {
-  "case": "sz.n1",
-  "ok": false,
-  "error": "'id'"
+  "case": "native 16:9 自动升2k + COS链",
+  "ok": true,
+  "cos_link": true,
+  "url_ok": true,
+  "size": [
+   1360,
+   768
+  ],
+  "saved": "/Users/betterme/PycharmProjects/AI/reverse/bfl/saved_images/matrix/caseN_native_16x9.png"
  },
  {
-  "case": "sz.a1",
-  "ok": false,
-  "error": "async failure: {'message': \"name 'aspect_ratio' is not defined\"}"
+  "case": "openai_edits size=1024x1536(2:3)",
+  "ok": true,
+  "http": 200,
+  "got": [
+   832,
+   1248
+  ]
+ },
+ {
+  "case": "async_t2i 2k + COS链",
+  "ok": true,
+  "cos_link": true,
+  "url_ok": true,
+  "size": [
+   2048,
+   2048
+  ],
+  "saved": "/Users/betterme/PycharmProjects/AI/reverse/bfl/saved_images/matrix/caseA_async_t2i_2k.png"
  }
 ]

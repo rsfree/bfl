@@ -144,13 +144,14 @@ async def native_submit(payload: dict, resolution: str,
     images = payload.get("images") or []
     boxes = parse_boxes(payload.get("boxes"))
     png = await native._reference_png(images[0]) if images else b""
+    aspect_ratio = str(payload.get("aspect_ratio") or "auto")
     gen_resolution = ensure_resolution_capacity(
         aspect_ratio, "2k" if upscale_to else resolution)
     return await upstream.submit_generation(
         image_png=png,
         prompt=prompt,
         boxes=boxes,
-        aspect_ratio=str(payload.get("aspect_ratio") or "auto"),
+        aspect_ratio=aspect_ratio,
         resolution=gen_resolution,
         mode="i2i" if images else "t2i",
     )

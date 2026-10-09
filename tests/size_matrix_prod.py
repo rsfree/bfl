@@ -30,6 +30,7 @@ def http(method, path, data=None, headers=None, timeout=300):
     hdrs = {"Content-Type": "application/json"}
     hdrs.update(headers or {})
     hdrs.setdefault("Authorization", f"Bearer {KEY}")
+    hdrs.setdefault("x-key", KEY)
     req = ur.Request(BASE + path, data=data, method=method, headers=hdrs)
     try:
         with _OPENER.open(req, timeout=timeout) as r:
