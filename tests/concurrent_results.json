@@ -1,9 +1,9 @@
 [
  {
-  "case": "openai_edits+boxes(i2i,1k)",
+  "case": "native_json(t2i,1k)",
   "ok": true,
   "http": 200,
-  "saved": "/Users/betterme/PycharmProjects/AI/reverse/bfl/saved_images/matrix/case1_openai_edits_boxes.png",
+  "saved": "/Users/betterme/PycharmProjects/AI/reverse/bfl/saved_images/matrix/case2_native_t2i.png",
   "format": "PNG",
   "size": [
    1024,
@@ -33,14 +33,26 @@
   ]
  },
  {
-  "case": "mp.case2",
+  "case": "openai_edits+boxes(i2i,1k)",
   "ok": false,
-  "error": "native poll timeout"
+  "http": 200,
+  "saved": "/Users/betterme/PycharmProjects/AI/reverse/bfl/saved_images/matrix/case1_openai_edits_boxes.png",
+  "format": "PNG",
+  "size": [
+   880,
+   1184
+  ]
  },
  {
-  "case": "mp.case5",
-  "ok": false,
-  "error": "native poll timeout"
+  "case": "native_i2i+bounding_boxes(1k)",
+  "ok": true,
+  "http": 200,
+  "saved": "/Users/betterme/PycharmProjects/AI/reverse/bfl/saved_images/matrix/case5_native_i2i_bbox.png",
+  "format": "PNG",
+  "size": [
+   1024,
+   1024
+  ]
  },
  {
   "case": "openai_generations size=1024x1024",
@@ -52,12 +64,12 @@
   ]
  },
  {
-  "case": "openai_generations size=1536x1024(3:2)",
+  "case": "openai_edits size=1024x1536(2:3)",
   "ok": true,
   "http": 200,
   "got": [
-   1248,
-   832
+   832,
+   1248
   ]
  },
  {
@@ -72,12 +84,12 @@
   "saved": "/Users/betterme/PycharmProjects/AI/reverse/bfl/saved_images/matrix/caseN_native_16x9.png"
  },
  {
-  "case": "openai_edits size=1024x1536(2:3)",
+  "case": "openai_generations size=1536x1024(3:2)",
   "ok": true,
   "http": 200,
   "got": [
-   832,
-   1248
+   1248,
+   832
   ]
  },
  {
