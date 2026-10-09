@@ -187,9 +187,7 @@ async def submit_generation(
         fields[2] = ("aspectRatio", "1:1")
     try:
         return await _submit_generation_impl(
-            image_png=image_png, prompt=prompt, boxes=boxes,
-            aspect_ratio=aspect_ratio, resolution=resolution, mode=mode,
-            references=references, base_url=base_url)
+            fields=fields, image_png=image_png, base_url=base_url)
     except UpstreamError:
         raise
     except Exception as exc:  # noqa: BLE001 - 网络/超时/上游 5xx 统一包装
@@ -197,9 +195,8 @@ async def submit_generation(
 
 
 async def _submit_generation_impl(
-    image_png: bytes, prompt: str, boxes: list[dict],
-    aspect_ratio: str, resolution: str, mode: str,
-    references: list[dict] | None = None,
+    fields: list[tuple[str, Any]],
+    image_png: bytes,
     base_url: str = DEFAULT_BASE,
 ) -> str:
     mp = CurlMime()
