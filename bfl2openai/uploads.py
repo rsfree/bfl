@@ -9,17 +9,12 @@ Flow (mirrors how chat clients paste screenshots):
    `@image#N` is the per-call ordinal (first file of one call is #1) and
    `filename` is the client's name -- together they form the reference.
 2. A later `POST /v1/flux-3-image` may reference those handles inside
-   `prompt` (e.g. "edit @image#1:Clipboard_Screenshot.png: ..."). Before the
-   request goes upstream, every handle is rewritten to the BFL multi-reference
-   placeholder `<ref_image_K>` (docs.bfl.ai layout convention) and the stored
-   bytes are appended to `images` in ordinal order (after any caller-supplied
-   images, which keep indices 0..k-1).
+   `prompt`; resolve_handles() swaps them for the BFL multi-reference
+   placeholder `<ref_image_K>` and returns the bytes.
 
-Storage is in-process and best-effort by design: TTL 1h, bounded in count and
-bytes, gone on restart. Handles are a convenience inside one client session --
-durable assets should travel as URLs/base64 directly. Guards: a missing or
-expired handle fails the request with the reference named; the store is size
-capped so a paste storm cannot OOM the worker.
+Storage: Redis (REDIS_URL) or in-process fallback -- 1h TTL both ways, so a
+multi-gunicorn-worker deployment shares handles through Redis while a single
+worker / tests keep working with zero dependencies.
 """
 
 from __future__ import annotations
@@ -27,12 +22,12 @@ from __future__ import annotations
 import base64
 import logging
 import re
-import threading
-import time
 import uuid
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
+
+from . import store
 
 log = logging.getLogger("bfl2openai.uploads")
 
@@ -42,41 +37,22 @@ MAX_STORE_BYTES = 128 * 1024 * 1024
 
 _HANDLE_RE = re.compile(r"@image#(\d+):([^\s]+)")
 
-_STORE: dict[str, dict] = {}   # id -> {data, filename, exp}
-_REFS: dict[str, str] = {}     # "@image#N:name" -> id
-_LOCK = threading.Lock()
-_TOTAL = 0
-
-
-def _janitor() -> None:
-    global _TOTAL
-    now = time.time()
-    for key in [k for k, v in _STORE.items() if v["exp"] < now]:
-        _TOTAL -= len(_STORE.pop(key)["data"])
-    while _TOTAL > MAX_STORE_BYTES and _STORE:
-        oldest = min(_STORE.items(), key=lambda kv: kv[1]["exp"])[0]
-        _TOTAL -= len(_STORE.pop(oldest)["data"])
-
 
 def store_upload(data: bytes, filename: str, ordinal: int) -> dict:
-    global _TOTAL
+    """Sync wrapper for out-of-loop callers (tests); asyncio.run is loop-safe."""
+    import asyncio
+
+    return asyncio.run(store_upload_async(data, filename, ordinal))
+
+
+async def store_upload_async(data: bytes, filename: str, ordinal: int) -> dict:
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(status_code=413,
                             detail=f"file exceeds {MAX_FILE_BYTES} bytes")
-    with _LOCK:
-        _janitor()
-        if _TOTAL + len(data) > MAX_STORE_BYTES:
-            raise HTTPException(status_code=507,
-                                detail="upload store is full, retry later")
-        file_id = uuid.uuid4().hex[:16]
-        _STORE[file_id] = {
-            "data": data,
-            "filename": filename,
-            "exp": time.time() + HANDLE_TTL_S,
-        }
-        _TOTAL += len(data)
+    file_id = uuid.uuid4().hex[:16]
+    await store.put_blob(f"upl:{file_id}", data, ttl_s=HANDLE_TTL_S)
     ref = f"@image#{ordinal}:{filename}"
-    register_ref(ref, file_id)
+    await store.put(f"ref:{ref}", {"id": file_id}, ttl_s=HANDLE_TTL_S)
     return {
         "id": file_id,
         "ref": ref,
@@ -86,21 +62,18 @@ def store_upload(data: bytes, filename: str, ordinal: int) -> dict:
     }
 
 
-def register_ref(ref: str, file_id: str) -> None:
-    """Maps one handle to its stored id; the table is bounded like the store."""
-    with _LOCK:
-        _REFS[ref] = file_id
-        if len(_REFS) > 512:
-            for stale in list(_REFS)[: len(_REFS) - 512]:
-                _REFS.pop(stale, None)
+def resolve_handles(prompt: str, explicit_images: list[str] | None):
+    """Sync wrapper for out-of-loop callers; in-loop callers use the async one."""
+    import asyncio
+
+    return asyncio.run(resolve_handles_async(prompt, explicit_images))
 
 
-def resolve_handles(prompt: str, explicit_images: list[str] | None) -> tuple[str, list[str]]:
+async def resolve_handles_async(prompt: str, explicit_images: list[str] | None):
     """Rewrites `@image#N:name` handles into BFL `<ref_image_K>` placeholders.
 
-    Returns (rewritten_prompt, images). Uploaded bytes come back as data URIs
-    (the one spelling every downstream path already accepts). A missing or
-    expired handle raises 400 naming the reference.
+    Returns (rewritten_prompt, images). A missing or expired handle raises
+    400 naming the reference. Uploaded bytes come back as data URIs.
     """
     matches = list(_HANDLE_RE.finditer(prompt or ""))
     if not matches:
@@ -109,27 +82,28 @@ def resolve_handles(prompt: str, explicit_images: list[str] | None) -> tuple[str
     images = list(explicit_images or [])
     rewritten = prompt or ""
     resolved: list[str] = []
-    with _LOCK:
-        _janitor()
-        for match in matches:
-            # Filename charset excludes whitespace; a trailing run of colons
-            # belongs to the caller's punctuation ("fix @image#1:a.png: make
-            # it pop"), so it is stripped -- and survives the rewrite intact.
-            ref = match.group(0).rstrip(":")
-            file_id = _REFS.get(ref)
-            entry = _STORE.get(file_id) if file_id else None
-            if entry is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"unknown or expired image reference: {ref}",
-                )
-            placeholder = f"<ref_image_{len(images)}>"
-            images.append(
-                "data:image/png;base64,"
-                + base64.b64encode(entry["data"]).decode("ascii")
+    for match in matches:
+        # Filename charset excludes whitespace; a trailing run of colons
+        # belongs to the caller's punctuation ("fix @image#1:a.png: make it
+        # pop"), so it is stripped -- and survives the rewrite intact.
+        ref = match.group(0).rstrip(":")
+        entry = await store.get(f"ref:{ref}")
+        if entry is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown or expired image reference: {ref}",
             )
-            rewritten = rewritten.replace(ref, placeholder, 1)
-            resolved.append(ref)
+        blob = await store.get_blob(f"upl:{entry['id']}")
+        if blob is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown or expired image reference: {ref}",
+            )
+        placeholder = f"<ref_image_{len(images)}>"
+        images.append(
+            "data:image/png;base64," + base64.b64encode(blob).decode("ascii"))
+        rewritten = rewritten.replace(ref, placeholder, 1)
+        resolved.append(ref)
     if resolved:
         log.info("resolved uploaded handle(s): %s", resolved)
     return rewritten, images
@@ -144,7 +118,7 @@ def register(app: FastAPI) -> None:
             if not data:
                 continue
             filename = upload.filename or f"upload_{ordinal}.png"
-            info = store_upload(data, filename, ordinal)
+            info = await store_upload_async(data, filename, ordinal)
             files.append(info)
         if not files:
             return JSONResponse(status_code=422,

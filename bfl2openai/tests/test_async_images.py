@@ -51,16 +51,18 @@ def client(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _clean():
-    async_images._TASKS.clear()
-    async_images._ORDER.clear()
+    from bfl2openai import store
+
+    store._MEM.clear()
+    store._ZSETS.clear()
     uploads_clean()
 
 
 def uploads_clean():
-    uploads_mod_store = sys.modules.get("bfl2openai.uploads")
-    if uploads_mod_store:
-        uploads_mod_store._STORE.clear()
-        uploads_mod_store._REFS.clear()
+    from bfl2openai import store
+
+    store._MEM.clear()
+    store._ZSETS.clear()
 
 
 async def _ok_submit(*a, **kw):
@@ -186,8 +188,6 @@ async def _never():
 def uploads_store(data: bytes, name: str, ordinal: int):
     from bfl2openai import uploads
 
-    uploads._STORE.clear()
-    uploads._REFS.clear()
     return uploads.store_upload(data, name, ordinal)
 
 

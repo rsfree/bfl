@@ -64,6 +64,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from PIL import Image
 
+from . import store
 from . import upstream
 from . import upscale as mps
 from . import uploads as uploads_mod
@@ -81,7 +82,8 @@ MAX_IMAGES = 10
 #: composite -- generate at 2k, then MPS super-resolution x2 / x4. Keyed by
 #: poll token; advanced by get_result calls (client-driven state machine).
 COMPOSITE_TIERS = {"4k": 2.0, "8k": 4.0}
-_COMPOSITES: dict[str, dict] = {}
+# composite 态外置（store）：多 worker 下受理与轮询可能落在不同进程
+_COMP_TTL = 3600
 
 
 def _check_x_key(request: Request) -> None:
@@ -201,7 +203,7 @@ def register(app: FastAPI) -> None:
         # `<ref_image_K>` placeholders (layout convention) and appended to
         # images after any caller-supplied ones.
         try:
-            prompt, refs = uploads_mod.resolve_handles(prompt, refs or None)
+            prompt, refs = await uploads_mod.resolve_handles_async(prompt, refs or None)
             refs = refs or []
         except HTTPException:
             raise
@@ -247,7 +249,7 @@ def register(app: FastAPI) -> None:
                     mode="i2i",
                 )
                 if resolution in COMPOSITE_TIERS:
-                    _COMPOSITES[poll_token] = {"phase": "gen", "target": resolution}
+                    await store.put(f"comp:{poll_token}", {"phase": "gen", "target": resolution}, ttl_s=_COMP_TTL)
             else:
                 # text-to-image: verified 2026-10-09 (mode t2i, no image part,
                 # explicit aspect ratio -- "auto" is canvas-only semantics).
@@ -260,7 +262,7 @@ def register(app: FastAPI) -> None:
                     mode="t2i",
                 )
                 if resolution in COMPOSITE_TIERS:
-                    _COMPOSITES[poll_token] = {"phase": "gen", "target": resolution}
+                    await store.put(f"comp:{poll_token}", {"phase": "gen", "target": resolution}, ttl_s=_COMP_TTL)
         except upstream.UpstreamError as exc:
             return JSONResponse(
                 status_code=502,
@@ -280,7 +282,7 @@ def register(app: FastAPI) -> None:
     @app.get("/v1/get_result")
     async def get_result(request: Request, id: str):
         _check_x_key(request)
-        composite = _COMPOSITES.get(id)
+        composite = await store.get(f"comp:{id}")
         if composite:
             return await _composite_step(request, id, composite)
 
@@ -328,7 +330,7 @@ def register(app: FastAPI) -> None:
             except upstream.UpstreamError as exc:
                 return JSONResponse(status_code=502, content={"detail": exc.message})
             if state.get("status") == "error":
-                _COMPOSITES.pop(token, None)
+                await store.drop(f"comp:{token}")
                 out["status"] = "Error"
                 out["details"] = {"error": state.get("error") or "unknown"}
                 return JSONResponse(out)
@@ -336,7 +338,7 @@ def register(app: FastAPI) -> None:
                 out["status"] = "Pending"
                 return JSONResponse(out)
             if not mps.configured():
-                _COMPOSITES.pop(token, None)
+                await store.drop(f"comp:{token}")
                 out["status"] = "Error"
                 out["details"] = {"error": "MPS not configured for 4k/8k composite"}
                 return JSONResponse(out)
@@ -349,7 +351,7 @@ def register(app: FastAPI) -> None:
                 await mps.upload_to_cos(media, key)
                 task_id = await mps.submit_cos(key, percent=COMPOSITE_TIERS[composite["target"]])
             except (mps.MPSError, RuntimeError, upstream.UpstreamError) as exc:
-                _COMPOSITES.pop(token, None)
+                await store.drop(f"comp:{token}")
                 out["status"] = "Error"
                 out["details"] = {"error": f"upscale submit failed: {exc}"}
                 return JSONResponse(out)
@@ -362,7 +364,7 @@ def register(app: FastAPI) -> None:
         try:
             state = await mps.query(composite["upscale_task"])
         except mps.MPSError as exc:
-            _COMPOSITES.pop(token, None)
+            await store.drop(f"comp:{token}")
             out["status"] = "Error"
             out["details"] = {"error": str(exc)}
             return JSONResponse(out)
@@ -370,7 +372,7 @@ def register(app: FastAPI) -> None:
             out["status"] = "Generating"
             out["details"] = {"stage": "upscale"}
             return JSONResponse(out)
-        _COMPOSITES.pop(token, None)
+        await store.drop(f"comp:{token}")
         if state["state"] == "error":
             out["status"] = "Error"
             out["details"] = {"error": state["error"]}

@@ -22,11 +22,13 @@ RAW = b"\x89PNG-clipboard-bytes"
 
 @pytest.fixture(autouse=True)
 def _clean():
-    uploads._STORE.clear()
-    uploads._REFS.clear()
+    from bfl2openai import store
+
+    store._MEM.clear()
+    store._ZSETS.clear()
     yield
-    uploads._STORE.clear()
-    uploads._REFS.clear()
+    store._MEM.clear()
+    store._ZSETS.clear()
 
 
 def _store_one(name="Clipboard_Screenshot.png", data=RAW, ordinal=1):

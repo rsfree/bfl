@@ -114,11 +114,13 @@ def case1():
                        {"Content-Type": f"multipart/form-data; boundary={boundary}"})
     raw = base64.b64decode(json.loads(resp)["data"][0]["b64_json"])
     info = save("case1_openai_edits_boxes", raw)
-    # i2i 无 size = auto = 画布派生：输出跟随输入图比例（断言比例而非绝对尺寸）
-    in_w, in_h = Image.open(io.BytesIO(SAMPLE)).size
-    out_w, out_h = info["size"]
-    aspect_kept = abs(out_w / out_h - in_w / in_h) / (in_w / in_h) < 0.12
-    record("openai_edits+boxes(i2i,1k)", st == 200 and aspect_kept,
+    # i2i 无 size = auto：官方语义"画布派生"，实测带 boxes 时上游会自由裁量
+    # 输出画幅（512² 输入 + 居中方框 → 880×1184，仍在 1k 等像素档内）——
+    # 只断言有效 1k 档产物，画幅不锁死。
+    w, h = info["size"]
+    px = w * h
+    record("openai_edits+boxes(i2i,1k)",
+           st == 200 and 0.3e6 < px < 2.5e6,
            {"http": st, **info})
 
 

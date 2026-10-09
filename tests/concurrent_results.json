@@ -55,6 +55,15 @@
   ]
  },
  {
+  "case": "openai_generations size=1536x1024(3:2)",
+  "ok": true,
+  "http": 200,
+  "got": [
+   1248,
+   832
+  ]
+ },
+ {
   "case": "openai_generations size=1024x1024",
   "ok": true,
   "http": 200,
@@ -82,15 +91,6 @@
    768
   ],
   "saved": "/Users/betterme/PycharmProjects/AI/reverse/bfl/saved_images/matrix/caseN_native_16x9.png"
- },
- {
-  "case": "openai_generations size=1536x1024(3:2)",
-  "ok": true,
-  "http": 200,
-  "got": [
-   1248,
-   832
-  ]
  },
  {
   "case": "async_t2i 2k + COS链",

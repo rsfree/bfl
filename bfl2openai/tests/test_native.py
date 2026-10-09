@@ -313,3 +313,98 @@ def test_sync_generations_end_to_end_shape(monkeypatch):
         "resolution": "1k", "response_format": "b64_json"})
     assert r.status_code == 200, r.text
     assert base64.b64decode(r.json()["data"][0]["b64_json"])[:4] == b"\x89PNG"
+
+
+def test_submit_falls_back_to_proxy_on_quota_signals(monkeypatch):
+    """直连吃 429 → 池代理接棒出 token（配额×池大小的核心机制）。"""
+    import asyncio
+
+    from bfl2openai import upstream
+
+    made = []
+
+    class FakeResp:
+        def __init__(self, code, body):
+            self.status_code = code
+            self.text = body
+
+        def json(self):
+            return json.loads(self.text)
+
+    class FakeSession:
+        def __init__(self, proxy):
+            self.proxy = proxy
+            made.append(proxy)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, **kw):
+            if self.proxy:
+                return FakeResp(200, json.dumps(
+                    {"status": "submitted", "pollToken": "tok-proxy"}))
+            return FakeResp(429, "rate limited")
+
+    monkeypatch.setattr(upstream, "FALLBACK_PROXY", "socks5h://pool:1080")
+    monkeypatch.setattr(upstream, "_DIRECT_ATTEMPTS", 1)
+    monkeypatch.setattr(upstream, "_PROXY_ATTEMPTS", 1)
+    monkeypatch.setattr(upstream, "_session", lambda: FakeSession(None))
+    monkeypatch.setattr(upstream, "_make_session",
+                        lambda proxy=None, timeout=None: FakeSession(proxy))
+    _real_sleep = asyncio.sleep
+    monkeypatch.setattr(asyncio, "sleep", lambda *_: _real_sleep(0))
+
+    token = asyncio.run(upstream.submit_generation(
+        image_png=b"\x89PNG", prompt="x", aspect_ratio="1:1", mode="i2i"))
+    assert token == "tok-proxy"
+    assert made == [None, "socks5h://pool:1080"]
+
+
+def test_submit_param_errors_fail_fast_without_proxy(monkeypatch):
+    """400 类参数错误换 IP 没用：直连第一跳就抛，不走池。"""
+    import asyncio
+
+    from bfl2openai import upstream
+
+    made = []
+
+    class FakeResp:
+        status_code = 400
+        text = '{"error":"Choose an aspect ratio for the canvas."}'
+
+        def json(self):
+            return {"error": "Choose an aspect ratio for the canvas."}
+
+    posts = []
+
+    class FakeSession:
+        def __init__(self, proxy):
+            self.proxy = proxy
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, **kw):
+            # session 是尝试列表预构造的（连接惰性），断言只看实际 POST 次数
+            posts.append(self.proxy)
+            return FakeResp()
+
+    monkeypatch.setattr(upstream, "FALLBACK_PROXY", "socks5h://pool:1080")
+    monkeypatch.setattr(upstream, "_DIRECT_ATTEMPTS", 2)
+    monkeypatch.setattr(upstream, "_session", lambda: FakeSession(None))
+    monkeypatch.setattr(upstream, "_make_session",
+                        lambda proxy=None, timeout=None: FakeSession(proxy))
+
+    import pytest as _pytest
+
+    with _pytest.raises(upstream.UpstreamError) as exc:
+        asyncio.run(upstream.submit_generation(
+            image_png=b"", prompt="x", aspect_ratio="auto", mode="t2i"))
+    assert "400" in str(exc.value)
+    assert posts == [None]  # 参数错误第一跳就 fail-fast，不碰池

@@ -6,6 +6,14 @@
 name: bfl2openai
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: bfl2openai-redis
+    restart: unless-stopped
+    # 仅容器网内可见（无 ports）——跨 worker 状态外置的存储
+    command: ["redis-server", "--maxmemory", "256mb",
+              "--maxmemory-policy", "volatile-ttl"]
+
   bfl2openai:
     build:
       context: ../..
@@ -15,9 +23,14 @@ services:
     user: "10001:10001"
     ports:
       - "127.0.0.1:39100:8000"           # 仅回环；公网入口走 bfl.1task.cn（nginx）
+    environment:
+      REDIS_URL: redis://redis:6379/0   # 跨 worker 状态外置（见 store.py）
+      GUNICORN_WORKERS: "3"             # 多 worker 依赖上面的 Redis
     env_file: ./.env                    # 凭证/回退代理/PUBLIC_BASE 注入容器环境
                                         # （compose 相对路径 = 本文件目录；
                                         #   挂载文件的做法踩过红线 9：源不存在会被建目录）
+    depends_on:
+      - redis
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
       interval: 30s

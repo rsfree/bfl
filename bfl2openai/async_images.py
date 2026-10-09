@@ -45,14 +45,15 @@ from fastapi.responses import JSONResponse
 from . import native
 from . import upstream
 from . import upscale as mps
+from . import store
 from .bridging import ensure_resolution_capacity, parse_boxes
 
 log = logging.getLogger("bfl2openai.async_images")
 
 PUBLIC_BASE = os.environ.get("BFL2OPENAI_PUBLIC_BASE", "").rstrip("/")
 
-_TASKS: dict[str, dict] = {}          # task_id -> record
-_ORDER: list[str] = []                # submission order, for listing
+_TASK_SET = "tasks:order"            # zset: member=task_id, score=created
+_TASK_TTL = 86400
 _MAX_TASKS = 500
 
 
@@ -81,18 +82,20 @@ def _view(rec: dict) -> tuple[int, dict[str, Any]]:
                  "data": rec["data"], "usage": usage}
 
 
-def _get_for_credential(task_id: str, credential: str) -> dict | None:
-    rec = _TASKS.get(task_id)
+async def _get_for_credential(task_id: str, credential: str) -> dict | None:
+    rec = await store.get(f"task:{task_id}")
+    # missing and foreign are the same 404 (jimeng's rule)
     if rec is None or rec["credential"] != credential:
-        return None  # missing and foreign are the same 404 (jimeng's rule)
+        return None
     return rec
 
 
 async def _run_task(task_id: str, payload: dict) -> None:
-    rec = _TASKS.get(task_id)
+    rec = await store.get(f"task:{task_id}")
     if rec is None:
         return
     rec["status"] = "in_progress"
+    await store.put(f"task:{task_id}", rec, ttl_s=_TASK_TTL)
     resolution = rec["resolution"]
     upscale_to = rec["upscale_to"]
     try:
@@ -128,12 +131,14 @@ async def _run_task(task_id: str, payload: dict) -> None:
         rec["status"] = "success"
         rec["data"] = [data]
         rec["created"] = int(time.time())
+        await store.put(f"task:{task_id}", rec, ttl_s=_TASK_TTL)
         log.info("async task %s success", task_id[:12])
     except Exception as exc:  # noqa: BLE001 - 任何异常都必须落到 failure 态，
         # 否则任务永远 in_progress（curl_cffi 超时等不在旧 except 列表，
         # asyncio task 的异常又无人 await ⇒ 静默吞掉，实测卡死 300s+）
         rec["status"] = "failure"
         rec["error"] = {"message": str(exc)[:300]}
+        await store.put(f"task:{task_id}", rec, ttl_s=_TASK_TTL)
         log.warning("async task %s failed: %s", task_id[:12], exc)
 
 
@@ -190,14 +195,17 @@ def register(app: FastAPI) -> None:
         try:
             images = payload.get("images")
             refs = [images] if isinstance(images, str) else list(images or [])
-            prompt, refs = native.uploads_mod.resolve_handles(prompt, refs or None)
+            prompt, refs = await native.uploads_mod.resolve_handles_async(prompt, refs or None)
         except HTTPException:
             raise
         payload = {**payload, "prompt": prompt, "images": refs}
 
         task_id = uuid.uuid4().hex[:24]
-        while len(_ORDER) >= _MAX_TASKS:
-            _TASKS.pop(_ORDER.pop(0), None)
+        if await store.zcard(_TASK_SET) >= _MAX_TASKS:
+            oldest = (await store.zrevrange(_TASK_SET, _MAX_TASKS - 1)) or []
+            for stale in oldest:
+                await store.drop(f"task:{stale}")
+                await store.zrem(_TASK_SET, stale)
         rec = {
             "task_id": task_id, "credential": credential,
             "base": PUBLIC_BASE or str(request.base_url).rstrip("/"),
@@ -206,8 +214,8 @@ def register(app: FastAPI) -> None:
             "created": int(time.time()), "data": [], "error": None,
             "details": None,
         }
-        _TASKS[task_id] = rec
-        _ORDER.append(task_id)
+        await store.put(f"task:{task_id}", rec, ttl_s=_TASK_TTL)
+        await store.zadd(_TASK_SET, task_id, float(rec["created"]))
         asyncio.create_task(_run_task(task_id, payload))
         return JSONResponse(
             status_code=202,
@@ -217,7 +225,7 @@ def register(app: FastAPI) -> None:
 
     @app.get("/async/v1/images/generations/{task_id}")
     async def get_generation(request: Request, task_id: str):
-        rec = _get_for_credential(task_id, _fingerprint(request))
+        rec = await _get_for_credential(task_id, _fingerprint(request))
         if rec is None:
             raise HTTPException(status_code=404, detail="task not found")
         status_code, body = _view(rec)
@@ -228,8 +236,8 @@ def register(app: FastAPI) -> None:
         credential = _fingerprint(request)
         limit = max(1, min(limit, 200))
         items = []
-        for tid in reversed(_ORDER):
-            rec = _TASKS.get(tid)
+        for tid in await store.zrevrange(_TASK_SET, 200):
+            rec = await store.get(f"task:{tid}")
             if rec and rec["credential"] == credential:
                 items.append({"task_id": tid, "status": rec["status"],
                               "created": rec["created"]})
@@ -239,7 +247,7 @@ def register(app: FastAPI) -> None:
 
     @app.delete("/async/v1/images/generations/{task_id}")
     async def delete_generation(request: Request, task_id: str):
-        rec = _get_for_credential(task_id, _fingerprint(request))
+        rec = await _get_for_credential(task_id, _fingerprint(request))
         if rec is None:
             raise HTTPException(status_code=404, detail="task not found")
         if rec["status"] in ("queued", "in_progress"):
@@ -249,7 +257,6 @@ def register(app: FastAPI) -> None:
                                    "cancel endpoint -- deleting it would only "
                                    "hide a running, resource-consuming job"},
             )
-        _TASKS.pop(task_id, None)
-        if task_id in _ORDER:
-            _ORDER.remove(task_id)
+        await store.drop(f"task:{task_id}")
+        await store.zrem(_TASK_SET, task_id)
         return JSONResponse({"deleted": task_id})

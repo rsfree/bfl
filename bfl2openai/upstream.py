@@ -199,28 +199,59 @@ async def _submit_generation_impl(
     image_png: bytes,
     base_url: str = DEFAULT_BASE,
 ) -> str:
-    mp = CurlMime()
-    for name, value in fields:
-        mp.addpart(name=name, data=str(value).encode())
-    if image_png:
-        # An empty image part is NOT "no image": upstream answers
-        # 400 "A composition must not include a canvas image." (measured
-        # 2026-10-09 on a t2i attempt). Omit the part entirely instead.
-        mp.addpart(name="image", filename="image.png", content_type="image/png",
-                   data=image_png)
-    async with _session() as s:
-        r = await s.post(
-            f"{base_url}/api/flux3-image/generate",
-            multipart=mp,
-            headers=_browser_headers(base_url),
-        )
-    text = r.text
-    if r.status_code != 200 or "Security Checkpoint" in text:
-        raise UpstreamError(f"generate failed: HTTP {r.status_code}: {text[:300]}")
-    data = r.json()
-    if data.get("status") != "submitted" or not data.get("pollToken"):
-        raise UpstreamError(f"generate rejected: {text[:300]}")
-    return data["pollToken"]
+    """提交：直连 x2 → （配了池则）池代理 x2 —— 换出口 IP = 换一份匿名配额。
+
+    每次尝试都是 chrome 指纹（impersonate）+ 新 mime。重试只对配额/风控类
+    失败（429/403/503/checkpoint）；400 类参数错误（比例、画布图等）立即抛，
+    换 IP 也没用。
+    """
+    attempts: list[tuple[str, AsyncSession]] = [
+        (f"direct#{i + 1}", _session()) for i in range(_DIRECT_ATTEMPTS)
+    ]
+    if FALLBACK_PROXY:
+        attempts.extend(
+            (f"proxy#{i + 1}",
+             _make_session(proxy=FALLBACK_PROXY, timeout=SUBMIT_TIMEOUT_S))
+            for i in range(_PROXY_ATTEMPTS))
+
+    last = "no attempts"
+    for index, (attempt_label, session) in enumerate(attempts):
+        # mime 每次重建：CurlMime 的重放语义不可靠
+        mp = CurlMime()
+        for name, value in fields:
+            mp.addpart(name=name, data=str(value).encode())
+        if image_png:
+            # An empty image part is NOT "no image": upstream answers
+            # 400 "A composition must not include a canvas image." (measured
+            # 2026-10-09 on a t2i attempt). Omit the part entirely instead.
+            mp.addpart(name="image", filename="image.png", content_type="image/png",
+                       data=image_png)
+        try:
+            async with session as s:
+                r = await s.post(
+                    f"{base_url}/api/flux3-image/generate",
+                    multipart=mp,
+                    headers=_browser_headers(base_url),
+                )
+            text = r.text
+            if (r.status_code == 200 and "Security Checkpoint" not in text
+                    and (data := r.json()).get("status") == "submitted"
+                    and data.get("pollToken")):
+                if index > 0:
+                    log.info("submit succeeded via %s", attempt_label)
+                return data["pollToken"]
+            last = f"HTTP {r.status_code}: {text[:200]}"
+            retryable = (r.status_code in _RETRY_STATUSES
+                         or "Security Checkpoint" in text)
+        except Exception as exc:  # noqa: BLE001 - transport errors retry
+            last = f"{type(exc).__name__}: {exc}"
+            retryable = True
+        log.warning("submit via %s failed (%s)", attempt_label, last)
+        if not retryable:
+            raise UpstreamError(f"generate failed: {last}")
+        if index < len(attempts) - 1:
+            await asyncio.sleep(1.0 if index < _DIRECT_ATTEMPTS - 1 else 3.0)
+    raise UpstreamError(f"generate submit failed after {len(attempts)} attempts: {last}")
 
 
 async def poll_once(poll_token: str, base_url: str = DEFAULT_BASE) -> dict[str, Any]:
