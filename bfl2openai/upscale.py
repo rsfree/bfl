@@ -260,11 +260,13 @@ def _finished(response: dict) -> tuple[str | None, str | None]:
         status = info.get("Status")
         out = info.get("Output") or {}
         if status == _OK:
+            # 24h 预签名：1h 的链接被调用方拿到手就快过期了（401 报障）。
             if out.get("SignUrl"):
                 return out["SignUrl"], None
             path = out.get("Path")
             if path:
-                return cos_presigned_get(path if path.startswith("/") else "/" + path), None
+                return cos_presigned_get(
+                    path if path.startswith("/") else "/" + path, ttl_s=86400), None
         if status not in _IN_FLIGHT and status != _OK:
             return None, f"task status {status}"
     if response.get("Status") == "FINISH":
@@ -278,7 +280,8 @@ def _finished(response: dict) -> tuple[str | None, str | None]:
             return out["SignUrl"], None
         path = out.get("Path")
         if path:
-            return cos_presigned_get(path if path.startswith("/") else "/" + path), None
+            return cos_presigned_get(
+                path if path.startswith("/") else "/" + path, ttl_s=86400), None
         return None, "FINISH without any recognizable output"
     return None, None
 

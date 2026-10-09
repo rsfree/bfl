@@ -131,6 +131,13 @@ async def run_job(
             upscaled = await upstream.fetch_url(sign_url)
             return {"b64_json": base64.b64encode(upscaled).decode()}
         if response_format == "url":
+            # 与异步门同策略：产物转存 COS 出 24h 预签名链。官方 media
+            # token 分钟级过期，代理链接也随 token 一起死。
+            if mps.configured():
+                media = await upstream.fetch_media(image_token, UPSTREAM_BASE)
+                key = f"results/{image_token[:16]}.png"
+                await mps.upload_to_cos(media, key)
+                return {"url": mps.cos_presigned_get("/" + key, ttl_s=86400)}
             base = str(request.base_url).rstrip("/")
             return {"url": f"{base}/v1/images/results/{image_token}"}
         media = await upstream.fetch_media(image_token, UPSTREAM_BASE)

@@ -293,12 +293,23 @@ def register(app: FastAPI) -> None:
         out = {"id": id, "progress": None, "details": None, "preview": None}
         if status == "ready":
             out["status"] = "Ready"
-            # PUBLIC_BASE 优先：nginx 后面 request.base_url 会是 http，
-            # 交给调用方一个 http 链接会在 :80 吃 301（矩阵测试实测）。
-            base = PUBLIC_BASE or str(request.base_url).rstrip("/")
-            out["result"] = {
-                "sample": f"{base}/v1/flux3-image/results/{state['imageToken']}"
-            }
+            # 产物持久化：playground media token 分钟级过期，代理链接会随之
+            # 失效；COS 凭证在 ⇒ 首次 Ready 时转存并回 24h 预签名链（幂等，
+            # persisted_url 缓存在 state 里）。无凭证时退回代理链接。
+            if not state.get("persisted_url"):
+                if mps.configured():
+                    media = await upstream.fetch_media(state["imageToken"])
+                    key = f"results/{state['imageToken'][:16]}.png"
+                    await mps.upload_to_cos(media, key)
+                    state["persisted_url"] = mps.cos_presigned_get(
+                        "/" + key, ttl_s=86400)
+                else:
+                    # PUBLIC_BASE 优先：nginx 后面 request.base_url 会是 http，
+                    # 交给调用方一个 http 链接会在 :80 吃 301（矩阵测试实测）。
+                    base = PUBLIC_BASE or str(request.base_url).rstrip("/")
+                    state["persisted_url"] = (
+                        f"{base}/v1/flux3-image/results/{state['imageToken']}")
+            out["result"] = {"sample": state["persisted_url"]}
         elif status == "error":
             out["status"] = "Error"
             out["details"] = {"error": state.get("error") or "unknown"}

@@ -241,6 +241,10 @@ def test_native_submit_returns_async_response_shape(client, monkeypatch):
 def test_native_poll_maps_states(client, monkeypatch):
     import asyncio
 
+    # 无 COS 回退分支：不触发转存，sample 走本服务代理链接
+    monkeypatch.setattr("bfl2openai.native.mps.SECRET_ID", "")
+    monkeypatch.setattr("bfl2openai.native.mps.SECRET_KEY", "")
+
     async def fake_poll(token):
         return {"status": "ready", "imageToken": "img-9"}
 
