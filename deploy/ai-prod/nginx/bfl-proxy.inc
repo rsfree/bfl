@@ -8,4 +8,4 @@ proxy_set_header X-Forwarded-Proto $scheme;
 proxy_buffering off;           # 生成是长请求（1k 约 30s；4k 复合最长 2-3 分钟）
 proxy_read_timeout 300s;
 proxy_send_timeout 300s;
-client_max_body_size 32m;      # multipart 图片上传（OpenAI edits 门）
+client_max_body_size 64m;      # multipart 图片上传（edits 门为主；覆盖 4096² PNG ≈27MB + 余量）
