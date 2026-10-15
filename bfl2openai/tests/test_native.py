@@ -258,6 +258,11 @@ def test_native_poll_maps_states(client, monkeypatch):
         return {"status": "pending"}
 
     monkeypatch.setattr("bfl2openai.native.upstream.poll_once", fake_pending)
+    import asyncio as _aio
+
+    from bfl2openai import store as _store
+
+    _aio.run(_store.drop("pollcache:tok-123"))          # 清轮询缓存
     r = client.get("/v1/get_result", params={"id": "tok-123"})
     assert r.json()["status"] == "Pending"
 
@@ -265,6 +270,7 @@ def test_native_poll_maps_states(client, monkeypatch):
         return {"status": "error", "error": "bad token"}
 
     monkeypatch.setattr("bfl2openai.native.upstream.poll_once", fake_error)
+    _aio.run(_store.drop("pollcache:tok-123"))
     r = client.get("/v1/get_result", params={"id": "tok-123"})
     body = r.json()
     assert body["status"] == "Error"
@@ -461,7 +467,7 @@ def test_native_submit_splits_main_and_references(monkeypatch):
     """入口契约：images[0] → image 部件；images[1:] → references 文件部件。"""
     import asyncio
 
-    from bfl2openai import async_images, native, upstream
+    from bfl2openai import async_images, native, store, upstream
 
     captured = {}
 

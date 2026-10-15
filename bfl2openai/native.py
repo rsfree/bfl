@@ -305,10 +305,18 @@ def register(app: FastAPI) -> None:
         if composite:
             return await _composite_step(request, id, composite)
 
-        try:
-            state = await upstream.poll_once(id)
-        except upstream.UpstreamError as exc:
-            return JSONResponse(status_code=502, content={"detail": exc.message})
+        # 轮询合并缓存：多租户并发下，同一 token 的密集轮询（客户每 2-3s
+        # 一次）只透传上游一次。生成中缓存 3s；终态缓存 120s（生成完成后
+        # 的重复轮询全部零上游请求——429 风暴的主源就是这里的 1:1 透传）。
+        cache_key = f"pollcache:{id}"
+        state = await store.get(cache_key)
+        if state is None:
+            try:
+                state = await upstream.poll_once(id)
+            except upstream.UpstreamError as exc:
+                return JSONResponse(status_code=502, content={"detail": exc.message})
+            ttl = 120 if state.get("status") in ("ready", "error") else 3
+            await store.put(cache_key, state, ttl_s=ttl)
 
         status = state.get("status")
         out = {"id": id, "progress": None, "details": None, "preview": None}

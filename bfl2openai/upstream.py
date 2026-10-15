@@ -240,6 +240,11 @@ async def _submit_generation_impl(
 
     last = "no attempts"
     for index, (attempt_label, session) in enumerate(attempts):
+        # 429 退避：限流是滑动窗口，秒级换出口硬打无效（出口池同 C 段），
+        # 等 5-12s 让窗口滑过再试，成功率远高于立即重试。
+        if index > 0 and last.startswith("submit via"):
+            import asyncio as _aio
+            await _aio.sleep(min(12.0, 4.0 + index * 2.0))
         # mime 每次重建：CurlMime 的重放语义不可靠
         mp = CurlMime()
         for name, value in fields:
