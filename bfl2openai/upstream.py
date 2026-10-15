@@ -354,8 +354,15 @@ async def poll_once_cached(poll_token: str, base_url: str = DEFAULT_BASE) -> dic
         low = str(exc).lower()
         if any(k in low for k in ("moderation", "flagged",
                                   "invalid or expired")):
-            neg = {"status": "error", "error": str(exc)[:300]}
-            await store.put(cache_key, neg, ttl_s=int(_POLL_CACHE_TERMINAL_S))
+            # kind 必须在这里就定型：缓存重抛的异常不再经过 wait_for_result
+            # 的分类分支（否则 wrap_upstream_error 又会错判成 502）。
+            kind = ("invalid_request_error"
+                    if "invalid or expired" in low else "content_policy")
+            await store.put(cache_key, {"status": "error",
+                                        "error": str(exc)[:300],
+                                        "kind": kind},
+                            ttl_s=int(_POLL_CACHE_TERMINAL_S))
+            raise UpstreamError(str(exc), kind) from exc
         raise
     ttl = int(_POLL_CACHE_TERMINAL_S if state.get("status") in ("ready", "error")
               else _POLL_CACHE_INFLIGHT_S)
