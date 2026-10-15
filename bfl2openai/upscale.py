@@ -407,8 +407,8 @@ async def ci_super_resolve_cos(object_key: str, magnify: int,
         scale = CI_MAX_INPUT_EDGE / max(im.size)
         if scale >= 1.0:
             raise
-        resized = im.resize((int(im.size[0] * scale), int(im.size[1] * scale)),
-                            Image.LANCZOS)
+        resized = im.resize((round(im.size[0] * scale),
+                             round(im.size[1] * scale)), Image.LANCZOS)
         buf = BytesIO()
         resized.save(buf, "JPEG", quality=90)
         log.info("CI input %s downscaled to %s (edge limit)", im.size, resized.size)
@@ -442,8 +442,8 @@ def ci_input_image(data: bytes, budget: int = 4_500_000) -> bytes:
             return buf.getvalue()
     # 极端兜底：降尺寸 + JPEG
     for scale in (0.75, 0.5):
-        resized = im.resize((int(im.size[0] * scale), int(im.size[1] * scale)),
-                            Image.LANCZOS)
+        resized = im.resize((round(im.size[0] * scale),
+                             round(im.size[1] * scale)), Image.LANCZOS)
         buf = BytesIO()
         resized.save(buf, "JPEG", quality=85)
         if len(buf.getvalue()) <= budget:
