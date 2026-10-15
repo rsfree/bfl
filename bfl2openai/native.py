@@ -371,17 +371,12 @@ def register(app: FastAPI) -> None:
                 log.info("composite gen ready token=%s target=%s media=%d bytes",
                          token[:16], composite["target"], len(media))
                 key = f"upscale/{token[:16]}.png"
-                # CI 同步超分的输入上限是 5MB（实测 2026-10-15：>5MB 400
-                # ImageTooLarge）—— 用 JPEG 压体积但**保留尺寸**（放大倍数
-                # 作用在输入上；normalize 的降档梯子会把 2048² 压到 1024²
-                # 导致 4k 只出 2k，full_matrix 实测抓到）。
-                ci_input = mps.ci_input_image(media)
-                await mps.upload_to_cos(ci_input, key)
                 magnify = int(COMPOSITE_TIERS[composite["target"]])
                 # 数据万象同步超分优先（秒级直返，实测 2026-10-15）；
                 # MPS 异步任务兜底（其队列曾 pending 40min+）。
                 try:
-                    up_bytes = await mps.ci_super_resolve_cos(key, magnify=magnify)
+                    up_bytes = await mps.ci_super_resolve_cos(
+                        key, magnify=magnify, data=media)
                     out_key = f"results/{token[:16]}.png"
                     await mps.upload_to_cos(up_bytes, out_key)
                     await store.drop(f"comp:{token}")

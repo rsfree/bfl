@@ -349,25 +349,69 @@ def cos_ci_signed_url(object_key: str, ci_params: dict, ttl_s: int = 900) -> str
             f"/{object_key.lstrip('/')}?{qs}&{auth}")
 
 
-async def ci_super_resolve_cos(object_key: str, magnify: int) -> bytes:
+CI_MAX_INPUT_EDGE = 2000   # 实测 2026-10-15：2048² 输入 400 "width or
+    # height exceeded limit"，512² 通过 —— 输入最长边上限取保守 2000。
+
+
+async def ci_super_resolve_cos(object_key: str, magnify: int,
+                               data: bytes | None = None) -> bytes:
     """数据万象同步超分：GET ?ci-process=AISuperResolution 直接返回放大图。
 
-    magnify ∈ {2,3,4}；失败抛 MPSError（调用方决定是否回落 MPS 异步任务）。
+    magnify ∈ {2,3,4}；data 提供时由本函数上传（先压体积、400 尺寸超限时
+    降长边 2000 重试一次）；失败抛 MPSError（调用方决定是否回落 MPS 任务）。
     实测 2026-10-15：ap-singapore 桶可用，512²→1024² 秒级返回。
     """
-    url = cos_ci_signed_url(object_key, {
-        "ci-process": "AISuperResolution", "magnify": magnify})
+    from io import BytesIO
+
+    from PIL import Image
+
+    async def _get():
+        url = cos_ci_signed_url(object_key, {
+            "ci-process": "AISuperResolution", "magnify": magnify})
+        try:
+            async with upstream._session() as s:
+                return await s.get(url)
+        except Exception as exc:  # noqa: BLE001
+            raise MPSError(f"CI super-resolution request failed: {exc}") from exc
+
+    async def _upload_and_get(payload: bytes):
+        await upload_to_cos(payload, object_key)
+        r = await _get()
+        if r.status_code != 200:
+            raise MPSError(f"CI super-resolution failed: HTTP {r.status_code}: "
+                           f"{r.text[:200]}")
+        if r.content[:8] != b"\x89PNG\r\n\x1a\n":
+            raise MPSError(f"CI super-resolution returned non-PNG: "
+                           f"{r.content[:120]}")
+        return r.content
+
+    if data is None:                      # 兼容旧签名（对象已在桶里）
+        r = await _get()
+        if r.status_code != 200:
+            raise MPSError(f"CI super-resolution failed: HTTP {r.status_code}: "
+                           f"{r.text[:200]}")
+        return r.content
+
+    payload = ci_input_image(data)
     try:
-        async with upstream._session() as s:
-            r = await s.get(url)
-    except Exception as exc:  # noqa: BLE001 - 网络/超时统一包装
-        raise MPSError(f"CI super-resolution request failed: {exc}") from exc
-    if r.status_code != 200:
-        raise MPSError(f"CI super-resolution failed: HTTP {r.status_code}: "
-                       f"{r.text[:150]}")
-    if r.content[:8] != b"\x89PNG\r\n\x1a\n":
-        raise MPSError(f"CI super-resolution returned non-PNG: {r.content[:120]}")
-    return r.content
+        return await _upload_and_get(payload)
+    except MPSError as exc:
+        if "width or height exceeded" not in str(exc):
+            raise
+        # 输入尺寸超 CI 上限：长边降到 2000 重试一次
+        im = Image.open(BytesIO(data))
+        im.load()
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        scale = CI_MAX_INPUT_EDGE / max(im.size)
+        if scale >= 1.0:
+            raise
+        resized = im.resize((int(im.size[0] * scale), int(im.size[1] * scale)),
+                            Image.LANCZOS)
+        buf = BytesIO()
+        resized.save(buf, "JPEG", quality=90)
+        log.info("CI input %s downscaled to %s (edge limit)", im.size, resized.size)
+        return await _upload_and_get(buf.getvalue())
 
 
 def ci_input_image(data: bytes, budget: int = 4_500_000) -> bytes:
