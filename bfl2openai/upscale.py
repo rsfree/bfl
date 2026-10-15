@@ -349,8 +349,9 @@ def cos_ci_signed_url(object_key: str, ci_params: dict, ttl_s: int = 900) -> str
             f"/{object_key.lstrip('/')}?{qs}&{auth}")
 
 
-CI_MAX_INPUT_EDGE = 2000   # 实测 2026-10-15：2048² 输入 400 "width or
-    # height exceeded limit"，512² 通过 —— 输入最长边上限取保守 2000。
+CI_MAX_INPUT_EDGE = 1920   # 实测 2026-10-15 二分：1792²/1920² OK，
+    # 1949²/2000²/2048² 400 "width or height exceeded limit" —— 输入单边
+    # 上限精确为 1920；输出 = 输入 x magnify（x2→3840²、x4→7680²）。
 
 
 async def ci_super_resolve_cos(object_key: str, magnify: int,
