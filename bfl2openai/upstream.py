@@ -302,6 +302,30 @@ async def poll_once(poll_token: str, base_url: str = DEFAULT_BASE) -> dict[str, 
     return r.json()
 
 
+_POLL_CACHE_INFLIGHT_S = 3.0    # 生成中：同 token 轮询合并窗口
+_POLL_CACHE_TERMINAL_S = 120.0  # 终态：完成后重复轮询零上游请求
+
+
+async def poll_once_cached(poll_token: str, base_url: str = DEFAULT_BASE) -> dict:
+    """带共享缓存的轮询。
+
+    多租户并发生成时，同一 pollToken 的密集轮询（服务端 3s 一次 x 全部
+    并发任务）是 429 风暴的主源——同 token 的轮询在窗口内只透传上游一次，
+    终态缓存 120s 让生成完成后的重复查询零上游流量。
+    """
+    from . import store
+
+    cache_key = f"pollcache:{poll_token[:40]}"
+    cached = await store.get(cache_key)
+    if cached is not None:
+        return cached
+    state = await poll_once(poll_token, base_url)
+    ttl = int(_POLL_CACHE_TERMINAL_S if state.get("status") in ("ready", "error")
+              else _POLL_CACHE_INFLIGHT_S)
+    await store.put(cache_key, state, ttl_s=ttl)
+    return state
+
+
 async def wait_for_result(
     poll_token: str,
     base_url: str = DEFAULT_BASE,
@@ -311,7 +335,7 @@ async def wait_for_result(
     deadline = time.monotonic() + POLL_TIMEOUT_S
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        last = await poll_once(poll_token, base_url)
+        last = await poll_once_cached(poll_token, base_url)
         status = last.get("status")
         if status == "ready":
             token = last.get("imageToken")
