@@ -120,7 +120,7 @@ async def upload_to_cos(data: bytes, object_key: str) -> None:
         f"&q-signature={signature}"
     )
     url = f"https://{OUTPUT_BUCKET}.cos.{OUTPUT_REGION}.myqcloud.com{pathname}"
-    async with upstream._session() as s:
+    async with upstream._session_direct() as s:
         r = await s.put(url, data=data, headers={"Authorization": auth},
                         timeout=120)
     if r.status_code not in (200, 201):
@@ -190,7 +190,7 @@ def _tc3_headers(action: str, payload: dict) -> dict:
 async def _call(action: str, payload: dict) -> dict:
     headers = _tc3_headers(action, payload)
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    async with upstream._session() as s:
+    async with upstream._session_direct() as s:
         r = await s.post(f"https://{HOST}", data=body, headers=headers, timeout=60)
     if r.status_code != 200:
         raise MPSError(f"HTTP {r.status_code}: {r.text[:200]}")
@@ -373,7 +373,7 @@ async def ci_super_resolve_cos(object_key: str, magnify: int,
         url = cos_ci_signed_url(object_key, {
             "ci-process": "AISuperResolution", "magnify": magnify})
         try:
-            async with upstream._session() as s:
+            async with upstream._session_direct() as s:
                 return await s.get(url)
         except Exception as exc:  # noqa: BLE001
             raise MPSError(f"CI super-resolution request failed: {exc}") from exc

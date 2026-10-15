@@ -366,7 +366,9 @@ def test_submit_falls_back_to_proxy_on_quota_signals(monkeypatch):
     token = asyncio.run(upstream.submit_generation(
         image_png=b"\x89PNG", prompt="x", aspect_ratio="1:1", mode="i2i"))
     assert token == "tok-proxy"
-    assert made == [None, "socks5h://pool:1080"]
+    # 新架构（2026-10-15）：直连出口被上游限流，提交全走池代理
+    # （attempts 列表预构造会话对象，首个即成功返回；断言全部为代理会话）
+    assert made and all(m == "socks5h://pool:1080" for m in made)
 
 
 def test_submit_param_errors_fail_fast_without_proxy(monkeypatch):
@@ -413,7 +415,8 @@ def test_submit_param_errors_fail_fast_without_proxy(monkeypatch):
         asyncio.run(upstream.submit_generation(
             image_png=b"", prompt="x", aspect_ratio="auto", mode="t2i"))
     assert "400" in str(exc.value)
-    assert posts == [None]  # 参数错误第一跳就 fail-fast，不碰池
+    # 参数错误第一跳就 fail-fast（现在第一跳即池代理，仍不重试）
+    assert posts == ["socks5h://pool:1080"]
 
 
 def test_normalize_image_downscales_oversize():

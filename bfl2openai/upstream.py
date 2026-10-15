@@ -92,10 +92,24 @@ class UpstreamError(Exception):
         self.kind = kind
 
 
-def _session() -> AsyncSession:
-    # impersonate chrome so the Vercel checkpoint lets us through;
-    # trust_env=False so HTTP_PROXY cannot swallow authenticated calls.
+def _session_direct() -> AsyncSession:
+    """强制直连（腾讯云内网：COS 上传/签名/CI 超分——不该绕代理）。"""
     return AsyncSession(impersonate="chrome", trust_env=False, timeout=SUBMIT_TIMEOUT_S)
+
+
+def _session(timeout: float | None = None) -> AsyncSession:
+    """默认会话：走池代理。
+
+    实测 2026-10-15：服务器直连出口 IP 被上游持久限流（direct#1/2/3 全 429），
+    所有 playground 流量（提交/轮询/媒体）改走池代理；池出口轮转跨多个 /24。
+    impersonate chrome 过 Vercel checkpoint；trust_env=False 防 HTTP_PROXY 干扰。
+    """
+    if FALLBACK_PROXY:
+        return AsyncSession(impersonate="chrome", trust_env=False,
+                            proxy=FALLBACK_PROXY,
+                            timeout=timeout or SUBMIT_TIMEOUT_S)
+    return AsyncSession(impersonate="chrome", trust_env=False,
+                        timeout=timeout or SUBMIT_TIMEOUT_S)
 
 
 def _make_session(proxy: str | None = None, timeout: float | None = None) -> AsyncSession:
@@ -117,13 +131,11 @@ async def _resilient_get(url: str, params: dict | None = None,
     different exit IP). Any other status returns immediately.
     """
     attempts: list[tuple[str, AsyncSession]] = [
-        (f"direct#{i + 1}", _make_session()) for i in range(_DIRECT_ATTEMPTS)
+        (f"proxy#{i + 1}", _make_session(proxy=FALLBACK_PROXY, timeout=timeout))
+        for i in range(_PROXY_ATTEMPTS)
+    ] if FALLBACK_PROXY else [
+        (f"direct#{i + 1}", _session_direct()) for i in range(_DIRECT_ATTEMPTS)
     ]
-    if FALLBACK_PROXY:
-        attempts.extend(
-            (f"proxy#{i + 1}", _make_session(proxy=FALLBACK_PROXY, timeout=timeout))
-            for i in range(_PROXY_ATTEMPTS)
-        )
 
     last = "no attempts"
     for index, (attempt_label, session) in enumerate(attempts):
@@ -223,28 +235,38 @@ async def _submit_generation_impl(
     base_url: str = DEFAULT_BASE,
     reference_parts: list[tuple[bytes, str]] | None = None,
 ) -> str:
-    """提交：直连 x2 → （配了池则）池代理 x2 —— 换出口 IP = 换一份匿名配额。
+    """提交尝试链：直连 x1 → 池代理 x3 → 等 15s → 池代理再一轮。
 
-    每次尝试都是 chrome 指纹（impersonate）+ 新 mime。重试只对配额/风控类
-    失败（429/403/503/checkpoint）；400 类参数错误（比例、画布图等）立即抛，
-    换 IP 也没用。
+    直连的多个 attempt 是同一台机器的同一个出口 IP——429 后秒级重试同 IP
+    必然再 429（实测 2026-10-15，还恶化限流窗口），所以直连只试一次；
+    换 IP 靠代理池，配速靠轮间等待（限流窗口分钟级恢复）。
+    每次尝试都是 chrome 指纹 + 新 mime；400 类参数错误立即抛（换 IP 无益）。
     """
     attempts: list[tuple[str, AsyncSession]] = [
-        (f"direct#{i + 1}", _session()) for i in range(_DIRECT_ATTEMPTS)
-    ]
-    if FALLBACK_PROXY:
-        attempts.extend(
-            (f"proxy#{i + 1}",
-             _make_session(proxy=FALLBACK_PROXY, timeout=SUBMIT_TIMEOUT_S))
-            for i in range(_PROXY_ATTEMPTS))
+        (f"proxy#{i + 1}",
+         _make_session(proxy=FALLBACK_PROXY, timeout=SUBMIT_TIMEOUT_S))
+        for i in range(max(2, _PROXY_ATTEMPTS))
+    ] if FALLBACK_PROXY else [("direct#1", _session_direct())]
+    # 全挂后的等待重试轮：再走一遍代理（新出口 + 限流窗口已滑过）
+    retry_round = [
+        (f"retry-proxy#{i + 1}",
+         _make_session(proxy=FALLBACK_PROXY, timeout=SUBMIT_TIMEOUT_S))
+        for i in range(2)
+    ] if FALLBACK_PROXY else []
+    retry_wait_s = float(os.environ.get("BFL2OPENAI_SUBMIT_RETRY_WAIT_S", "15"))
 
     last = "no attempts"
-    for index, (attempt_label, session) in enumerate(attempts):
-        # 429 退避：限流是滑动窗口，秒级换出口硬打无效（出口池同 C 段），
-        # 等 5-12s 让窗口滑过再试，成功率远高于立即重试。
-        if index > 0 and last.startswith("submit via"):
+    rounds = [attempts] + ([retry_round] if retry_round else [])
+    total = [a for rnd in rounds for a in rnd]
+    index = -1
+    for rnd_i, rnd in enumerate(rounds):
+        if rnd_i > 0:
             import asyncio as _aio
-            await _aio.sleep(min(12.0, 4.0 + index * 2.0))
+            log.warning("submit: all %d attempts rate-limited; waiting %.0fs "
+                        "before retry round", len(attempts), retry_wait_s)
+            await _aio.sleep(retry_wait_s)
+        for attempt_label, session in rnd:
+            index += 1
         # mime 每次重建：CurlMime 的重放语义不可靠
         mp = CurlMime()
         for name, value in fields:
@@ -285,13 +307,12 @@ async def _submit_generation_impl(
         log.warning("submit via %s failed (%s)", attempt_label, last)
         if not retryable:
             raise UpstreamError(f"generate failed: {last}")
-        if index < len(attempts) - 1:
-            await asyncio.sleep(1.0 if index < _DIRECT_ATTEMPTS - 1 else 3.0)
-    raise UpstreamError(f"generate submit failed after {len(attempts)} attempts: {last}")
+    raise UpstreamError(
+        f"generate submit failed after {len(total)} attempts: {last}")
 
 
 async def poll_once(poll_token: str, base_url: str = DEFAULT_BASE) -> dict[str, Any]:
-    async with _session() as s:
+    async with _session(timeout=60) as s:
         r = await s.get(
             f"{base_url}/api/flux3-image/status",
             params={"pollToken": poll_token},
