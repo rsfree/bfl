@@ -76,6 +76,11 @@ _load_project_env()
 #:   socks5h://<user>:<pass>@pool.livetest.cn:2088
 FALLBACK_PROXY = os.environ.get("BFL2OPENAI_FALLBACK_PROXY", "")
 
+#: 上游全局并发槽 = 50（共享 showcases key，503 原文实测 2026-10-15）。
+#: gunicorn 3 worker x 16 = 48，留 2 槽余量给上游其他流量。
+_SUBMIT_SEM = asyncio.Semaphore(
+    int(os.environ.get("BFL2OPENAI_SUBMIT_CONCURRENCY", "16")))
+
 _DIRECT_ATTEMPTS = 3
 _PROXY_ATTEMPTS = 2
 #: Transport-ish failures that a retry (or a different exit) can fix. A 400
@@ -220,9 +225,10 @@ async def submit_generation(
             reference_parts = [(rb, name)
                                for rb, (_, name) in zip(ref_bytes_list,
                                                         reference_images)]
-        return await _submit_generation_impl(
-            fields=fields, image_png=image_png, base_url=base_url,
-            reference_parts=reference_parts)
+        async with _SUBMIT_SEM:   # 并发闸门：排队等槽，避免 503 槽满失败
+            return await _submit_generation_impl(
+                fields=fields, image_png=image_png, base_url=base_url,
+                reference_parts=reference_parts)
     except UpstreamError:
         raise
     except Exception as exc:  # noqa: BLE001 - 网络/超时/上游 5xx 统一包装
