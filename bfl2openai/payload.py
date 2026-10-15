@@ -83,3 +83,10 @@ def normalize_image_joint(main: bytes, refs: list[bytes]) -> tuple[bytes, list[b
     out_main, _ = normalize_image(main, budget=main_budget)
     out_refs = [normalize_image(r, budget=ref_budget)[0] for r in refs]
     return out_main, out_refs
+
+
+def content_type_of(data: bytes) -> str:
+    """按魔数判断图片类型（normalize 的 JPEG 兜底需要正确标注部件类型）。"""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    return "image/png"

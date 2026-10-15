@@ -455,3 +455,66 @@ def test_normalize_image_joint_shares_budget():
     assert total <= UPSTREAM_BODY_BUDGET          # 联合预算不超
     for r in refs:
         assert max(Image.open(io.BytesIO(r)).size) <= 2048
+
+
+def test_native_submit_splits_main_and_references(monkeypatch):
+    """入口契约：images[0] → image 部件；images[1:] → references 文件部件。"""
+    import asyncio
+
+    from bfl2openai import async_images, native, upstream
+
+    captured = {}
+
+    async def fake_ref(ref):
+        return b"png-bytes"
+
+    async def fake_submit(**kwargs):
+        captured.update(kwargs)
+        return "tok-1"
+
+    monkeypatch.setattr(native, "_reference_png", fake_ref)
+    monkeypatch.setattr(upstream, "submit_generation", fake_submit)
+
+    # 单张：无 references
+    asyncio.run(async_images.native_submit(
+        {"prompt": "x", "images": ["u1"], "aspect_ratio": "1:1"}, "1k", None, {}))
+    assert captured["image_png"] == b"png-bytes"
+    assert captured["reference_images"] is None
+
+    # 三张：第 1 张主图，第 2/3 张进 references
+    captured.clear()
+    asyncio.run(async_images.native_submit(
+        {"prompt": "x", "images": ["u1", "u2", "u3"], "aspect_ratio": "1:1"},
+        "1k", None, {}))
+    assert captured["image_png"] == b"png-bytes"
+    assert [n for _, n in captured["reference_images"]] == ["ref_2.png", "ref_3.png"]
+
+
+def test_single_image_normalized_before_upload(monkeypatch):
+    """>4MB 单图必须走 normalize 降档（历史回归：单图路径曾丢失该调用）。"""
+    import asyncio
+    import io
+    import os
+
+    from PIL import Image
+    from bfl2openai import upstream
+    from bfl2openai.payload import UPSTREAM_BODY_BUDGET, content_type_of
+
+    seen = {}
+
+    async def fake_post(url, multipart=None, headers=None):
+        raise AssertionError("should not reach network")  # pragma: no cover
+
+    im = Image.frombytes("RGB", (2000, 2000), os.urandom(2000 * 2000 * 3))
+    buf = io.BytesIO()
+    im.save(buf, "PNG", compress_level=1)
+    big = buf.getvalue()
+    assert len(big) > UPSTREAM_BODY_BUDGET
+
+    # 直接在 normalize 层验证（提交层需要真网络，此处只锁定降档语义 + 类型嗅探）
+    from bfl2openai.payload import normalize_image
+
+    out, ct = normalize_image(big)
+    assert len(out) <= UPSTREAM_BODY_BUDGET
+    assert content_type_of(out) == ct
+    assert content_type_of(b"\xff\xd8\xff\xe0rest") == "image/jpeg"

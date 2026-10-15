@@ -268,12 +268,15 @@ def register(app: FastAPI) -> None:
             else:
                 # text-to-image: verified 2026-10-09 (mode t2i, no image part,
                 # explicit aspect ratio -- "auto" is canvas-only semantics).
+                # 4k/8k 复合同 i2i：2k 生成 + MPS 超分。上游 2026-10-14 起对
+                # 匿名直出 4k 报 403 "4K resolution is available to BFL
+                # accounts only"，t2i 分支此前漏降档已补（full_matrix 抓到）。
                 poll_token = await upstream.submit_generation(
                     image_png=b"",
                     prompt=prompt,
                     boxes=boxes,
                     aspect_ratio=str(payload.get("aspect_ratio") or "auto"),
-                    resolution=resolution,
+                    resolution="2k" if resolution in COMPOSITE_TIERS else resolution,
                     mode="t2i",
                 )
                 if resolution in COMPOSITE_TIERS:
@@ -317,6 +320,8 @@ def register(app: FastAPI) -> None:
                 if mps.configured():
                     media = await upstream.fetch_media(state["imageToken"])
                     key = f"results/{state['imageToken'][:16]}.png"
+                    log.info("persist plain ready token=%s %d bytes",
+                             state["imageToken"][:16], len(media))
                     await mps.upload_to_cos(media, key)
                     state["persisted_url"] = mps.cos_presigned_get(
                         "/" + key, ttl_s=86400)
@@ -362,9 +367,13 @@ def register(app: FastAPI) -> None:
             # rides through our COS: download, upload, CosInputInfo.
             try:
                 media = await upstream.fetch_media(state["imageToken"])
+                log.info("composite gen ready token=%s target=%s media=%d bytes",
+                         token[:16], composite["target"], len(media))
                 key = f"upscale/{token[:16]}.png"
                 await mps.upload_to_cos(media, key)
                 task_id = await mps.submit_cos(key, percent=COMPOSITE_TIERS[composite["target"]])
+                log.info("composite MPS task=%s percent=%.1f", task_id[:16],
+                         COMPOSITE_TIERS[composite["target"]])
             except (mps.MPSError, RuntimeError, upstream.UpstreamError) as exc:
                 await store.drop(f"comp:{token}")
                 out["status"] = "Error"
@@ -392,6 +401,7 @@ def register(app: FastAPI) -> None:
             out["status"] = "Error"
             out["details"] = {"error": state["error"]}
             return JSONResponse(out)
+        log.info("composite done token=%s url=%s", token[:16], state["url"][:70])
         out["status"] = "Ready"
         out["result"] = {"sample": state["url"]}
         return JSONResponse(out)

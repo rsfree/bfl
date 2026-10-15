@@ -37,7 +37,7 @@ from typing import Any
 
 from curl_cffi import CurlMime
 
-from .payload import normalize_image
+from .payload import content_type_of, normalize_image
 from curl_cffi.requests import AsyncSession
 
 log = logging.getLogger("bfl2openai.upstream")
@@ -195,8 +195,12 @@ async def submit_generation(
         # 多参考图：联合预算规范化（主图 60% + 参考图均分），再以重复文件
         # 部件转发（契约实测 2026-10-14：按部件数量与 filename 配对）。
         reference_parts: list[tuple[bytes, str]] | None = None
+        if image_png and not reference_images:
+            # 单图路径：>4MB 规范化（PNG 降档 → JPEG 兜底），否则上游
+            # Vercel 4.5MB body 上限直接 413（实测 2026-10-14/15）。
+            image_png, _ct = normalize_image(image_png)
         if reference_images:
-            from .payload import normalize_image_joint
+            from .payload import content_type_of, normalize_image_joint
 
             main_bytes, ref_bytes_list = normalize_image_joint(
                 image_png, [b for b, _ in reference_images])
@@ -244,13 +248,15 @@ async def _submit_generation_impl(
             # An empty image part is NOT "no image": upstream answers
             # 400 "A composition must not include a canvas image." (measured
             # 2026-10-09 on a t2i attempt). Omit the part entirely instead.
-            mp.addpart(name="image", filename="image.png", content_type="image/png",
+            mp.addpart(name="image", filename="image.png",
+                       content_type=content_type_of(image_png),
                        data=image_png)
         for ref_bytes, ref_name in (reference_parts or []):
             # 多参考图契约（实测 2026-10-14）：references 是重复的文件部件，
             # 每张自带 filename —— 服务端按部件数量与文件名配对。
             mp.addpart(name="references", filename=ref_name,
-                       content_type="image/png", data=ref_bytes)
+                       content_type=content_type_of(ref_bytes),
+                       data=ref_bytes)
         try:
             async with session as s:
                 r = await s.post(

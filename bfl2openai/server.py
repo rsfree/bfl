@@ -101,6 +101,7 @@ async def run_job(
     response_format: str,
     request: Request,
     upscale_to: int | None = None,
+    reference_images: list[tuple[bytes, str]] | None = None,
 ) -> JSONResponse:
     async def one() -> dict[str, str]:
         gen_resolution = bridging.ensure_resolution_capacity(
@@ -113,6 +114,7 @@ async def run_job(
             resolution=gen_resolution,
             mode=mode,
             base_url=UPSTREAM_BASE,
+            reference_images=reference_images or None,
         )
         log.info("submitted pollToken=%s… (resolution=%s)", poll_token[:10], gen_resolution)
         image_token = await upstream.wait_for_result(poll_token, UPSTREAM_BASE)
@@ -221,6 +223,17 @@ async def images_edits(
     except Exception as exc:
         return openai_error(400, f"invalid image or boxes: {exc}")
 
+    # 多垫图：image[1:] 转发为 references 文件部件（上游按部件+filename 配对，
+    # 实测 2026-10-14）。单张失败丢弃、不阻塞主图。
+    reference_images: list[tuple[bytes, str]] = []
+    for idx, ref_file in enumerate(image[1:], start=2):
+        try:
+            reference_images.append(
+                (image_to_png(await ref_file.read()),
+                 ref_file.filename or f"ref_{idx}.png"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("edits reference #%d dropped: %s", idx, exc)
+
     if mask is not None:
         try:
             mask_boxes = mask_to_boxes(await mask.read())
@@ -256,6 +269,7 @@ async def images_edits(
         response_format=response_format or "b64_json",
         request=request,
         upscale_to=upscale_to,
+        reference_images=reference_images or None,
     )
 
 
@@ -264,13 +278,41 @@ async def images_generations(
     request: Request,
     payload: dict,
 ):
-    """Text-to-image. The precise-editing upstream is i2i-oriented; this path
-    posts without an input image using mode="t2i" (unverified against upstream).
+    """Text-to-image, or image-guided generation when `image` is supplied.
+
+    `image` accepts a string or list of strings (base64 / data URI / URL /
+    upload handle) -- list[0] becomes the canvas, the rest ride along as
+    upstream reference parts (contract measured 2026-10-14).
     """
     await check_auth(request)
     prompt = str(payload.get("prompt") or "")
     if not prompt:
         return openai_error(400, "prompt is required")
+
+    # 垫图（可选）：string | list[string] → 主图 + references
+    image_field = payload.get("image")
+    if isinstance(image_field, str):
+        refs_in = [image_field]
+    elif isinstance(image_field, (list, tuple)):
+        refs_in = [str(x) for x in image_field]
+    else:
+        refs_in = []
+    if len(refs_in) > native.MAX_IMAGES:
+        return openai_error(400, f"at most {native.MAX_IMAGES} images")
+    reference_images: list[tuple[bytes, str]] = []
+    image_png: bytes | None = None
+    for idx, ref in enumerate(refs_in):
+        try:
+            png = await native._reference_png(ref)
+        except Exception as exc:  # noqa: BLE001
+            if idx == 0:
+                return openai_error(400, f"invalid image: {exc}")
+            log.warning("generations reference #%d dropped: %s", idx + 1, exc)
+            continue
+        if idx == 0:
+            image_png = png
+        else:
+            reference_images.append((png, f"ref_{idx + 1}.png"))
     n = int(payload.get("n") or 1)
     response_format = payload.get("response_format") or "b64_json"
     ratio = payload.get("aspect_ratio") or size_to_aspect_ratio(payload.get("size"))
@@ -286,16 +328,17 @@ async def images_generations(
             "(MPS_SECRET_ID / MPS_SECRET_KEY not configured)",
         )
     return await run_job(
-        image_png=None,
+        image_png=image_png,
         prompt=prompt,
         boxes=[],
         aspect_ratio=ratio,
         resolution=resolution,
-        mode="t2i",
+        mode="i2i" if image_png else "t2i",
         n=max(1, min(n, 4)),
         response_format=response_format,
         request=request,
         upscale_to=upscale_to,
+        reference_images=reference_images or None,
     )
 
 
