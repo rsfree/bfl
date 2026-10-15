@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Any
 
 from curl_cffi import CurlMime
+
+from .payload import normalize_image
 from curl_cffi.requests import AsyncSession
 
 log = logging.getLogger("bfl2openai.upstream")
@@ -165,6 +167,8 @@ async def submit_generation(
     prompt: str,
     boxes: list[dict[str, Any]] | None = None,
     references: list[dict[str, Any]] | None = None,
+    reference_images: list[tuple[bytes, str]] | None = None,
+    extra_form_fields: dict[str, str] | None = None,
     aspect_ratio: str = "auto",
     resolution: str = "1.5k",
     mode: str = "i2i",
@@ -179,6 +183,8 @@ async def submit_generation(
         ("boxes", json.dumps(boxes or [])),
         ("references", json.dumps(references or [])),
     ]
+    for _k, _v in (extra_form_fields or {}).items():
+        fields.append((_k, _v))
     if not image_png and aspect_ratio == "auto":
         # "auto" means "derive from the canvas" -- without one the upstream
         # demands an explicit ratio ("Choose an aspect ratio for the canvas.",
@@ -186,8 +192,21 @@ async def submit_generation(
         # verified live the same day: 4k composite produced a real landscape).
         fields[2] = ("aspectRatio", "1:1")
     try:
+        # 多参考图：联合预算规范化（主图 60% + 参考图均分），再以重复文件
+        # 部件转发（契约实测 2026-10-14：按部件数量与 filename 配对）。
+        reference_parts: list[tuple[bytes, str]] | None = None
+        if reference_images:
+            from .payload import normalize_image_joint
+
+            main_bytes, ref_bytes_list = normalize_image_joint(
+                image_png, [b for b, _ in reference_images])
+            image_png = main_bytes
+            reference_parts = [(rb, name)
+                               for rb, (_, name) in zip(ref_bytes_list,
+                                                        reference_images)]
         return await _submit_generation_impl(
-            fields=fields, image_png=image_png, base_url=base_url)
+            fields=fields, image_png=image_png, base_url=base_url,
+            reference_parts=reference_parts)
     except UpstreamError:
         raise
     except Exception as exc:  # noqa: BLE001 - 网络/超时/上游 5xx 统一包装
@@ -198,6 +217,7 @@ async def _submit_generation_impl(
     fields: list[tuple[str, Any]],
     image_png: bytes,
     base_url: str = DEFAULT_BASE,
+    reference_parts: list[tuple[bytes, str]] | None = None,
 ) -> str:
     """提交：直连 x2 → （配了池则）池代理 x2 —— 换出口 IP = 换一份匿名配额。
 
@@ -226,6 +246,11 @@ async def _submit_generation_impl(
             # 2026-10-09 on a t2i attempt). Omit the part entirely instead.
             mp.addpart(name="image", filename="image.png", content_type="image/png",
                        data=image_png)
+        for ref_bytes, ref_name in (reference_parts or []):
+            # 多参考图契约（实测 2026-10-14）：references 是重复的文件部件，
+            # 每张自带 filename —— 服务端按部件数量与文件名配对。
+            mp.addpart(name="references", filename=ref_name,
+                       content_type="image/png", data=ref_bytes)
         try:
             async with session as s:
                 r = await s.post(

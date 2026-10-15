@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any
@@ -149,6 +150,18 @@ async def native_submit(payload: dict, resolution: str,
     images = payload.get("images") or []
     boxes = parse_boxes(payload.get("boxes"))
     png = await native._reference_png(images[0]) if images else b""
+    # 多参考图：images[1:] 转发为 references 文件部件（单张失败即丢弃）
+    reference_images = []
+    for idx, ref in enumerate(images[1:], start=2):
+        try:
+            ref_png = await native._reference_png(ref)
+            ref_name = f"ref_{idx}.png"
+            m = re.match(r"@image#\d+:(.+)", str(ref))
+            if m:
+                ref_name = m.group(1)
+            reference_images.append((ref_png, ref_name))
+        except Exception as exc:  # noqa: BLE001 — 单张参考失败不拖垮主任务
+            log.warning("async reference #%d dropped: %s", idx, exc)
     aspect_ratio = str(payload.get("aspect_ratio") or "auto")
     gen_resolution = ensure_resolution_capacity(
         aspect_ratio, "2k" if upscale_to else resolution)
@@ -159,6 +172,7 @@ async def native_submit(payload: dict, resolution: str,
         aspect_ratio=aspect_ratio,
         resolution=gen_resolution,
         mode="i2i" if images else "t2i",
+        reference_images=reference_images or None,
     )
 
 

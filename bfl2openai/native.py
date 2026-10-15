@@ -234,6 +234,20 @@ def register(app: FastAPI) -> None:
                                      "msg": str(exc)}]},
             )
 
+        # 多参考图：refs[1:] 转发为 references 文件部件（上游按部件+filename
+        # 配对，实测 2026-10-14）。逐张下载失败不阻塞主图——丢弃并记日志。
+        reference_images = []
+        for idx, ref in enumerate(refs[1:], start=2):
+            try:
+                ref_png = await _reference_png(ref)
+                ref_name = f"ref_{idx}.png"
+                m = re.match(r"@image#\d+:(.+)", str(ref))
+                if m:
+                    ref_name = m.group(1)
+                reference_images.append((ref_png, ref_name))
+            except (ValueError, upstream.UpstreamError) as exc:
+                log.warning("reference #%d dropped (fetch failed): %s", idx, exc)
+
         try:
             if png:
                 # 4k/8k composite: generate at the 2k anonymous ceiling, then
@@ -247,6 +261,7 @@ def register(app: FastAPI) -> None:
                     aspect_ratio=str(payload.get("aspect_ratio") or "auto"),
                     resolution=gen_resolution,
                     mode="i2i",
+                    reference_images=reference_images or None,
                 )
                 if resolution in COMPOSITE_TIERS:
                     await store.put(f"comp:{poll_token}", {"phase": "gen", "target": resolution}, ttl_s=_COMP_TTL)

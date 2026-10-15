@@ -408,3 +408,50 @@ def test_submit_param_errors_fail_fast_without_proxy(monkeypatch):
             image_png=b"", prompt="x", aspect_ratio="auto", mode="t2i"))
     assert "400" in str(exc.value)
     assert posts == [None]  # 参数错误第一跳就 fail-fast，不碰池
+
+
+def test_normalize_image_downscales_oversize():
+    import io
+    import os
+
+    from PIL import Image
+    from bfl2openai.payload import UPSTREAM_BODY_BUDGET, normalize_image
+
+    im = Image.frombytes("RGB", (3000, 3000), os.urandom(3000 * 3000 * 3))
+    buf = io.BytesIO()
+    im.save(buf, "PNG", compress_level=0)
+    big = buf.getvalue()
+    assert len(big) > UPSTREAM_BODY_BUDGET
+    out, ctype = normalize_image(big)
+    assert len(out) <= UPSTREAM_BODY_BUDGET
+    assert ctype == "image/png"
+    out_im = Image.open(io.BytesIO(out))
+    assert max(out_im.size) <= 2048
+
+
+def test_normalize_image_passthrough_small():
+    from bfl2openai.payload import normalize_image
+
+    small = b"\x89PNG-not-really-but-small"
+    out, ctype = normalize_image(small)
+    assert out == small and ctype == "image/png"
+
+
+def test_normalize_image_joint_shares_budget():
+    import io
+    import os
+
+    from PIL import Image
+    from bfl2openai.payload import UPSTREAM_BODY_BUDGET, normalize_image_joint
+
+    def big_png():
+        im = Image.frombytes("RGB", (3000, 3000), os.urandom(3000 * 3000 * 3))
+        buf = io.BytesIO()
+        im.save(buf, "PNG", compress_level=0)
+        return buf.getvalue()
+
+    main, refs = normalize_image_joint(big_png(), [big_png(), big_png()])
+    total = len(main) + sum(len(r) for r in refs)
+    assert total <= UPSTREAM_BODY_BUDGET          # 联合预算不超
+    for r in refs:
+        assert max(Image.open(io.BytesIO(r)).size) <= 2048
