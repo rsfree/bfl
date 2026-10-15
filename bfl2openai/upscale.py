@@ -205,7 +205,8 @@ async def _call(action: str, payload: dict) -> dict:
     return response
 
 
-async def submit_cos(object_key: str, percent: float = 2.0) -> str:
+async def submit_cos(object_key: str, percent: float = 2.0,
+                     sr_type: str = "standard") -> str:
     """One ProcessImage task with the input taken from our own COS object.
 
     URL inputs are rejected in practice: MPS's fetcher gets 429'd by the
@@ -228,7 +229,9 @@ async def submit_cos(object_key: str, percent: float = 2.0) -> str:
             "EnhanceConfig": {
                 "AdvancedSuperResolutionConfig": {
                     "Switch": "ON",
-                    "Type": "ultra",
+                    # standard=标准档兜底（实测 13.9s vs ultra 27.3s，纹理保留更
+                    # 忠实原图）；ultra 平滑化明显且慢一倍
+                    "Type": sr_type,
                     "Mode": "percent",
                     "Percent": percent,
                 }
