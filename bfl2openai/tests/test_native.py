@@ -545,8 +545,8 @@ def test_ci_input_image_keeps_dimensions():
     assert Image.open(io.BytesIO(out)).size == (2048, 2048)  # 尺寸不变！
 
 
-def test_moderation_maps_to_422():
-    """内容审核拒绝必须是 422（客户端内容问题），不是 502。"""
+def test_moderation_maps_to_451():
+    """内容审核拒绝必须 451（合规拒绝标准语义），不是 502。"""
     from bfl2openai import server as server_mod
     from bfl2openai.upstream import UpstreamError
 
@@ -554,7 +554,7 @@ def test_moderation_maps_to_422():
         UpstreamError('status failed: HTTP 422: {"error":"Your input was flagged '
                       'by content moderation.","code":"moderation"}',
                       "content_policy"))
-    assert r.status_code == 422
+    assert r.status_code == 451
     assert b"moderation" in r.body.lower()
 
 
@@ -588,4 +588,31 @@ def test_poll_negative_cache_for_moderation(monkeypatch):
     assert calls["n"] == 1          # 第二次命中负缓存，上游零请求
     cached = asyncio.run(store.get(f"pollcache:{tok[:40]}"))
     assert cached is not None and cached["status"] == "error"
+    asyncio.run(store.drop(f"pollcache:{tok[:40]}"))
+
+
+def test_negative_cache_ttl_is_7_days(monkeypatch):
+    import asyncio
+
+    from bfl2openai import store, upstream
+
+    async def fake_poll(token, base_url=None):
+        raise upstream.UpstreamError(
+            'status failed: HTTP 422: {"error":"flagged by content moderation"}')
+
+    monkeypatch.setattr(upstream, "poll_once", fake_poll)
+    tok = "neg-ttl-tok"
+
+    async def one():
+        try:
+            await upstream.poll_once_cached(tok)
+        except upstream.UpstreamError:
+            pass
+
+    asyncio.run(one())
+    import time as _t
+
+    _data, expire_ts = store._MEM.get(f"pollcache:{tok[:40]}")
+    assert expire_ts is not None, "负缓存必须带过期时间"
+    assert expire_ts - _t.time() > 6 * 24 * 3600, "负缓存 TTL 应 ~7 天"
     asyncio.run(store.drop(f"pollcache:{tok[:40]}"))

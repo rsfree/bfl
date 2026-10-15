@@ -331,6 +331,8 @@ async def poll_once(poll_token: str, base_url: str = DEFAULT_BASE) -> dict[str, 
 
 _POLL_CACHE_INFLIGHT_S = 3.0    # 生成中：同 token 轮询合并窗口
 _POLL_CACHE_TERMINAL_S = 120.0  # 终态：完成后重复轮询零上游请求
+_POLL_CACHE_NEG_TTL_S = 7 * 24 * 3600  # 负缓存（审核拒绝/失效 token）= 7 天：
+    # 永久终态不会自愈，长缓存彻底杜绝死 token 的重复上游请求
 
 
 async def poll_once_cached(poll_token: str, base_url: str = DEFAULT_BASE) -> dict:
@@ -361,7 +363,7 @@ async def poll_once_cached(poll_token: str, base_url: str = DEFAULT_BASE) -> dic
             await store.put(cache_key, {"status": "error",
                                         "error": str(exc)[:300],
                                         "kind": kind},
-                            ttl_s=int(_POLL_CACHE_TERMINAL_S))
+                            ttl_s=int(_POLL_CACHE_NEG_TTL_S))
             raise UpstreamError(str(exc), kind) from exc
         raise
     ttl = int(_POLL_CACHE_TERMINAL_S if state.get("status") in ("ready", "error")

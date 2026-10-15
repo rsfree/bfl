@@ -73,7 +73,8 @@ def wrap_upstream_error(exc: UpstreamError) -> JSONResponse:
     # 内容审核（moderation）是客户端内容问题：422 让调用方明确知道
     # "换内容"而不是"重试"（此前误映射为 502，客户会无效重试且监控失真）。
     if exc.kind == "content_policy":
-        return openai_error(422, f"Content moderation rejected: {exc.message}",
+        # 451 Unavailable For Legal Reasons：内容合规拒绝的 HTTP 标准语义
+        return openai_error(451, f"Content moderation rejected: {exc.message}",
                             "content_policy_violation")
     status = 400 if exc.kind == "invalid_request_error" else 502
     return openai_error(status, f"Upstream error: {exc.message}", exc.kind)
