@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any
 
@@ -318,3 +319,88 @@ async def wait_done(task_id: str, timeout_s: float = 180.0) -> str:
             raise MPSError(state["error"])
         await asyncio.sleep(3.0)
     raise MPSError(f"upscale task {task_id} did not finish within {timeout_s:.0f}s")
+
+
+def cos_ci_signed_url(object_key: str, ci_params: dict, ttl_s: int = 900) -> str:
+    """COS GET 签名 URL，处理参数（ci-process 等）参与签名。
+
+    CI 同步图片处理直接作用在桶对象上：GET 即返回处理后的字节，无任务无轮询。
+    签名按 COS XML-API 规范：Parameters 排序 k=v（k 小写、值 URL 编码），
+    q-url-param-list 列参数名（分号分隔）。
+    """
+    now = int(time.time()) - 60
+    key_time = f"{now};{now + ttl_s}"
+    sign_key = hmac.new(SECRET_KEY.encode("utf-8"), key_time.encode("utf-8"),
+                        hashlib.sha1).hexdigest()
+    kv = "&".join(f"{k.lower()}={urllib.parse.quote(str(v), safe='')}"
+                  for k, v in sorted(ci_params.items()))
+    plist = ";".join(sorted(k.lower() for k in ci_params))
+    fmt = f"get\n/{object_key.lstrip('/')}\n{kv}\n\n"
+    string_to_sign = (
+        f"sha1\n{key_time}\n" + hashlib.sha1(fmt.encode("utf-8")).hexdigest() + "\n")
+    signature = hmac.new(sign_key.encode("utf-8"),
+                         string_to_sign.encode("utf-8"), hashlib.sha1).hexdigest()
+    qs = "&".join(f"{k}={urllib.parse.quote(str(v), safe='')}"
+                  for k, v in ci_params.items())
+    auth = (f"q-sign-algorithm=sha1&q-ak={SECRET_ID}"
+            f"&q-sign-time={key_time}&q-key-time={key_time}"
+            f"&q-header-list=&q-url-param-list={plist}&q-signature={signature}")
+    return (f"https://{OUTPUT_BUCKET}.cos.{OUTPUT_REGION}.myqcloud.com"
+            f"/{object_key.lstrip('/')}?{qs}&{auth}")
+
+
+async def ci_super_resolve_cos(object_key: str, magnify: int) -> bytes:
+    """数据万象同步超分：GET ?ci-process=AISuperResolution 直接返回放大图。
+
+    magnify ∈ {2,3,4}；失败抛 MPSError（调用方决定是否回落 MPS 异步任务）。
+    实测 2026-10-15：ap-singapore 桶可用，512²→1024² 秒级返回。
+    """
+    url = cos_ci_signed_url(object_key, {
+        "ci-process": "AISuperResolution", "magnify": magnify})
+    try:
+        async with upstream._session() as s:
+            r = await s.get(url)
+    except Exception as exc:  # noqa: BLE001 - 网络/超时统一包装
+        raise MPSError(f"CI super-resolution request failed: {exc}") from exc
+    if r.status_code != 200:
+        raise MPSError(f"CI super-resolution failed: HTTP {r.status_code}: "
+                       f"{r.text[:150]}")
+    if r.content[:8] != b"\x89PNG\r\n\x1a\n":
+        raise MPSError(f"CI super-resolution returned non-PNG: {r.content[:120]}")
+    return r.content
+
+
+def ci_input_image(data: bytes, budget: int = 4_500_000) -> bytes:
+    """CI 同步超分的输入准备：**保尺寸、压体积**。
+
+    与 payload.normalize_image 的差别：超分要保留原始分辨率（放大倍数作用
+    在输入尺寸上），所以优先 JPEG 重编码（照片压缩率高，2048²≈2MB），
+    尺寸纹丝不动；确实压不进预算再按比例缩（极端兜底）。
+    """
+    from io import BytesIO
+
+    from PIL import Image
+
+    if len(data) <= budget:
+        return data
+    try:
+        im = Image.open(BytesIO(data))
+        im.load()
+    except Exception:  # noqa: BLE001 - 解不开就原样交由 CI 报错
+        return data
+    if im.mode not in ("RGB", "L"):
+        im = im.convert("RGB")
+    for quality in (92, 85, 78, 70):
+        buf = BytesIO()
+        im.save(buf, "JPEG", quality=quality)
+        if len(buf.getvalue()) <= budget:
+            return buf.getvalue()
+    # 极端兜底：降尺寸 + JPEG
+    for scale in (0.75, 0.5):
+        resized = im.resize((int(im.size[0] * scale), int(im.size[1] * scale)),
+                            Image.LANCZOS)
+        buf = BytesIO()
+        resized.save(buf, "JPEG", quality=85)
+        if len(buf.getvalue()) <= budget:
+            return buf.getvalue()
+    return buf.getvalue()

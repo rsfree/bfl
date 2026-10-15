@@ -518,3 +518,19 @@ def test_single_image_normalized_before_upload(monkeypatch):
     assert len(out) <= UPSTREAM_BODY_BUDGET
     assert content_type_of(out) == ct
     assert content_type_of(b"\xff\xd8\xff\xe0rest") == "image/jpeg"
+
+
+def test_ci_input_image_keeps_dimensions():
+    """CI 输入：压体积不压尺寸（4k 复合实测：降档导致只出 2k）。"""
+    import io
+    import os
+
+    from PIL import Image
+    from bfl2openai.upscale import ci_input_image
+
+    im = Image.frombytes("RGB", (2048, 2048), os.urandom(2048 * 2048 * 3))
+    buf = io.BytesIO()
+    im.save(buf, "PNG", compress_level=6)
+    out = ci_input_image(buf.getvalue(), budget=4_500_000)
+    assert len(out) <= 4_500_000
+    assert Image.open(io.BytesIO(out)).size == (2048, 2048)  # 尺寸不变！
