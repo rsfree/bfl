@@ -556,3 +556,36 @@ def test_moderation_maps_to_422():
                       "content_policy"))
     assert r.status_code == 422
     assert b"moderation" in r.body.lower()
+
+
+def test_poll_negative_cache_for_moderation(monkeypatch):
+    """审核拒绝的 token 必须负缓存——重复轮询不再打上游。"""
+    import asyncio
+
+    from bfl2openai import store, upstream
+
+    calls = {"n": 0}
+
+    async def fake_poll(token, base_url=None):
+        calls["n"] += 1
+        raise upstream.UpstreamError(
+            'status failed: HTTP 422: {"status":"error","error":"Your input was '
+            'flagged by content moderation.","code":"moderation"}')
+
+    monkeypatch.setattr(upstream, "poll_once", fake_poll)
+    tok = "neg-cache-tok"
+
+    async def twice():
+        for _ in range(2):
+            try:
+                async def _noop():
+                    return await upstream.poll_once_cached(tok)
+                await _noop()
+            except upstream.UpstreamError:
+                pass
+
+    asyncio.run(twice())
+    assert calls["n"] == 1          # 第二次命中负缓存，上游零请求
+    cached = asyncio.run(store.get(f"pollcache:{tok[:40]}"))
+    assert cached is not None and cached["status"] == "error"
+    asyncio.run(store.drop(f"pollcache:{tok[:40]}"))

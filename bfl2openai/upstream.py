@@ -346,7 +346,17 @@ async def poll_once_cached(poll_token: str, base_url: str = DEFAULT_BASE) -> dic
     cached = await store.get(cache_key)
     if cached is not None:
         return cached
-    state = await poll_once(poll_token, base_url)
+    try:
+        state = await poll_once(poll_token, base_url)
+    except UpstreamError as exc:
+        # 负缓存：终态错误（内容审核/失效 token）不会自愈——不缓存的话，
+        # 同一个死 token 的每次轮询都会白打上游一次 422。
+        low = str(exc).lower()
+        if any(k in low for k in ("moderation", "flagged",
+                                  "invalid or expired")):
+            neg = {"status": "error", "error": str(exc)[:300]}
+            await store.put(cache_key, neg, ttl_s=int(_POLL_CACHE_TERMINAL_S))
+        raise
     ttl = int(_POLL_CACHE_TERMINAL_S if state.get("status") in ("ready", "error")
               else _POLL_CACHE_INFLIGHT_S)
     await store.put(cache_key, state, ttl_s=ttl)
