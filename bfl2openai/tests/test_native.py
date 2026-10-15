@@ -543,3 +543,16 @@ def test_ci_input_image_keeps_dimensions():
     out = ci_input_image(buf.getvalue(), budget=4_500_000)
     assert len(out) <= 4_500_000
     assert Image.open(io.BytesIO(out)).size == (2048, 2048)  # 尺寸不变！
+
+
+def test_moderation_maps_to_422():
+    """内容审核拒绝必须是 422（客户端内容问题），不是 502。"""
+    from bfl2openai import server as server_mod
+    from bfl2openai.upstream import UpstreamError
+
+    r = server_mod.wrap_upstream_error(
+        UpstreamError('status failed: HTTP 422: {"error":"Your input was flagged '
+                      'by content moderation.","code":"moderation"}',
+                      "content_policy"))
+    assert r.status_code == 422
+    assert b"moderation" in r.body.lower()

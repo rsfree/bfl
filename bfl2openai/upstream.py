@@ -371,7 +371,13 @@ async def wait_for_result(
             return token
         if status == "error":
             msg = last.get("error") or "unknown upstream error"
-            kind = "invalid_request_error" if "token" in str(msg).lower() else "upstream_error"
+            low = str(msg).lower()
+            if "moderation" in low or "flagged" in low:
+                kind = "content_policy"      # 内容审核：客户端内容问题，非上游故障
+            elif "token" in low:
+                kind = "invalid_request_error"
+            else:
+                kind = "upstream_error"
             raise UpstreamError(str(msg), kind)
         if callable(on_poll):
             on_poll(last)
