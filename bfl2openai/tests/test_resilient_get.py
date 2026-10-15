@@ -50,6 +50,8 @@ def _reset(monkeypatch):
     monkeypatch.setattr(upstream, "FALLBACK_PROXY", "")
     monkeypatch.setattr(upstream, "_make_session",
                         lambda proxy=None, timeout=None: _FakeSession())
+    monkeypatch.setattr(upstream, "_session_direct",
+                        lambda: _FakeSession())
     monkeypatch.setattr(upstream.asyncio, "sleep", lambda s: _done())
     yield
 
@@ -87,11 +89,12 @@ def test_400_is_an_answer_not_an_outage():
     assert _FakeSession.calls == 1  # no retry on a plain business 400
 
 
-def test_proxy_fallback_runs_after_direct(monkeypatch):
+def test_proxy_chain_when_configured(monkeypatch):
+    """新架构（2026-10-15）：配置池时全部走代理，无 direct 前缀。"""
     monkeypatch.setattr(upstream, "FALLBACK_PROXY", "http://pool:2086")
     monkeypatch.setattr(upstream, "_DIRECT_ATTEMPTS", 2)
-    monkeypatch.setattr(upstream, "_PROXY_ATTEMPTS", 1)
-    _FakeSession.statuses = [429, 429, 200]
+    monkeypatch.setattr(upstream, "_PROXY_ATTEMPTS", 2)
+    _FakeSession.statuses = [429, 200]
     data = _run(upstream._resilient_get("https://x/media", label="media"))
     assert data == b"ok"
-    assert _FakeSession.calls == 3
+    assert _FakeSession.calls == 2
