@@ -209,7 +209,11 @@ async def list_models(request: Request):
 @app.post("/v1/images/edits")
 async def images_edits(
     request: Request,
-    image: list[UploadFile] = File(...),
+    # 多图两种拼法都要接：OpenAI 官方 curl 示例用可重复的 `image[]`，而
+    # openai-python SDK 用重复的 `image`（实测 2026-10-20：只认后者时
+    # `image[]` 直接 422 missing image）。合并后 files[0]=画布，其余=参考图。
+    image: list[UploadFile] | None = File(None),
+    image_bracket: list[UploadFile] | None = File(None, alias="image[]"),
     prompt: str = Form(""),
     mask: UploadFile | None = File(None),
     n: int = Form(1),
@@ -225,16 +229,20 @@ async def images_edits(
     if not prompt and not boxes:
         return openai_error(400, "prompt (or boxes) is required")
 
+    files: list[UploadFile] = list(image or []) + list(image_bracket or [])
+    if not files:
+        return openai_error(400, "image is required")
+
     try:
-        image_png = image_to_png(await image[0].read())
+        image_png = image_to_png(await files[0].read())
         box_list = parse_boxes(boxes)
     except Exception as exc:
         return openai_error(400, f"invalid image or boxes: {exc}")
 
-    # 多垫图：image[1:] 转发为 references 文件部件（上游按部件+filename 配对，
+    # 多垫图：files[1:] 转发为 references 文件部件（上游按部件+filename 配对，
     # 实测 2026-10-14）。单张失败丢弃、不阻塞主图。
     reference_images: list[tuple[bytes, str]] = []
-    for idx, ref_file in enumerate(image[1:], start=2):
+    for idx, ref_file in enumerate(files[1:], start=2):
         try:
             reference_images.append(
                 (image_to_png(await ref_file.read()),

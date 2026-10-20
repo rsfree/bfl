@@ -150,7 +150,7 @@ multipart 字段：
 
 | 字段 | 说明 |
 | --- | --- |
-| `image` | 必填，任意常见格式（自动转 PNG） |
+| `image` / `image[]` | 必填（≥1 张），任意常见格式（自动转 PNG）。**重复该字段即多图生图**：第 1 张是画布、其余作为上游参考图文件部件转发。两种拼法都接——`image[]` 是 OpenAI 官方 curl 示例的写法，重复 `image` 是 openai-python SDK 的写法（2026-10-20 实测两者均出图） |
 | `prompt` | 全局编辑指令 |
 | `mask` | 可选，OpenAI 语义（透明=可编辑区）；自动求连通域外接矩形 → 上游 `boxes`，每框 instruction=prompt |
 | `n` | 1~4，并发提交 |
@@ -158,6 +158,31 @@ multipart 字段：
 | `response_format` | `b64_json`（默认）或 `url` |
 | `boxes` **（扩展）** | 直接传上游 JSON，玩转精确区域编辑（可含每区域独立 instruction） |
 | `aspect_ratio` / `resolution` / `mode` **（扩展）** | 透传上游（默认 `auto` / `1.5k` / `i2i`） |
+
+多图生图（2026-10-20 端到端实测）：主图「白瓷马克杯+木桌」+ 参考图「黄色橡皮鸭」，
+prompt 要求把鸭子放进杯子，输出同时保留了两张源的要素（杯体/木桌/光影来自主图，
+鸭子造型与橙喙来自参考图），50~55s 出图。合成基准图与产物在 `saved_images/multi_ref/`。
+
+一条命令的现成脚本：`bfl2openai/tests/curl_multi_edit.sh`（自动读 `.env` 取 key、自动
+`--noproxy '*'`、解码 b64 落盘，图片数量不限）。
+
+```sh
+cd bfl2openai/tests
+./curl_multi_edit.sh out.png "Put the duck into the mug" mug.png duck.png
+SPELL=image ./curl_multi_edit.sh out_sdk.png "Put the duck into the mug" mug.png duck.png
+```
+
+脚本内部就是下面这条 curl（`SPELL` 只换字段名）：
+
+```sh
+curl -s --noproxy '*' -X POST http://127.0.0.1:8977/v1/images/edits \
+  -H "Authorization: Bearer $BFL2OPENAI_API_KEY" \
+  -F "image[]=@mug.png" -F "image[]=@duck.png" \
+  -F "prompt=Put the duck into the mug" -F "resolution=1k" -F "response_format=b64_json"
+```
+
+两条拼法实跑对照（2026-10-20）：`image[]` 46s / 1.24MB，`image` 47s / 1.27MB，
+画面一致（`saved_images/multi_ref/curl_bracket.png` vs `curl_sdk.png`）。
 
 响应（OpenAI 格式）：
 
