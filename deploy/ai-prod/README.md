@@ -21,10 +21,34 @@ scp -i ~/.ssh/id_ed25519_ops bfl2openai/.env root@210.121.44.245:/opt/bfl/deploy
 ssh -i ~/.ssh/id_ed25519_ops root@210.121.44.245 \
   'chown root:10001 /opt/bfl/deploy/ai-prod/.env && chmod 640 /opt/bfl/deploy/ai-prod/.env'
 ssh -i ~/.ssh/id_ed25519_ops root@210.121.44.245 \
-  'cd /opt/bfl && docker compose -f deploy/ai-prod/docker-compose.yml up -d --build'
+  'cd /opt/bfl && docker compose -f deploy/ai-prod/docker-compose.yml pull \
+   && docker compose -f deploy/ai-prod/docker-compose.yml up -d'
 ```
 
 之后：投 :80 vhost → 加 DNS A 记录（bfl.1task.cn → 210.121.44.245）→ 跑 apply-https.sh。
+
+## 发布与回滚（2026-10-20 起：不在服务器 build）
+
+```sh
+git push origin main          # release.yml：自增版本 → 构建并推 ghcr.io/rsfree/bfl:{版本,latest,sha-<sha>}
+gh run watch --exit-status    # 等价于看 CI 绿
+
+ssh -i ~/.ssh/id_ed25519_ops root@210.121.44.245 'bash -s' <<'EOS'
+cd /opt/bfl
+sed -i '/^BFL_IMAGE_TAG=/d' deploy/ai-prod/.env
+echo 'BFL_IMAGE_TAG=<版本>' >> deploy/ai-prod/.env      # 回滚＝把这里改回旧 tag
+docker compose -f deploy/ai-prod/docker-compose.yml pull bfl2openai
+docker compose -f deploy/ai-prod/docker-compose.yml up -d bfl2openai
+EOS
+```
+
+GHCR tag **不带 `v` 前缀**（`git tag v0.2.34` → 镜像 `0.2.34`），与 jimeng/qwen 等既有镜像一致。
+
+镜像包 `ghcr.io/rsfree/bfl` 已设为 **public**（2026-10-20 核实：匿名 `docker manifest inspect`
+直接返回 manifest、匿名 `docker pull` 成功下载），所以部署本服务**不需要** `docker login`。
+🔴 但同一台机器上 `ghcr.io/rsfree/metaso` 仍是 private，**不要**执行 `docker logout ghcr.io`，
+否则 metaso 一旦重建就拉不下来。包归属是 **组织 rsfree**，改可见性只有 org owner 能操作
+（`https://github.com/orgs/rsfree/packages/container/bfl/settings`）；改仓库可见性不会联动改包。
 
 ## 并发与 gunicorn
 
