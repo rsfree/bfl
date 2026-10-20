@@ -15,9 +15,10 @@ services:
               "--maxmemory-policy", "volatile-ttl"]
 
   bfl2openai:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
+    # 镜像由 CI 构建推送（.github/workflows/release.yml 的 docker job），
+    # 生产只 pull，不在服务器上 build。换版本 = 改 BFL_IMAGE_TAG（deploy/ai-prod/.env）。
+    # 回滚 = 把 tag 改回上一个版本号再 up -d，不再依赖"重新构建当时那份源码"。
+    image: ghcr.io/rsfree/bfl:${BFL_IMAGE_TAG:-latest}
     container_name: bfl2openai
     restart: unless-stopped
     user: "10001:10001"

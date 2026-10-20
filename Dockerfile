@@ -1,4 +1,7 @@
-# bfl2openai · ai-prod 部署镜像（服务器构建路径；无 GHCR 镜像）
+# bfl2openai · ai-prod 部署镜像
+# 由 CI（.github/workflows/release.yml 的 docker job）构建并推送
+#   ghcr.io/rsfree/bfl:<版本>（tag 不带 v 前缀）/ :latest / :sha-<sha>
+# 生产只 pull 不 build（deploy/ai-prod/docker-compose.yml）；服务器上 `docker build` 仅作紧急兜底。
 # 运行方式：源码就位（非 pip install），.env 由卷挂到 /app/bfl2openai/.env
 #   —— upstream/upscale 的 .env 加载器按「包目录」找文件，挂载点必须一致。
 FROM python:3.13-slim
