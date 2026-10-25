@@ -149,5 +149,7 @@ jobs:
       - name: Verify pushed image
         run: |
           set -euo pipefail
+          # sed 而非 head：pipefail 下 head 提前关管道会以 SIGPIPE 误报失败
           docker buildx imagetools inspect \
-            "${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.name }}" | head -12
+            "${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.name }}" \
+            | sed -n '1,12p'
