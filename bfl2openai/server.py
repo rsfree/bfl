@@ -95,6 +95,10 @@ def _parse_long_side(size: str | None) -> int | None:
 #: beyond is reached by generating at 2k and MPS-upscaling (x = long/2048).
 GEN_LONG_EDGE = 2048
 
+#: 审核诊断采样开关（默认关）。开时审核拒绝会记录 prompt 前 100 字符，
+#: 用于定位高频违规词；采样期结束务必关掉（客户内容不落日志是默认原则）。
+_MODERATION_DIAG = os.environ.get("BFL2OPENAI_MODERATION_DIAG", "") == "1"
+
 
 async def run_job(
     image_png: bytes | None,
@@ -170,6 +174,12 @@ async def run_job(
                 raise first_err
     except UpstreamError as exc:
         log.warning("run_job upstream error: %s", str(exc)[:300])
+        if _MODERATION_DIAG and exc.kind == "content_policy":
+            snippet = " ".join((prompt or "").split())[:100]
+            log.warning(
+                "MODERATION_DIAG prompt=%r res=%s has_image=%s refs=%d msg=%s",
+                snippet, resolution, bool(image_png),
+                len(reference_images or []), str(exc)[-80:])
         return wrap_upstream_error(exc)
     except mps.MPSError as exc:
         log.warning("run_job mps error: %s", str(exc)[:300])
