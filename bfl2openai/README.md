@@ -208,10 +208,12 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8977/v1/images/edits \
   棕熊牌6／企鹅牌7／兔子牌8）后 **8 只全部出现、顺序与牌号全对、造型与参考图同款**
   （产物 `saved_images/multi_ref_8animals/D_named_8animals.png`）。⇒ 参考图张数不是
   瓶颈（8 张照吃），瓶颈全在 prompt 有没有逐个指名物体。
-  `size` 两种拼法都认（2026-10-25 修）：`"3:2"` 比例写法 + `"1536x1024"` 像素写法。
-  修前只认像素写法，`size:"3:2"` 静默落 `auto` → 横图请求回来是 1488×2731 竖图；
-  同 prompt 改传 `aspect_ratio:"3:2"` 才得到 2512×1664。非法值（`"foo"`、`"10:1"`）
-  仍 fallback `auto`，映射单测见 `tests/test_size_ratio.py`（27 例）。
+  `size` 两种拼法都认（2026-10-25 修）：`"3:2"` 比例写法 + `"1536x1024"` 像素写法，
+  分隔符 `x` / `×` / `*` / 大小写不敏感，都走同一套解析。修前只认小写 `x` 的像素写法：
+  `size:"3:2"` 静默落 `auto`（横图请求回来是 1488×2731 竖图，无报错），
+  `"1536×1024"`（全角乘号）同样失效且长边也解析不到。非法值（`"foo"`、`"10:1"`）
+  仍 fallback `auto`。像素写法的长边还会参与升采样判断（>2048 走 MPS），
+  比例写法只影响 `aspectRatio`。映射单测见 `tests/test_size_ratio.py`。
 - `GET /v1/images/results/{imageToken}` — 代理上游 media 字节流（配 `response_format=url` 用）。
 - `GET /v1/models` / `GET /healthz`。
 

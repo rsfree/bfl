@@ -104,32 +104,68 @@ def _nearest_ratio(ratio: float) -> str:
     return "auto"
 
 
+#: 客户端实际出现过的分隔符：ASCII x、Unicode ×、乘号 *、比例冒号。
+#: 统一成一个入口解析，避免某一种写法静默落到 auto。
+_SIZE_SEPARATORS = ("x", "×", "*", ":")
+
+
+def _split_size(token: str) -> tuple[float, float] | None:
+    """把 "1536x1024" / "1536×1024" / "1536*1024" / "3:2" 拆成两个正数。"""
+    for sep in _SIZE_SEPARATORS:
+        if sep in token:
+            left, _, right = token.partition(sep)
+            try:
+                a, b = float(left.strip()), float(right.strip())
+            except Exception:
+                return None
+            if a > 0 and b > 0:
+                return a, b
+            return None
+    return None
+
+
+def parse_size_dims(size: str | None) -> tuple[int, int] | None:
+    """像素写法的宽高；比例写法/非法值返回 None。
+
+    与 size_to_aspect_ratio 共用同一套分隔符，否则 "1536×1024" 这类写法
+    会「比例对了、长边没解析到」，尺寸相关逻辑（超 2k 升采样）静默失效。
+    """
+    if not size:
+        return None
+    token = str(size).strip().lower()
+    # 只有 "WxH" 一族算像素；"3:2" 是比例，别把长边当成 3。
+    if ":" in token and not any(sep in token for sep in ("x", "×", "*")):
+        return None
+    dims = _split_size(token)
+    if not dims:
+        return None
+    a, b = dims
+    if a != int(a) or b != int(b):
+        return None
+    return int(a), int(b)
+
+
 def size_to_aspect_ratio(size: str | None) -> str:
     """Map a client `size` to an upstream aspect ratio; fall back to "auto".
 
-    Accepts both spellings, because callers use both and the wrong one used to
+    Accepts both spellings, because callers use both and one of them used to
     fail silently (2026-10-25: `size:"3:2"` fell through to "auto", so a
     landscape request came back portrait at 1488x2731 with no error):
 
-      * "1536x1024" -- OpenAI's pixel form, matched to the nearest enum
-      * "3:2"       -- the ratio form, which is upstream's own enum spelling
+      * "1536x1024"       -- OpenAI's pixel form, matched to the nearest enum
+      * "1536×1024" / "*" -- the same thing pasted from a UI
+      * "3:2"             -- the ratio form, upstream's own enum spelling
     """
     if not size:
         return "auto"
     token = str(size).strip().lower()
-    if ":" in token:
-        if token in _RATIO_NAMES:
-            return token
-        try:
-            a, b = token.split(":")
-            return _nearest_ratio(float(a) / float(b))
-        except Exception:
-            return "auto"
-    try:
-        sw, sh = token.split("x")
-        ratio = float(sw) / float(sh)
-    except Exception:
+    if ":" in token and token in _RATIO_NAMES:
+        return token
+    dims = _split_size(token)
+    if not dims:
         return "auto"
+    a, b = dims
+    ratio = a / b
     if abs(ratio - 1.0) < 0.02:
         return "1:1"
     return _nearest_ratio(ratio)

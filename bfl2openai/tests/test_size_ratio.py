@@ -7,7 +7,7 @@
 
 import pytest
 
-from bfl2openai.bridging import _COMMON_RATIOS, size_to_aspect_ratio
+from bfl2openai.bridging import _COMMON_RATIOS, parse_size_dims, size_to_aspect_ratio
 
 
 @pytest.mark.parametrize(
@@ -65,3 +65,38 @@ def test_every_enum_member_round_trips() -> None:
 
 def test_whitespace_and_case_tolerated() -> None:
     assert size_to_aspect_ratio("  3:2 ") == "3:2"
+
+
+@pytest.mark.parametrize(
+    "size",
+    ["1536x1024", "1536×1024", "1536*1024", "1536 X 1024"],
+)
+def test_pixel_separators_are_equivalent(size: str) -> None:
+    """UI 复制出来的 × / 手输的 * / 大小写 X 都得当成同一个像素写法。"""
+    assert size_to_aspect_ratio(size) == "3:2"
+    assert parse_size_dims(size) == (1536, 1024)
+
+
+def test_ratio_is_not_mistaken_for_pixels() -> None:
+    """"3:2" 是比例，长边不是 3 —— 不能让升采样逻辑拿到 3。"""
+    assert parse_size_dims("3:2") is None
+    assert parse_size_dims("16:9") is None
+    assert parse_size_dims("1536x1024") == (1536, 1024)
+
+
+@pytest.mark.parametrize(
+    "size,long_edge",
+    [
+        ("2512x1664", 2512),
+        ("2512×1664", 2512),
+        ("1664*2512", 2512),
+        ("1024x1024", 1024),
+        ("3:2", None),
+        ("foo", None),
+        (None, None),
+    ],
+)
+def test_parse_long_side_accepts_all_separators(size, long_edge) -> None:
+    from bfl2openai.server import _parse_long_side
+
+    assert _parse_long_side(size) == long_edge

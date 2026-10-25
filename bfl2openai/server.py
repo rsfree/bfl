@@ -33,7 +33,13 @@ from . import bridging
 from . import upscale as mps
 from . import uploads
 from . import async_images
-from .bridging import image_to_png, mask_to_boxes, parse_boxes, size_to_aspect_ratio
+from .bridging import (
+    image_to_png,
+    mask_to_boxes,
+    parse_boxes,
+    parse_size_dims,
+    size_to_aspect_ratio,
+)
 from .upstream import UpstreamError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -81,14 +87,15 @@ def wrap_upstream_error(exc: UpstreamError) -> JSONResponse:
 
 
 def _parse_long_side(size: str | None) -> int | None:
-    """A canonical "WxH" as its long edge, or None when it does not parse."""
-    if not size:
+    """A "WxH" size as its long edge, or None for ratio/junk.
+
+    走 bridging.parse_size_dims，和宽高比解析共用一套分隔符（x / × / *），
+    否则 "1536×1024" 会「比例对了但长边丢了」，超 2k 升采样静默不触发。
+    """
+    dims = parse_size_dims(size)
+    if not dims:
         return None
-    try:
-        w, h = size.lower().split("x")
-        return max(int(w), int(h))
-    except ValueError:
-        return None
+    return max(dims)
 
 
 #: Anonymous generation tops out at the 2k tier (long edge 2048); anything
