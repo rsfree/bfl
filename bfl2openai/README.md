@@ -192,8 +192,15 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8977/v1/images/edits \
 
 ### 其他端点
 
-- `POST /v1/images/generations` — 文生图路径（上游按 `mode=t2i`、无 image 提交；
-  **未验证**，Playground 只暴露 i2i，失败会原样透出上游错误）。
+- `POST /v1/images/generations` — 文生图，**也支持多垫图**（2026-10-25 实测）：
+  `image` 可为字符串或字符串数组（base64 / data URI / URL / `@image#N` handle），
+  `image[0]` 是画布、其余作为上游参考图部件转发，最多 10 张（超出 400 `at most 10 images`）。
+  不传 `image` 时按 `mode=t2i` 提交。
+
+  ⚠️ **prompt 必须明确指名要放入/改变的物体**，否则上游会近乎原样返回画布（实测模糊指令
+  「把参考图里的所有物体摆到一起」的输出与画布 mean pixel diff ≈ 2~3、>32 差异像素占比 0%，
+  看起来像"多图没生效"）。点名物体后两张/三张垫图都确实被消费：
+  「把第二张的黄鸭放进杯子」→ 鸭子进杯；再加「第三张的红方块放到杯旁」→ 红方块出现。
 - `GET /v1/images/results/{imageToken}` — 代理上游 media 字节流（配 `response_format=url` 用）。
 - `GET /v1/models` / `GET /healthz`。
 
