@@ -92,22 +92,47 @@ _COMMON_RATIOS = [
 ]
 
 
+#: 上游 aspectRatio 的合法枚举值（"3:2" 这种写法本身就是上游契约）。
+_RATIO_NAMES = {name for name, _ in _COMMON_RATIOS}
+
+
+def _nearest_ratio(ratio: float) -> str:
+    """最接近的合法枚举；偏离超过 12% 视为不可映射（交回 auto）。"""
+    best = min(_COMMON_RATIOS, key=lambda kv: abs(kv[1] - ratio))
+    if abs(best[1] - ratio) / best[1] < 0.12:
+        return best[0]
+    return "auto"
+
+
 def size_to_aspect_ratio(size: str | None) -> str:
-    """Map an OpenAI `size` ("1024x1024") to the closest upstream aspect ratio;
-    fall back to "auto"."""
+    """Map a client `size` to an upstream aspect ratio; fall back to "auto".
+
+    Accepts both spellings, because callers use both and the wrong one used to
+    fail silently (2026-10-25: `size:"3:2"` fell through to "auto", so a
+    landscape request came back portrait at 1488x2731 with no error):
+
+      * "1536x1024" -- OpenAI's pixel form, matched to the nearest enum
+      * "3:2"       -- the ratio form, which is upstream's own enum spelling
+    """
     if not size:
         return "auto"
+    token = str(size).strip().lower()
+    if ":" in token:
+        if token in _RATIO_NAMES:
+            return token
+        try:
+            a, b = token.split(":")
+            return _nearest_ratio(float(a) / float(b))
+        except Exception:
+            return "auto"
     try:
-        sw, sh = size.lower().split("x")
+        sw, sh = token.split("x")
         ratio = float(sw) / float(sh)
     except Exception:
         return "auto"
     if abs(ratio - 1.0) < 0.02:
         return "1:1"
-    best = min(_COMMON_RATIOS, key=lambda kv: abs(kv[1] - ratio))
-    if abs(best[1] - ratio) / best[1] < 0.12:
-        return best[0]
-    return "auto"
+    return _nearest_ratio(ratio)
 
 
 # ---------- boxes param ----------
