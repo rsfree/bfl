@@ -19,6 +19,7 @@ Run:  uvicorn bfl2openai.server:app --host 127.0.0.1 --port 8977
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import time
@@ -27,6 +28,7 @@ from typing import Literal
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
+from . import browser_egress_client
 from . import upstream
 from . import native
 from . import bridging
@@ -123,24 +125,44 @@ async def run_job(
     async def one() -> dict[str, str]:
         gen_resolution = bridging.ensure_resolution_capacity(
             aspect_ratio, "2k" if upscale_to else resolution)
-        poll_token = await upstream.submit_generation(
-            image_png=image_png or b"",
-            prompt=prompt,
-            boxes=boxes,
-            aspect_ratio=aspect_ratio,
-            resolution=gen_resolution,
-            mode=mode,
-            base_url=UPSTREAM_BASE,
-            reference_images=reference_images or None,
-        )
-        log.info("submitted pollToken=%s… (resolution=%s)", poll_token[:10], gen_resolution)
-        image_token = await upstream.wait_for_result(poll_token, UPSTREAM_BASE)
-        log.info("ready imageToken=%s…", image_token[:10])
+        browser_media: bytes | None = None
+        try:
+            poll_token = await upstream.submit_generation(
+                image_png=image_png or b"",
+                prompt=prompt,
+                boxes=boxes,
+                aspect_ratio=aspect_ratio,
+                resolution=gen_resolution,
+                mode=mode,
+                base_url=UPSTREAM_BASE,
+                reference_images=reference_images or None,
+            )
+            log.info("submitted pollToken=%s… (resolution=%s)", poll_token[:10], gen_resolution)
+        except UpstreamError as submit_exc:
+            # 上游按 HTTP/2 指纹拒绝 curl_cffi（403 Access denied）——只有真实
+            # 浏览器环境能过。降级到 browser_egress sidecar（页面内 fetch
+            # 直出图片，跳过 wait_for_result/fetch_media）。
+            if submit_exc.kind != "access_denied" or not browser_egress_client.configured():
+                raise
+            import uuid as _uuid
+            poll_token = _uuid.uuid4().hex
+            log.warning("fingerprint 403 from upstream; browser egress fallback "
+                        "token=%s… (resolution=%s)", poll_token[:10], gen_resolution)
+            browser_media = await browser_egress_client.generate(
+                image_png=image_png or b"", prompt=prompt,
+                aspect_ratio=aspect_ratio, resolution=gen_resolution, mode=mode,
+                boxes_json=json.dumps(boxes) if boxes else None,
+                refs=[b for b, _ in (reference_images or [])])
+            image_token = poll_token
+        else:
+            image_token = await upstream.wait_for_result(poll_token, UPSTREAM_BASE)
+            log.info("ready imageToken=%s…", image_token[:10])
         if upscale_to:
             # Automatic super-resolution for >2k asks: the generated image
             # rides through our COS -- MPS's own fetcher gets 429'd by the
             # playground edge (measured), so the URL input path is not used.
-            media = await upstream.fetch_media(image_token, UPSTREAM_BASE)
+            media = browser_media if browser_media is not None \
+                else await upstream.fetch_media(image_token, UPSTREAM_BASE)
             object_key = f"upscale/{poll_token[:16]}.png"
             await mps.upload_to_cos(media, object_key)
             percent = max(1.0, min(10.0, upscale_to / GEN_LONG_EDGE))
@@ -155,13 +177,15 @@ async def run_job(
             # 与异步门同策略：产物转存 COS 出 24h 预签名链。官方 media
             # token 分钟级过期，代理链接也随 token 一起死。
             if mps.configured():
-                media = await upstream.fetch_media(image_token, UPSTREAM_BASE)
+                media = browser_media if browser_media is not None \
+                    else await upstream.fetch_media(image_token, UPSTREAM_BASE)
                 key = f"results/{image_token[:16]}.png"
                 await mps.upload_to_cos(media, key)
                 return {"url": mps.cos_presigned_get("/" + key, ttl_s=86400)}
             base = str(request.base_url).rstrip("/")
             return {"url": f"{base}/v1/images/results/{image_token}"}
-        media = await upstream.fetch_media(image_token, UPSTREAM_BASE)
+        media = browser_media if browser_media is not None \
+            else await upstream.fetch_media(image_token, UPSTREAM_BASE)
         return {"b64_json": base64.b64encode(media).decode()}
 
     try:
