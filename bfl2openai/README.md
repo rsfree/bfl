@@ -150,7 +150,7 @@ multipart 字段：
 
 | 字段 | 说明 |
 | --- | --- |
-| `image` / `image[]` | 必填（≥1 张），任意常见格式（自动转 PNG）。**重复该字段即多图生图**：第 1 张是画布、其余作为上游参考图文件部件转发。两种拼法都接——`image[]` 是 OpenAI 官方 curl 示例的写法，重复 `image` 是 openai-python SDK 的写法（2026-10-20 实测两者均出图） |
+| `image` / `image[]` | 必填（≥1 张），任意常见格式（自动转 PNG）。**重复该字段即多图生图**：多图一律走上游 composition：第 1 张作为**编辑目标**、与其余图一起按 `references` 转发，`mode` 由适配器置 `t2i`（2026-10-26 契约修订，见「已知边界」）。两种拼法都接——`image[]` 是 OpenAI 官方 curl 示例的写法，重复 `image` 是 openai-python SDK 的写法（2026-10-20 实测两者均出图） |
 | `prompt` | 全局编辑指令 |
 | `mask` | 可选，OpenAI 语义（透明=可编辑区）；自动求连通域外接矩形 → 上游 `boxes`，每框 instruction=prompt |
 | `n` | 1~4，并发提交 |
@@ -264,7 +264,15 @@ curl -s -X POST http://127.0.0.1:8977/v1/images/edits \
   即：**可观测区间内没有"每天免费 N 张"的硬上限**。唯一限制是校验型的——
   输入图 <256×256 会被 422 拒绝（不消耗额度）。站点有登录 credits 体系但匿名链路未接，
   BFL 随时可能收紧，请勿高并发滥用；复测脚本 `tests/probe_ratelimit.py`。
-- `references`（参考图）非空结构未验证（Playground 里需要上传参考图才能看到）。
+  **2026-10-26 修订**：已观测到 `429 You've used today's 30 free generations`（按出口 IP 计），
+  早期「未触发任何限流/额度」的结论已不成立；现网靠 socks 代理池轮换出口 IP 规避。
+- `references`（参考图）**2026-10-26 实测定型**：上游 `mode` 枚举只有 `t2i` | `i2i`，
+  canvas（`image` 部件）与 references **互斥** —— `i2i`+canvas+refs → 400
+  `A composition must not include a canvas image.`；`i2i`+refs 无 canvas → 400
+  `An image is required for an edit.`；只有 **`t2i`+refs 无 canvas** 能出图。
+  语义是「第一张参考图即编辑目标」（上游 prompt 模板原文 `Edit the first reference image.`）。
+- **区域编辑与参考图互斥**：`boxes`/`mask` 是画布坐标指令，composition 是整图语义。
+  两者同时出现时适配器直接返回 **400**，而不是让上游 400 被包成 502 且 boxes 静默失效。
 - `aspectRatio` 只实测 `auto`（其余值透传由上游校验）；`resolution` 五档已全实测（见顶部档位表）。
 - 上游为 BFL 官方免费 Playground，**有速率限制与内容审核**（站点计费体系未接入），
   请勿高并发滥用；商用请走 BFL 官方 API（api.bfl.ai）。
