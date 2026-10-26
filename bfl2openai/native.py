@@ -72,6 +72,7 @@ from . import upstream
 from . import upscale as mps
 from . import bridging
 from . import browser_egress_client
+from . import payload as payload_mod
 from .payload import normalize_image
 from . import uploads as uploads_mod
 
@@ -195,11 +196,14 @@ async def _bridge_run(token: str, image_png: bytes, prompt: str, boxes: list[dic
             image_png = b""
             mode = "t2i"
         gen_resolution = bridging.ensure_resolution_capacity(aspect_ratio, resolution)
+        # 同一套上传预算（桥也直连 sidecar，不走 upstream 的 normalize）
+        fit_main, fit_refs = payload_mod.fit_body_budget(
+            image_png or b"", [b for b, _ in (reference_images or [])])
         media = await browser_egress_client.generate(
-            image_png=image_png, prompt=prompt, aspect_ratio=aspect_ratio,
+            image_png=fit_main, prompt=prompt, aspect_ratio=aspect_ratio,
             resolution=gen_resolution, mode=mode,
             boxes_json=json.dumps(boxes) if boxes else None,
-            refs=[b for b, _ in (reference_images or [])])
+            refs=fit_refs)
         sample: str | None = None
         if magnify:
             media, sample = await _bridge_upscale(token, media, magnify)

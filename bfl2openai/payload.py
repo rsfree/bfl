@@ -90,3 +90,23 @@ def content_type_of(data: bytes) -> str:
     if data[:3] == b"\xff\xd8\xff":
         return "image/jpeg"
     return "image/png"
+
+
+def fit_body_budget(main: bytes, refs: list[bytes]) -> tuple[bytes, list[bytes]]:
+    """主图 + 参考图压进上游 body 预算（两条提交路径共用同一套规则）。
+
+    背景（2026-10-26）：浏览器出口路径当初直接转发原始字节，绕过了这里的
+    规范化 —— 11.5MB 的图本可压到 2.76MB，实际吃上游 413。凡是要发到上游
+    的字节，都必须先过这一关。
+
+    分配与 normalize_image_joint 一致：主图 60%，参考图均分剩余 25% 余量里
+    的部分；无主图时整份预算给参考图（composition 降级语义）。
+    """
+    refs = [r for r in refs if r]
+    if not refs:
+        return (normalize_image(main)[0] if main else b""), []
+    if main:
+        main_out, refs_out = normalize_image_joint(main, refs)
+        return main_out, refs_out
+    budget = max(300_000, int(UPSTREAM_BODY_BUDGET * 0.75) // max(1, len(refs)))
+    return b"", [normalize_image(r, budget=budget)[0] for r in refs]

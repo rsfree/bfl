@@ -288,6 +288,18 @@ curl -s -X POST http://127.0.0.1:8977/v1/images/edits \
   -F "response_format=b64_json"
 ```
 
+## 上传体积预算（2026-10-26）
+
+两条提交路径（curl_cffi 直连 / 浏览器出口 sidecar）现在共用同一套预算
+（`payload.fit_body_budget`）：主图 60%、参考图均分剩余，各图独立降档
+（PNG 2048→1536→1024→768，再 JPEG q85/q75），总量压进 4MB。
+
+> 历史回归：`BROWSER_PRIMARY=1` 上线时 sidecar 路径直接转发原始字节，
+> 绕过规范化——11.5MB 的图本可压到 2.76MB 正常出图，实际吃上游
+> `413 Request Entity Too Large`，还被包成 502。现已在 `server.run_job`
+> 与 `native._bridge_run` 两处补齐，413 也单独映射成 `413 +
+> invalid_request_error`（提示缩图），不再伪装成服务故障。
+
 ## 已知边界
 
 - **频控/免费额度（2026-10-09 实测）**：匿名无登录，顺序 40 连发 + 瞬时 10 并发全部 200，

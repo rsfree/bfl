@@ -29,6 +29,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from . import browser_egress_client
+from . import payload
 from . import upstream
 from . import native
 from . import bridging
@@ -191,6 +192,11 @@ def wrap_browser_egress_error(
         # 配额细节只进日志（含"免费额度"字样），不透给调用方
         return openai_error(429, "upstream quota exhausted; retry later",
                             "rate_limit")
+    if "413" in str(exc) or "Request Entity Too Large" in str(exc):
+        # 上游 body 上限：重试无用，必须让调用方缩图（此前笼统报 502，
+        # 客户端会当成服务故障无限重试）。
+        return openai_error(413, "payload too large for upstream; "
+                                 "downscale the input images", "invalid_request_error")
     if exc.status == 0:
         return openai_error(504, f"upstream timeout: {exc}"[:300],
                             "upstream_error")
@@ -250,6 +256,23 @@ async def run_job(
             image_png = None
         mode = "t2i"
 
+    # 浏览器出口路径的上传预算：sidecar 直连上游，不走
+    # upstream.submit_generation 的 normalize，这里必须自己压一遍，
+    # 否则超大图直接吃上游 413（原本能压到预算内正常出图）。
+    sidecar_upload: tuple[bytes | None, list[tuple[bytes, str]]] | None = None
+
+    def fit_upload() -> tuple[bytes | None, list[tuple[bytes, str]]]:
+        nonlocal sidecar_upload
+        if sidecar_upload is None:
+            main_out, refs_out = payload.fit_body_budget(
+                image_png or b"", [b for b, _ in (reference_images or [])])
+            names = [n for _, n in (reference_images or [])]
+            sidecar_upload = (
+                main_out or None,
+                [(b, n) for b, n in zip(refs_out, names)],
+            )
+        return sidecar_upload
+
     async def one() -> dict[str, str]:
         gen_resolution = bridging.ensure_resolution_capacity(
             aspect_ratio, "2k" if upscale_to else resolution)
@@ -259,13 +282,15 @@ async def run_job(
             # 白耗 2-3 分钟）。生成图由 sidecar 直出，后处理复用原有分支。
             import uuid as _uuid
             poll_token = _uuid.uuid4().hex
-            log.info("browser-primary token=%s… (resolution=%s)",
-                     poll_token[:10], gen_resolution)
+            fit_main, fit_refs = fit_upload()
+            log.info("browser-primary token=%s… (resolution=%s main=%dB refs=%d)",
+                     poll_token[:10], gen_resolution, len(fit_main or b""),
+                     len(fit_refs))
             browser_media = await browser_egress_client.generate(
-                image_png=image_png or b"", prompt=prompt,
+                image_png=fit_main or b"", prompt=prompt,
                 aspect_ratio=aspect_ratio, resolution=gen_resolution, mode=mode,
                 boxes_json=json.dumps(boxes) if boxes else None,
-                refs=[b for b, _ in (reference_images or [])])
+                refs=[b for b, _ in fit_refs])
             image_token = poll_token
         else:
             try:
@@ -289,15 +314,17 @@ async def run_job(
                     raise
                 import uuid as _uuid
                 poll_token = _uuid.uuid4().hex
+                fit_main, fit_refs = fit_upload()
                 log.warning("fingerprint 403 from upstream; browser egress "
-                            "fallback token=%s… (resolution=%s)",
-                            poll_token[:10], gen_resolution)
+                            "fallback token=%s… (resolution=%s main=%dB refs=%d)",
+                            poll_token[:10], gen_resolution,
+                            len(fit_main or b""), len(fit_refs))
                 browser_media = await browser_egress_client.generate(
-                    image_png=image_png or b"", prompt=prompt,
+                    image_png=fit_main or b"", prompt=prompt,
                     aspect_ratio=aspect_ratio, resolution=gen_resolution,
                     mode=mode,
                     boxes_json=json.dumps(boxes) if boxes else None,
-                    refs=[b for b, _ in (reference_images or [])])
+                    refs=[b for b, _ in fit_refs])
                 image_token = poll_token
             else:
                 image_token = await upstream.wait_for_result(
