@@ -247,10 +247,11 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8977/v1/images/edits \
 |---|---|
 | `flux-precise-edit` | 规范名（`BFL2OPENAI_MODEL`） |
 | `flux-3-image` | BFL 官方原生端点的叫法 |
+| `flux-3` | 短名，new-api 渠道里实际在用的写法 |
 | `flux-kontext-max` / `flux-kontext-pro` | kontext 系列的叫法 |
 
 - 列表与识别均**大小写不敏感**、忽略首尾空白；`BFL2OPENAI_MODEL_ALIASES`
-  （逗号或分号分隔）覆盖默认这三个。
+  （逗号或分号分隔）覆盖默认这几个。
 - 响应头回写 `X-Bfl-Model-Requested` / `X-Bfl-Model-Resolved`，可确认没落到别的渠道。
 - 默认**宽松**：未登记的名字照样出图（兼容层的本分），只记日志；要收紧设
   `BFL2OPENAI_MODEL_STRICT=1` → 未登记名字直接 404 `model_not_found`，

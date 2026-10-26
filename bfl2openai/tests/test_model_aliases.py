@@ -1,4 +1,4 @@
-"""模型别名：flux-3-image / flux-kontext-max / flux-kontext-pro → 同一个上游模型。
+"""模型别名：flux-3-image / flux-3 / flux-kontext-max / flux-kontext-pro → 同一个上游模型。
 
 背景（2026-10-26）：客户端与网关按 fal 的叫法传 `flux-kontext-pro` 之类的名字，
 而适配器里模型名本来就不参与路由（真正决定模型的是 `BFL2OPENAI_MODEL`）。
@@ -25,7 +25,7 @@ from bfl2openai import server  # noqa: E402
 TESTS_DIR = Path(__file__).resolve().parent
 SAMPLE = TESTS_DIR / "sample_input.png"
 
-ALIASES = ["flux-3-image", "flux-kontext-max", "flux-kontext-pro"]
+ALIASES = ["flux-3-image", "flux-3", "flux-kontext-max", "flux-kontext-pro"]
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +75,19 @@ def test_alias_is_case_and_space_insensitive(spelling):
 def test_canonical_name_is_not_an_alias():
     route = server.model_route(server.MODEL_ID)
     assert route["known"] is True and route["alias"] is None
+
+
+def test_short_alias_flux_3_is_recognized():
+    """`flux-3` 是网关渠道里实际在用的短名，必须与 `flux-3-image` 同为已登记。
+
+    它与 `flux-3-image` 不是前缀关系就能互认——登记表是精确比对（仅忽略大小写
+    与首尾空白），所以短名要单独占一项。
+    """
+    route = server.model_route("flux-3")
+    assert route["known"] is True
+    assert route["denied"] is False
+    assert route["alias"] == "flux-3"
+    assert route["resolved"] == server.MODEL_ID
 
 
 def test_missing_model_uses_default():

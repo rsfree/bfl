@@ -63,7 +63,10 @@ UPSTREAM_BASE = os.environ.get("BFL2OPENAI_UPSTREAM", upstream.DEFAULT_BASE)
 #: flux-tools 这一个模型），所以别名唯一的职责是「让客户端按它熟悉的叫法来调、
 #: 并且能在 /v1/models 里被发现」：fal 的 flux-3-image、kontext 系列，或网关里
 #: 给客户看的商用名。逗号（或分号）分隔，匹配大小写不敏感。
-DEFAULT_MODEL_ALIASES = "flux-3-image,flux-kontext-max,flux-kontext-pro"
+#:
+#: `flux-3`（短名）是 new-api 渠道 39 里已经在用的写法 —— 服务端不登记它，
+#: 列表里就看不见，strict 模式下还会被判 404，所以必须与 `flux-3-image` 并列。
+DEFAULT_MODEL_ALIASES = "flux-3-image,flux-3,flux-kontext-max,flux-kontext-pro"
 
 
 def _env_list(name: str, default: str) -> list[str]:
