@@ -44,11 +44,14 @@ services:
       BFL2OPENAI_SUBMIT_CONCURRENCY: "${BFL2OPENAI_SUBMIT_CONCURRENCY:-16}"
       # 浏览器出口：地址必须与下面 sidecar 的静态 IP 一致（Docker 内嵌 DNS
       # 在容器重建后会缓存旧 IP，实测导致 connection refused，故用固定 IP）。
-      BFL2OPENAI_BROWSER_EGRESS: "http://172.18.0.10:8011"
+      # 多实例：逗号分隔，客户端按轮询分发，仅传输失败/sidecar 503 才换实例。
+      BFL2OPENAI_BROWSER_EGRESS: "http://172.18.0.10:8011,http://172.18.0.11:8011"
       BFL2OPENAI_BROWSER_PRIMARY: "1"   # 跳过 curl_cffi（当前恒 403，白耗 2-3 分钟）
     env_file: ./.env                    # 凭证/回退代理/PUBLIC_BASE 注入容器环境
     depends_on:
       - redis
+      - bfl-browser-egress
+      - bfl-browser-egress-2
     logging:
       driver: json-file
       options:
@@ -95,6 +98,44 @@ services:
       timeout: 10s
       retries: 3
       start_period: 180s                # 6-8 页加载 + 预热生成需要时间
+
+  # 第二个出口实例：同一镜像、同配置，只是换静态 IP。
+  # 为什么要两个：单实例实测舒适区 8 并发 ≈ 1,225 张/h，而历史峰值 3,482/h
+  # （≈25 并发 / 25.5s 中位）⇒ 单实例只有峰值的 1/3。两实例给到 24-40 并发。
+  # 资源实测（8 页空闲）：RSS 1.17GB、CPU ~1%（去动画后）；满载峰值 2.6 核。
+  # 所以 cpus/mem 是「上限」不是「占用」，两实例真实合计约 2.4GB。
+  # ⚠️ 每页 = 一条独立出口 IP：加实例会成倍占用 socks 池 IP，
+  #    池子不够时表现为 429 变多（看 /healthz 的 pages_cooling）。
+  bfl-browser-egress-2:
+    image: bfl-browser-egress:local
+    container_name: bfl-browser-egress-2
+    restart: unless-stopped
+    pull_policy: never
+    shm_size: 1g
+    environment:
+      BFL2OPENAI_EGRESS_PAGES: "8"
+      BFL2OPENAI_EGRESS_MAX_INFLIGHT: "20"
+      BFL2OPENAI_EGRESS_MAX_REQ_PER_CTX: "25"
+      BFL2OPENAI_EGRESS_POLL_TIMEOUT: "165"
+      BFL2OPENAI_EGRESS_IP_COOLDOWN: "20"
+      BFL2OPENAI_EGRESS_TZ: "America/New_York"
+      UPSTREAM_PROXY: "${UPSTREAM_PROXY:?UPSTREAM_PROXY 未在 .env 中配置}"
+    networks:
+      bfl_net:
+        ipv4_address: 172.18.0.11       # 与 app 侧 BFL2OPENAI_BROWSER_EGRESS 对应
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "2"
+    mem_limit: 5g
+    cpus: 6
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8011/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
 
 # 复用已存在的项目网络：external 方式避免 compose 重建网络（重建会连带重启应用）。
 networks:
