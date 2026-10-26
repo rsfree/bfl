@@ -10,7 +10,7 @@ POST /v1/images/generations text-to-image (upstream is used without an input
                             image, mode="t2i"; unverified — the playground
                             only exposes i2i)
 GET  /v1/images/results/{imageToken}   proxy for the generated image bytes
-GET  /v1/models             model list for client sanity checks
+GET  /v1/models             model list (canonical id + aliases)
 GET  /healthz
 
 Run:  uvicorn bfl2openai.server:app --host 127.0.0.1 --port 8977
@@ -55,6 +55,86 @@ async_images.register(app)
 MODEL_ID = os.environ.get("BFL2OPENAI_MODEL", "flux-precise-edit")
 API_KEY = os.environ.get("BFL2OPENAI_API_KEY", "")  # optional; empty = auth disabled
 UPSTREAM_BASE = os.environ.get("BFL2OPENAI_UPSTREAM", upstream.DEFAULT_BASE)
+
+#: 模型别名 = 同一个上游模型的另外几个「名字」。
+#: 适配器里模型名不参与路由（真正决定模型的是 BFL2OPENAI_MODEL，上游也只有
+#: flux-tools 这一个模型），所以别名唯一的职责是「让客户端按它熟悉的叫法来调、
+#: 并且能在 /v1/models 里被发现」：fal 的 flux-3-image、kontext 系列，或网关里
+#: 给客户看的商用名。逗号（或分号）分隔，匹配大小写不敏感。
+DEFAULT_MODEL_ALIASES = "flux-3-image,flux-kontext-max,flux-kontext-pro"
+
+
+def _env_list(name: str, default: str) -> list[str]:
+    """逗号分隔的环境变量 → 去空白、去重（忽略大小写）、保留原拼写的列表。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in os.environ.get(name, default).replace(";", ",").split(","):
+        value = chunk.strip()
+        if value and value.lower() not in seen:
+            seen.add(value.lower())
+            out.append(value)
+    return out
+
+
+MODEL_ALIASES = _env_list("BFL2OPENAI_MODEL_ALIASES", DEFAULT_MODEL_ALIASES)
+
+#: 未登记模型名的处置。默认放行——兼容层不该因为客户端写了个本地别名就拒单
+#: （上游只有一个模型，叫什么都出同一张图）；置 1 则 404 model_not_found，
+#: 让「渠道配错了名字」当场暴露，而不是静默扣量。
+_MODEL_STRICT = os.environ.get("BFL2OPENAI_MODEL_STRICT", "") == "1"
+
+
+def model_ids() -> list[str]:
+    """对外公布的全部模型名：规范名在前，别名去重后跟。"""
+    ids = [MODEL_ID]
+    seen = {MODEL_ID.lower()}
+    for alias in MODEL_ALIASES:
+        if alias.lower() not in seen:
+            seen.add(alias.lower())
+            ids.append(alias)
+    return ids
+
+
+def model_route(name: str | None) -> dict:
+    """请求里的 `model` → 路由信息（别名与规范名完全等价）。
+
+    返回 requested/resolved/alias/known/denied 五个键。`denied` 只在
+    BFL2OPENAI_MODEL_STRICT=1 且名字未登记时为真。
+    """
+    requested = (name or "").strip()
+    alias = None
+    known = not requested
+    if requested:
+        if requested.lower() == MODEL_ID.lower():
+            known = True
+        else:
+            for candidate in MODEL_ALIASES:
+                if requested.lower() == candidate.lower():
+                    alias, known = candidate, True
+                    break
+    return {
+        "requested": requested,
+        "resolved": MODEL_ID,
+        "alias": alias,
+        "known": known,
+        "denied": bool(requested) and not known and _MODEL_STRICT,
+    }
+
+
+def stamp_model(resp: JSONResponse, route: dict) -> JSONResponse:
+    """把「请求了什么名字 / 实际跑的是哪个模型」写进响应头。
+
+    别名命中时客户端可据此确认没有落到别的渠道；未登记名字留一条日志，
+    用来发现客户端/网关的拼写漂移（不落 prompt，不侵犯客户内容）。
+    """
+    if route["requested"]:
+        resp.headers["X-Bfl-Model-Requested"] = route["requested"][:64]
+        resp.headers["X-Bfl-Model-Resolved"] = route["resolved"]
+        if not route["known"]:
+            log.info("unregistered model %r accepted as %s (lenient mode)",
+                     route["requested"][:64], route["resolved"])
+    return resp
+
 
 # ---------------------------------------------------------------- auth
 
@@ -304,15 +384,22 @@ async def run_job(
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    return {"ok": True, "model": MODEL_ID, "upstream": UPSTREAM_BASE}
+    return {"ok": True, "model": MODEL_ID, "aliases": model_ids()[1:],
+            "upstream": UPSTREAM_BASE}
 
 
 @app.get("/v1/models")
 async def list_models(request: Request):
     await check_auth(request)
+    # 别名与规范名是同一个模型，用 OpenAI 的 `root` 字段把它们挂在一起：
+    # 客户端（New API / Cherry Studio 等）拿 id 建下拉，拿 root 认亲。
     return {
         "object": "list",
-        "data": [{"id": MODEL_ID, "object": "model", "owned_by": "bfl2openai"}],
+        "data": [
+            {"id": mid, "object": "model", "owned_by": "bfl2openai",
+             **({} if mid == MODEL_ID else {"root": MODEL_ID})}
+            for mid in model_ids()
+        ],
     }
 
 
@@ -334,8 +421,14 @@ async def images_edits(
     aspect_ratio: str | None = Form(None),   # "auto" | "1:1" | "16:9" | ...
     resolution: str = Form("1.5k"),          # "1k" | "1.5k" | ...
     mode: str = Form("i2i"),
+    model: str | None = Form(None),   # 仅用于别名识别，不影响上游选择
 ):
     await check_auth(request)
+    route = model_route(model)
+    if route["denied"]:
+        return openai_error(
+            404, f"The model '{route['requested']}' does not exist.",
+            "model_not_found")
     if not prompt and not boxes:
         return openai_error(400, "prompt (or boxes) is required")
 
@@ -392,7 +485,7 @@ async def images_edits(
             400,
             "region editing (boxes/mask) cannot be combined with reference "
             "images: composition mode edits the first reference as a whole")
-    return await run_job(
+    resp = await run_job(
         image_png=image_png,
         prompt=prompt,
         boxes=box_list,
@@ -405,6 +498,7 @@ async def images_edits(
         upscale_to=upscale_to,
         reference_images=reference_images or None,
     )
+    return stamp_model(resp, route)
 
 
 @app.post("/v1/images/generations")
@@ -419,6 +513,11 @@ async def images_generations(
     upstream reference parts (contract measured 2026-10-14).
     """
     await check_auth(request)
+    route = model_route(payload.get("model"))
+    if route["denied"]:
+        return openai_error(
+            404, f"The model '{route['requested']}' does not exist.",
+            "model_not_found")
     prompt = str(payload.get("prompt") or "")
     if not prompt:
         return openai_error(400, "prompt is required")
@@ -461,7 +560,7 @@ async def images_generations(
             "an output beyond 2k requires MPS super-resolution "
             "(MPS_SECRET_ID / MPS_SECRET_KEY not configured)",
         )
-    return await run_job(
+    resp = await run_job(
         image_png=image_png,
         prompt=prompt,
         boxes=[],
@@ -474,6 +573,7 @@ async def images_generations(
         upscale_to=upscale_to,
         reference_images=reference_images or None,
     )
+    return stamp_model(resp, route)
 
 
 @app.get("/v1/images/results/{image_token}")

@@ -223,7 +223,27 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8977/v1/images/edits \
   仍 fallback `auto`。像素写法的长边还会参与升采样判断（>2048 走 MPS），
   比例写法只影响 `aspectRatio`。映射单测见 `tests/test_size_ratio.py`。
 - `GET /v1/images/results/{imageToken}` — 代理上游 media 字节流（配 `response_format=url` 用）。
-- `GET /v1/models` / `GET /healthz`。
+- `GET /v1/models` — 规范名 + 全部别名（别名用 `root` 指回规范名）。
+- `GET /healthz` — `{ok, model, aliases, upstream}`。
+
+### 模型名与别名（2026-10-26）
+
+上游只有一个模型：`BFL2OPENAI_MODEL`（默认 `flux-precise-edit`）决定它是谁，
+请求体里的 `model` **不参与路由**——传什么名字都出同一张图。别名的意义只是
+让客户端用自己熟悉的叫法调用、并能在 `/v1/models` 里被发现：
+
+| 名字 | 来源 |
+|---|---|
+| `flux-precise-edit` | 规范名（`BFL2OPENAI_MODEL`） |
+| `flux-3-image` | BFL 官方原生端点的叫法 |
+| `flux-kontext-max` / `flux-kontext-pro` | kontext 系列的叫法 |
+
+- 列表与识别均**大小写不敏感**、忽略首尾空白；`BFL2OPENAI_MODEL_ALIASES`
+  （逗号或分号分隔）覆盖默认这三个。
+- 响应头回写 `X-Bfl-Model-Requested` / `X-Bfl-Model-Resolved`，可确认没落到别的渠道。
+- 默认**宽松**：未登记的名字照样出图（兼容层的本分），只记日志；要收紧设
+  `BFL2OPENAI_MODEL_STRICT=1` → 未登记名字直接 404 `model_not_found`，
+  让「渠道配错了名字」当场暴露，而不是静默扣量。
 
 ### 鉴权（适配器自身）
 
