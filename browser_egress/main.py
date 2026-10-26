@@ -36,13 +36,16 @@ POLL_INTERVAL_S = float(os.environ.get("BFL2OPENAI_EGRESS_POLL_S", "1.0"))
 #: 轮询上限必须短于调用方超时（bfl2openai 侧 180s）：否则客户先断开，
 #: 我们连"为什么失败"都送不回去（实测一笔 pending 280s 的请求就这么消失的）。
 POLL_TIMEOUT_S = float(os.environ.get("BFL2OPENAI_EGRESS_POLL_TIMEOUT", "165"))
-PAGES = int(os.environ.get("BFL2OPENAI_EGRESS_PAGES", "4"))
+#: 页面池大小。默认 8（每页独立 context = 独立出口 IP），与生产 compose 的显式
+#: 配置一致——不带环境变量直接跑也是够用的池子，别退回 4 页把并发压死。
+PAGES = int(os.environ.get("BFL2OPENAI_EGRESS_PAGES", "8"))
 #: 池代理（socks5://user:pass@host:port）：Chromium 直连=服务器 IP，已被上游
 #: 按 IP 限流（429）；真浏览器指纹 + 换出口 IP 才能过。
 PROXY_URL = os.environ.get("BFL2OPENAI_EGRESS_PROXY", "")
 
-#: 全局并发上限（默认每页 2）：单 IP 并发连接越多，越容易撞上游配额。
-MAX_INFLIGHT = int(os.environ.get("BFL2OPENAI_EGRESS_MAX_INFLIGHT", str(PAGES * 2)))
+#: 全局并发上限。默认 20（8 页 → 每页 cap = ceil(20/8) = 3，见 acquire_entry）。
+#: 这是「池子总量」而非每页放开：单 IP 并发连接越多，越容易撞上游配额。
+MAX_INFLIGHT = int(os.environ.get("BFL2OPENAI_EGRESS_MAX_INFLIGHT", "20"))
 #: 单个 context 用 N 次提交后回收：新连接拿新出口 IP + 干净 cookie，
 #: 避免长时间「一个会话跑几百张」的非人类画像。
 MAX_REQ_PER_CTX = int(os.environ.get("BFL2OPENAI_EGRESS_MAX_REQ_PER_CTX", "25"))
