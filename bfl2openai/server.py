@@ -155,6 +155,20 @@ async def run_job(
     upscale_to: int | None = None,
     reference_images: list[tuple[bytes, str]] | None = None,
 ) -> JSONResponse:
+    # ---- 多图（composition）归一化 -------------------------------------
+    # 上游契约（2026-10-26 实测，Zod 报错暴露枚举）：mode 只有 't2i' | 'i2i'，
+    # 且 canvas(`image` 部件) 与 references 互斥：
+    #     i2i + canvas + refs  -> 400 "A composition must not include a canvas image."
+    #     i2i + refs（无 canvas）-> 400 "An image is required for an edit."
+    #     t2i + refs（无 canvas）-> 200 正常出图（1536x1536，带 C2PA）
+    # 所以带参考图的请求一律降级成 composition：canvas 并入 references 首位
+    # （上游前端 prompt 也是 "Edit the first reference image."），mode 置 t2i。
+    if reference_images:
+        if image_png:
+            reference_images = [(image_png, "canvas.png"), *reference_images]
+            image_png = None
+        mode = "t2i"
+
     async def one() -> dict[str, str]:
         gen_resolution = bridging.ensure_resolution_capacity(
             aspect_ratio, "2k" if upscale_to else resolution)
@@ -370,6 +384,14 @@ async def images_edits(
             "an output beyond 2k requires MPS super-resolution "
             "(MPS_SECRET_ID / MPS_SECRET_KEY not configured)",
         )
+    if reference_images and box_list:
+        # composition 是整图语义：第一张参考图被整体编辑，逐区域 boxes
+        # 在上游无处落地（真发过去也是 400）。明确拒绝好过返回一张
+        # "boxes 被静默忽略"的图。
+        return openai_error(
+            400,
+            "region editing (boxes/mask) cannot be combined with reference "
+            "images: composition mode edits the first reference as a whole")
     return await run_job(
         image_png=image_png,
         prompt=prompt,

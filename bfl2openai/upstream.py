@@ -217,11 +217,24 @@ async def submit_generation(
             # Vercel 4.5MB body 上限直接 413（实测 2026-10-14/15）。
             image_png, _ct = normalize_image(image_png)
         if reference_images:
-            from .payload import content_type_of, normalize_image_joint
+            # 注意：normalize_image / content_type_of 已在模块顶部导入；
+            # 这里再 import 同名会把它变成函数局部量，导致上面的单图分支
+            # 触发 UnboundLocalError（2026-10-26 实测踩到）。
+            from .payload import UPSTREAM_BODY_BUDGET, normalize_image_joint
 
-            main_bytes, ref_bytes_list = normalize_image_joint(
-                image_png, [b for b, _ in reference_images])
-            image_png = main_bytes
+            if image_png:
+                main_bytes, ref_bytes_list = normalize_image_joint(
+                    image_png, [b for b, _ in reference_images])
+                image_png = main_bytes
+            else:
+                # composition 降级（无 canvas，2026-10-26）：joint 会给空主图
+                # 预留 60% 预算，这里把整份预算均分给参考图。
+                refs_only = [b for b, _ in reference_images]
+                ref_budget = max(
+                    300_000,
+                    int(UPSTREAM_BODY_BUDGET * 0.75) // max(1, len(refs_only)))
+                ref_bytes_list = [normalize_image(b, budget=ref_budget)[0]
+                                  for b in refs_only]
             reference_parts = [(rb, name)
                                for rb, (_, name) in zip(ref_bytes_list,
                                                         reference_images)]
