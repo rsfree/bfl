@@ -71,6 +71,12 @@ MPS `ProcessImage`（COS 输入，Type=ultra，percent ×2/×4）→ `DescribeIm
 
 ## BFL 官方原生端点
 
+> **2026-10-26 起走「异步桥」**：上游封 curl_cffi 指纹后，原生方言若直连必 403=>502。
+> 现在 sidecar 在位时，`/v1/flux-3-image` 受理即回 `{id, polling_url}`，生成在后台任务里
+> 跑浏览器出口（20-30s），`/v1/get_result` 只读任务状态（Generating/Ready/Error），
+> Ready 的 `result.sample` 是 24h COS 预签名链（无 COS 时是本服务代理链）。
+> 4k/8k 复合同样在后台任务里完成（2k 生成 + CI/MPS 超分）。sidecar 不在才回落直连。
+
 ```
 POST /v1/flux-3-image        官方 JSON：prompt*、images(string|[string]，URL/base64，≤10)、
                              aspect_ratio(auto)、resolution(见上表，默认 1k)、
@@ -216,6 +222,11 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8977/v1/images/edits \
   动物」→ 同样 7 只、牌 5 缺失，除画布狮子外全是瞎编猫 `F_index_refs.png`。
   ⇒ 上游对 references 的消费是**名词驱动**：prompt 没写出的物种不会去参考图里检索，
   「按参考图顺序」「第 N 张」这类序号指代一律无效，必须逐个写出可辨识的物种名。
+  **size 像素写法决定档位（2026-10-26 补）**：`"1024x1024"`→1k、`"1536x1024"`→1.5k、
+`"2048x2048"`→2k（OpenAI 客户端按 size 预期输出像素，此前一律落默认 1.5k 档，
+"1024x1024" 实际出 1536²）；比例写法不受影响；**显式 `resolution` 永远优先**；
+长边 >2048 照旧走 MPS 升采样复合。
+
   `size` 两种拼法都认（2026-10-25 修）：`"3:2"` 比例写法 + `"1536x1024"` 像素写法，
   分隔符 `x` / `×` / `*` / 大小写不敏感，都走同一套解析。修前只认小写 `x` 的像素写法：
   `size:"3:2"` 静默落 `auto`（横图请求回来是 1488×2731 竖图，无报错），

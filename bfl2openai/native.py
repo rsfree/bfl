@@ -52,13 +52,16 @@ Known bounds:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import io
+import json
 import logging
 import os
 import re
 import time
+import uuid
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -67,6 +70,8 @@ from PIL import Image
 from . import store
 from . import upstream
 from . import upscale as mps
+from . import bridging
+from . import browser_egress_client
 from .payload import normalize_image
 from . import uploads as uploads_mod
 
@@ -85,6 +90,14 @@ MAX_IMAGES = 10
 COMPOSITE_TIERS = {"4k": 2.0, "8k": 4.0}
 # composite 态外置（store）：多 worker 下受理与轮询可能落在不同进程
 _COMP_TTL = 3600
+
+#: 原生端点的「异步桥」：submit 立刻回 id，生成在后台任务里跑浏览器出口
+#: sidecar，get_result 读任务状态。上游 2026-10-26 起封 curl_cffi 指纹，
+#: 原生方言直连必 502（矩阵测试实测）——sidecar 在，桥就是唯一的活路；
+#: sidecar 不在（本地开发）才回落原有直连路径。
+_BRIDGE_TTL_RUNNING = 1800
+_BRIDGE_TTL_DONE = 3600
+_BRIDGE_TASKS: set = set()  # 持强引用防 GC（asyncio 只存弱引用）
 
 
 def _check_x_key(request: Request) -> None:
@@ -149,6 +162,67 @@ def _boxes_native(rows) -> list[dict]:
             }
         )
     return out
+
+
+async def _bridge_upscale(token: str, media: bytes, magnify: int) -> tuple[bytes | None, str]:
+    """4k/8k 复合的超分段：CI 同步优先，MPS 异步任务兜底（同 _composite_step）。"""
+    ikey = f"upscale/{token[:16]}.png"
+    await mps.upload_to_cos(media, ikey)
+    try:
+        up = await mps.ci_super_resolve_cos(ikey, magnify=magnify, data=media)
+        okey = f"results/{token[:16]}.png"
+        await mps.upload_to_cos(up, okey)
+        return up, mps.cos_presigned_get("/" + okey, ttl_s=86400)
+    except mps.MPSError as exc:
+        log.warning("bridge CI upscale failed, MPS task fallback: %s", exc)
+    task_id = await mps.submit_cos(ikey, percent=float(magnify))
+    return None, await mps.wait_done(task_id)
+
+
+async def _bridge_run(token: str, image_png: bytes, prompt: str, boxes: list[dict],
+                      aspect_ratio: str, resolution: str, mode: str,
+                      reference_images: list[tuple[bytes, str]] | None,
+                      magnify: int | None, proxy_sample: str) -> None:
+    """后台跑 sidecar 生成，终态写进 bridge:{token}（get_result 消费）。
+
+    多图归一化与 server.run_job 一致：canvas 与 references 互斥（上游
+    composition 语义），带参考图时 canvas 并入首位、mode 置 t2i。
+    """
+    key = f"bridge:{token}"
+    try:
+        if reference_images and image_png:
+            reference_images = [(image_png, "canvas.png"), *reference_images]
+            image_png = b""
+            mode = "t2i"
+        gen_resolution = bridging.ensure_resolution_capacity(aspect_ratio, resolution)
+        media = await browser_egress_client.generate(
+            image_png=image_png, prompt=prompt, aspect_ratio=aspect_ratio,
+            resolution=gen_resolution, mode=mode,
+            boxes_json=json.dumps(boxes) if boxes else None,
+            refs=[b for b, _ in (reference_images or [])])
+        sample: str | None = None
+        if magnify:
+            media, sample = await _bridge_upscale(token, media, magnify)
+        if sample is None:
+            if mps.configured():
+                okey = f"results/{token[:16]}.png"
+                await mps.upload_to_cos(media, okey)
+                sample = mps.cos_presigned_get("/" + okey, ttl_s=86400)
+            else:
+                # 无 COS：字节暂存 store，代理端点按 token 取
+                await store.put_blob(f"bridge_bytes:{token}", media, ttl_s=3600)
+                sample = proxy_sample
+        await store.put(key, {"status": "ready", "sample": sample},
+                        ttl_s=_BRIDGE_TTL_DONE)
+        log.info("native bridge done token=%s %d bytes", token[:16], len(media))
+    except browser_egress_client.BrowserEgressError as exc:
+        await store.put(key, {"status": "error", "error": str(exc)[:300]},
+                        ttl_s=_BRIDGE_TTL_DONE)
+        log.warning("native bridge failed token=%s status=%s", token[:16], exc.status)
+    except Exception as exc:  # noqa: BLE001
+        await store.put(key, {"status": "error", "error": f"bridge: {exc}"[:300]},
+                        ttl_s=_BRIDGE_TTL_DONE)
+        log.exception("native bridge crashed token=%s", token[:16])
 
 
 def register(app: FastAPI) -> None:
@@ -249,6 +323,32 @@ def register(app: FastAPI) -> None:
             except (ValueError, upstream.UpstreamError) as exc:
                 log.warning("reference #%d dropped (fetch failed): %s", idx, exc)
 
+        if browser_egress_client.configured():
+            # 异步桥：受理即回 id，生成在后台跑 sidecar（上游封 curl_cffi
+            # 指纹后，直连 submit 恒 403 => 502；桥让原生方言恢复可用）。
+            token = uuid.uuid4().hex
+            await store.put(f"bridge:{token}", {"status": "generating"},
+                            ttl_s=_BRIDGE_TTL_RUNNING)
+            proxy_base = PUBLIC_BASE or str(request.base_url).rstrip("/")
+            task = asyncio.create_task(_bridge_run(
+                token, png or b"", prompt, boxes,
+                str(payload.get("aspect_ratio") or "auto"),
+                "2k" if resolution in COMPOSITE_TIERS else resolution,
+                "i2i" if png else "t2i",
+                reference_images or None,
+                COMPOSITE_TIERS.get(resolution),
+                f"{proxy_base}/v1/flux3-image/results/{token}"))
+            _BRIDGE_TASKS.add(task)
+            task.add_done_callback(_BRIDGE_TASKS.discard)
+            base = str(request.base_url).rstrip("/")
+            return JSONResponse(
+                {
+                    "id": token,
+                    "polling_url": f"{base}/v1/get_result?id={token}",
+                    "cost": None,
+                    "input_mp": None,
+                }
+            )
         try:
             if png:
                 # 4k/8k composite: generate at the 2k anonymous ceiling, then
@@ -304,6 +404,20 @@ def register(app: FastAPI) -> None:
         composite = await store.get(f"comp:{id}")
         if composite:
             return await _composite_step(request, id, composite)
+
+        # 异步桥任务：生成跑在 sidecar 后台任务里，这里只读状态（零上游请求）
+        bridge = await store.get(f"bridge:{id}")
+        if bridge:
+            out = {"id": id, "progress": None, "details": None, "preview": None}
+            if bridge.get("status") == "ready":
+                out["status"] = "Ready"
+                out["result"] = {"sample": bridge["sample"]}
+            elif bridge.get("status") == "error":
+                out["status"] = "Error"
+                out["details"] = {"error": bridge.get("error") or "unknown"}
+            else:
+                out["status"] = "Generating"
+            return JSONResponse(out)
 
         # 轮询合并缓存：多租户并发下，同一 token 的密集轮询（客户每 2-3s
         # 一次）只透传上游一次。生成中缓存 3s；终态缓存 120s（生成完成后
@@ -434,6 +548,9 @@ def register(app: FastAPI) -> None:
 
     @app.get("/v1/flux3-image/results/{image_token}")
     async def native_sample(image_token: str):
+        blob = await store.get_blob(f"bridge_bytes:{image_token}")
+        if blob:
+            return Response(content=blob, media_type="image/png")
         try:
             media = await upstream.fetch_media(image_token)
         except upstream.UpstreamError as exc:
