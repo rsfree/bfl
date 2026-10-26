@@ -311,6 +311,8 @@ async def _submit_generation_impl(
                 raise UpstreamError(f"generate failed: {last}", "access_denied")
             retryable = (r.status_code in _RETRY_STATUSES
                          or "Security Checkpoint" in text)
+        except UpstreamError:
+            raise          # 保留 access_denied 等已定型错误（勿被下面的兜底吞掉）
         except Exception as exc:  # noqa: BLE001 - transport errors retry
             last = f"{type(exc).__name__}: {exc}"
             retryable = True
