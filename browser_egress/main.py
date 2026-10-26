@@ -36,7 +36,9 @@ POLL_INTERVAL_S = float(os.environ.get("BFL2OPENAI_EGRESS_POLL_S", "1.0"))
 #: 轮询上限必须短于调用方超时（bfl2openai 侧 180s）：否则客户先断开，
 #: 我们连"为什么失败"都送不回去（实测一笔 pending 280s 的请求就这么消失的）。
 POLL_TIMEOUT_S = float(os.environ.get("BFL2OPENAI_EGRESS_POLL_TIMEOUT", "165"))
-#: 页面池大小。默认 8（每页独立 context = 独立出口 IP），与生产 compose 的显式
+#: 页面池大小。默认 8。每页独立 context ⇒ 独立 socket 池 ⇒ 通常各自一个出口 IP；
+#: 但 IP 是「每条 TCP 连接」分配的（poolclient 逐连接轮换，见 socksbridge.py），
+#: 所以连接重建/context 回收就会换 IP，不是固定绑定。与生产 compose 的显式
 #: 配置一致——不带环境变量直接跑也是够用的池子，别退回 4 页把并发压死。
 PAGES = int(os.environ.get("BFL2OPENAI_EGRESS_PAGES", "8"))
 #: 池代理（socks5://user:pass@host:port）：Chromium 直连=服务器 IP，已被上游

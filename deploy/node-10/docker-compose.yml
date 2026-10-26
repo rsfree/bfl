@@ -106,8 +106,10 @@ services:
   # （≈25 并发 × 25.5s 中位）。每实例 8 页 / 闸门 20，三实例给到 24-60 并发、
   # 24 条出口 IP。资源实测（8 页空闲）RSS 1.17GB / CPU ~1%，满载峰值 2.6 核
   # —— cpus/mem 是「上限」不是「占用」，三实例真实合计约 3.5GB。
-  # ⚠️ 每页 = 一条独立出口 IP：加实例会成倍占用 socks 池 IP，池子不够时
-  #    表现为 429 变多（看各实例 /healthz 的 pages_cooling 与 errors）。
+  # 出口 IP 由 poolclient 逐连接轮换（实测：48 并发得 48 个不同 IP，20+20
+  # 采样零重复）⇒ 加实例不吃「固定 IP 配额」，只是同时占用更多连接。
+  # 真正的 429 来源是「同一页的连接复用了同一 IP 超过 30 次/天」，由
+  # MAX_REQ_PER_CTX=25 提前换 context 兜住（余量只有 5 次）。
   # ⚠️ 加第 N 台三处要一起改：下面 anchors 默认值、服务块的 ipv4_address、
   #    以及 app 的 BFL2OPENAI_BROWSER_EGRESS 列表。
   bfl-browser-egress:
