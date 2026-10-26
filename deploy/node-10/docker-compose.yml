@@ -1,0 +1,103 @@
+# bfl2openai · node-10 部署声明（2026-10-23 迁移自 ai-prod）
+#
+# 端口只绑回环（红线）：公网入口一律 nginx + bfl.1task.cn。
+# .env（凭证 + 回退代理 + 浏览器出口）只挂载不进镜像；宿主上 chmod 640。
+#
+# 与 ai-prod 版本的差异（针对 8C/16G/29G 的小机器）：
+#   1) logging 显式限制 —— 29G 系统盘，daemon.json 已设默认值，这里再兜一道
+#   2) mem_limit —— 防单容器 OOM 拖垮整机（16G 而非 48G）
+#   3) BFL2OPENAI_SUBMIT_CONCURRENCY=12 —— 上游全局仅 50 槽，
+#      原 3 worker x 16 = 48 几乎独占配额，导致 503「50 of 50 slots in use」
+#   4) bfl-browser-egress —— 上游按 HTTP/2 帧指纹拒绝 curl_cffi，只放行真浏览器，
+#      出口改由本机 Chromium 池承担（详见 browser_egress/main.py）
+name: bfl2openai
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: bfl2openai-redis
+    restart: unless-stopped
+    # 仅容器网内可见（无 ports）——跨 worker 状态外置的存储
+    command: ["redis-server", "--maxmemory", "256mb",
+              "--maxmemory-policy", "volatile-ttl"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "2"
+    mem_limit: 512m
+
+  bfl2openai:
+    image: ghcr.io/rsfree/bfl:${BFL_IMAGE_TAG:-latest}
+    container_name: bfl2openai
+    restart: unless-stopped
+    user: "10001:10001"
+    ports:
+      - "127.0.0.1:39100:8000"           # 仅回环；公网入口走 bfl.1task.cn（nginx）
+    environment:
+      REDIS_URL: redis://redis:6379/0   # 跨 worker 状态外置（见 store.py）
+      GUNICORN_WORKERS: "3"             # 多 worker 依赖上面的 Redis
+      # 满载：上游 showcase key 全局并发槽 = 50，3 worker x 16 = 48，留 2 槽余量。
+      # ⚠️ 2026-10-23 用户明确要求「并发拉满，不降级」——不再用 12 的保守值。
+      #    代价要清楚：48/50 意味着自身流量一冲高就会打出 503「50 of 50 slots in use」，
+      #    该现象在 ai-prod 时期单小时曾致成功率跌至 68.7%（见 reports/…success-rate…）。
+      BFL2OPENAI_SUBMIT_CONCURRENCY: "${BFL2OPENAI_SUBMIT_CONCURRENCY:-16}"
+      # 浏览器出口：地址必须与下面 sidecar 的静态 IP 一致（Docker 内嵌 DNS
+      # 在容器重建后会缓存旧 IP，实测导致 connection refused，故用固定 IP）。
+      BFL2OPENAI_BROWSER_EGRESS: "http://172.18.0.10:8011"
+      BFL2OPENAI_BROWSER_PRIMARY: "1"   # 跳过 curl_cffi（当前恒 403，白耗 2-3 分钟）
+    env_file: ./.env                    # 凭证/回退代理/PUBLIC_BASE 注入容器环境
+    depends_on:
+      - redis
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "2"
+    mem_limit: 4g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # 浏览器出口 sidecar：页面池 + 页面内 fetch 完成 提交→轮询→取图。
+  # 镜像在宿主本地构建（无 registry）：cd browser_egress && docker build -t bfl-browser-egress:local .
+  # 容量实测（2026-10-26）：8 页 / 闸门 20 时 CPU 峰值 2.6 核、稳态 0.6 核、内存 1.2G。
+  bfl-browser-egress:
+    image: bfl-browser-egress:local
+    container_name: bfl-browser-egress
+    restart: unless-stopped
+    pull_policy: never                  # 本地构建镜像，避免 compose pull 去 registry 找它
+    shm_size: 1g                        # Chromium 必需，否则 /dev/shm 不足会崩渲染进程
+    environment:
+      BFL2OPENAI_EGRESS_PAGES: "8"           # 页面池大小（每页独立 context=独立出口 IP）
+      BFL2OPENAI_EGRESS_MAX_INFLIGHT: "20"   # 全局并发闸门
+      BFL2OPENAI_EGRESS_MAX_REQ_PER_CTX: "25"  # 单会话 25 次后换 IP/新 cookie
+      BFL2OPENAI_EGRESS_POLL_TIMEOUT: "165"    # 必须 < 应用侧 180s，否则失败原因送不回
+      BFL2OPENAI_EGRESS_IP_COOLDOWN: "20"      # 403/429 后该页冷却秒数
+      BFL2OPENAI_EGRESS_TZ: "America/New_York" # 须与出口地域一致（UTC 是机房特征）
+      # 池代理凭证放 .env，不进版本库
+      UPSTREAM_PROXY: "${UPSTREAM_PROXY:?UPSTREAM_PROXY 未在 .env 中配置}"
+    networks:
+      bfl_net:
+        ipv4_address: 172.18.0.10       # 固定 IP：见上面 app 侧的说明
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "2"
+    mem_limit: 5g
+    cpus: 6
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8011/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s                # 6-8 页加载 + 预热生成需要时间
+
+# 复用已存在的项目网络：external 方式避免 compose 重建网络（重建会连带重启应用）。
+networks:
+  bfl_net:
+    external: true
+    name: bfl2openai_default
