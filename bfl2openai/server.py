@@ -162,6 +162,19 @@ def openai_error(status: int, message: str, err_type: str = "invalid_request_err
     return JSONResponse(status_code=status, content={"error": {"message": message, "type": err_type}})
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """兜底：未捕获异常一律回 JSON 错误体，而不是纯文本 500。
+
+    Starlette 默认的 500 是 21 字节纯文本 "Internal Server Error"：OpenAI
+    客户端按 JSON 解析会得到空 message，把"我们自己的 bug"误判成"网关
+    整体不可用"。这里至少给出异常类型，且日志里有完整 traceback。
+    """
+    log.exception("unhandled error on %s %s", request.method, request.url.path)
+    return openai_error(500, f"internal error: {type(exc).__name__}",
+                        "server_error")
+
+
 def wrap_upstream_error(exc: UpstreamError) -> JSONResponse:
     # 内容审核（moderation）是客户端内容问题：422 让调用方明确知道
     # "换内容"而不是"重试"（此前误映射为 502，客户会无效重试且监控失真）。

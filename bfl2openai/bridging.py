@@ -249,6 +249,11 @@ def tier_for_long_edge(px: int | None) -> str | None:
     """
     if not px:
         return None
+    if px <= 768:
+        # 上游确有 768 档（native `resolution=768sq` 实测真出 768x768）。
+        # 少了这一档，OpenAI 客户端传 size=768x768 会被上舍入到 1k 拿
+        # 1024²，"按 size 给像素"的约定就破了（2026-10-27 实测）。
+        return "768sq"
     if px <= 1024:
         return "1k"
     if px <= 1536:

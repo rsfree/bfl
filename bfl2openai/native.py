@@ -98,6 +98,11 @@ _COMP_TTL = 3600
 #: sidecar 不在（本地开发）才回落原有直连路径。
 _BRIDGE_TTL_RUNNING = 1800
 _BRIDGE_TTL_DONE = 3600
+#: 墓碑：状态过期后仍能由 id 解析出产物链接。必须与 COS 预签名 TTL
+#: (86400) 对齐——bridge:{id} 只活 1h，而图能活 24h，中间的 23h 里
+#: 用 id 查图会掉进 get_result 的上游兜底分支（把我们的 uuid 当上游
+#: pollToken 打过去）→ 上游 400 → 502（2026-10-27 实测复现）。
+_BRIDGE_TOMBSTONE_TTL = 86400
 _BRIDGE_TASKS: set = set()  # 持强引用防 GC（asyncio 只存弱引用）
 
 
@@ -110,13 +115,25 @@ def _check_x_key(request: Request) -> None:
 
 
 def _png_bytes(ctx_image_data: bytes, source: str) -> bytes:
-    """Normalize a reference image to PNG (the playground's file spelling)."""
-    img = Image.open(io.BytesIO(ctx_image_data))
-    if img.format == "PNG":
-        return ctx_image_data
-    buf = io.BytesIO()
-    img.convert("RGBA").save(buf, format="PNG")
-    log.info("converted %s input %s to png", img.format, source)
+    """Normalize a reference image to PNG (the playground's file spelling).
+
+    解码失败统一抛 ValueError：PIL 的 UnidentifiedImageError 继承 OSError
+    （MRO: UnidentifiedImageError -> OSError -> Exception），**不是**
+    ValueError，漏出去会穿过所有 `except (ValueError, ...)` 变成 500 纯文本
+    （2026-10-27 实测：坏 base64 图 -> "Internal Server Error" 21 字节）。
+    调用方按 ValueError 映射 422 / 丢弃参考图。
+    """
+    try:
+        img = Image.open(io.BytesIO(ctx_image_data))
+        fmt = img.format
+        if fmt == "PNG":
+            return ctx_image_data
+        buf = io.BytesIO()
+        img.convert("RGBA").save(buf, format="PNG")
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"undecodable image ({source}): {type(exc).__name__}: {exc}") from exc
+    log.info("converted %s input %s to png", fmt, source)
     return buf.getvalue()
 
 
@@ -167,6 +184,12 @@ def _boxes_native(rows) -> list[dict]:
 
 async def _bridge_upscale(token: str, media: bytes, magnify: int) -> tuple[bytes | None, str]:
     """4k/8k 复合的超分段：CI 同步优先，MPS 异步任务兜底（同 _composite_step）。"""
+    # COMPOSITE_TIERS 的值是 float（2.0 / 4.0），直接拼进 URL 会变成
+    # `magnify=2.0`，数据万象判 InvalidArgument "param magnify invalid"
+    # ⇒ CI 同步超分 100% 失败，每次都退化到慢得多的 MPS 异步任务
+    # （2026-10-27 生产日志实测）。server._composite_step 有 int()，
+    # 桥这条路径漏了。
+    magnify = int(magnify)
     ikey = f"upscale/{token[:16]}.png"
     await mps.upload_to_cos(media, ikey)
     try:
@@ -218,7 +241,9 @@ async def _bridge_run(token: str, image_png: bytes, prompt: str, boxes: list[dic
                 sample = proxy_sample
         await store.put(key, {"status": "ready", "sample": sample},
                         ttl_s=_BRIDGE_TTL_DONE)
-        log.info("native bridge done token=%s %d bytes", token[:16], len(media))
+        await store.put(f"bridge_done:{token}", {"sample": sample},
+                        ttl_s=_BRIDGE_TOMBSTONE_TTL)
+        log.info("native bridge done token=%s %d bytes", token[:16], len(media or b""))
     except browser_egress_client.BrowserEgressError as exc:
         await store.put(key, {"status": "error", "error": str(exc)[:300]},
                         ttl_s=_BRIDGE_TTL_DONE)
@@ -306,7 +331,7 @@ def register(app: FastAPI) -> None:
 
         try:
             png = await _reference_png(refs[0]) if refs else None
-        except (ValueError, upstream.UpstreamError) as exc:
+        except (ValueError, OSError, upstream.UpstreamError) as exc:
             return JSONResponse(
                 status_code=422,
                 content={"detail": [{"loc": ["body", "images"],
@@ -324,7 +349,7 @@ def register(app: FastAPI) -> None:
                 if m:
                     ref_name = m.group(1)
                 reference_images.append((ref_png, ref_name))
-            except (ValueError, upstream.UpstreamError) as exc:
+            except (ValueError, OSError, upstream.UpstreamError) as exc:
                 log.warning("reference #%d dropped (fetch failed): %s", idx, exc)
 
         if browser_egress_client.configured():
@@ -423,6 +448,15 @@ def register(app: FastAPI) -> None:
                 out["status"] = "Generating"
             return JSONResponse(out)
 
+        # 墓碑：状态记录已过期，但产物还在 COS（24h）。没有这个分支，
+        # 1h-24h 之间的查询会掉到最下面的上游兜底，把我们的 uuid 当成
+        # 上游 pollToken 发一次真实请求，然后 502。
+        tomb = await store.get(f"bridge_done:{id}")
+        if tomb:
+            return JSONResponse({
+                "id": id, "progress": None, "details": None, "preview": None,
+                "status": "Ready", "result": {"sample": tomb["sample"]}})
+
         # 轮询合并缓存：多租户并发下，同一 token 的密集轮询（客户每 2-3s
         # 一次）只透传上游一次。生成中缓存 3s；终态缓存 120s（生成完成后
         # 的重复轮询全部零上游请求——429 风暴的主源就是这里的 1:1 透传）。
@@ -432,11 +466,22 @@ def register(app: FastAPI) -> None:
             try:
                 state = await upstream.poll_once(id)
             except upstream.UpstreamError as exc:
+                if "invalid or expired" in str(exc).lower():
+                    # 不是上游故障，是"查不到这个任务"（我们的 uuid 过期 /
+                    # 客户端编造 id）。语义应为 404：让客户端明确放弃而不是
+                    # 当 502 无限重试。负缓存 300s —— 否则每次重试都会向上游
+                    # 发一次真实请求（实测每次 1.3-1.7s，且永不缓存）。
+                    await store.put(cache_key, {"status": "gone"}, ttl_s=300)
+                    return JSONResponse(status_code=404,
+                                        content={"detail": "unknown or expired result id"})
                 return JSONResponse(status_code=502, content={"detail": exc.message})
             ttl = 120 if state.get("status") in ("ready", "error") else 3
             await store.put(cache_key, state, ttl_s=ttl)
 
         status = state.get("status")
+        if status == "gone":
+            return JSONResponse(status_code=404,
+                                content={"detail": "unknown or expired result id"})
         out = {"id": id, "progress": None, "details": None, "preview": None}
         if status == "ready":
             out["status"] = "Ready"

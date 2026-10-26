@@ -36,8 +36,12 @@ def client():
 
 
 @pytest.mark.parametrize(("px", "tier"), [
-    (None, None), (0, None), (512, "1k"), (1024, "1k"), (1025, "1.5k"),
-    (1536, "1.5k"), (1537, "2k"), (2048, "2k"), (2049, None), (4096, None),
+    # 768 档是上游真实存在的档位（native `768sq` 实测真出 768x768，
+    # 2026-10-27）。此前缺这一档，OpenAI 客户端传 size=768 会被上舍入
+    # 到 1k 拿 1024²，"按 size 给像素"的约定就破了。
+    (None, None), (0, None), (512, "768sq"), (768, "768sq"), (1024, "1k"),
+    (1025, "1.5k"), (1536, "1.5k"), (1537, "2k"), (2048, "2k"),
+    (2049, None), (4096, None),
 ])
 def test_tier_mapping(px, tier):
     assert tier_for_long_edge(px) == tier
