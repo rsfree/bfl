@@ -88,6 +88,35 @@ def wrap_upstream_error(exc: UpstreamError) -> JSONResponse:
     return openai_error(status, f"Upstream error: {exc.message}", exc.kind)
 
 
+def wrap_browser_egress_error(
+        exc: browser_egress_client.BrowserEgressError) -> JSONResponse:
+    """sidecar 失败 → 对客户端有意义的码。
+
+    历史行为：browser_egress_client 抛裸 RuntimeError，run_job 只捕
+    UpstreamError / MPSError ⇒ 冒到 ASGI 层变 500 + 21 字节空体。客户端
+    拿不到原因，会把"上游暂时不可用"当"服务端崩溃"。生产 2026-10-26
+    实测 50 次，其中 34 次真实原因是多图契约 400、10 次是匿名配额 429。
+
+    映射依据：
+      - 451：内容审核/合规拒绝（sidecar 已把上游 422 归一成 451）→ 客户换内容
+      - 429：上游匿名配额耗尽 → 客户端退避，而不是立刻重试
+      - 0  ：传输层（连接/超时）→ 504，语义是"等得到但没等到"
+      - 其它：上游契约/内部错误 → 502，重试有意义但不该被当成 4xx
+    """
+    if exc.status == 451:
+        return openai_error(451, f"Content moderation rejected: {exc}",
+                            "content_policy_violation")
+    if exc.status == 429:
+        # 配额细节只进日志（含"免费额度"字样），不透给调用方
+        return openai_error(429, "upstream quota exhausted; retry later",
+                            "rate_limit")
+    if exc.status == 0:
+        return openai_error(504, f"upstream timeout: {exc}"[:300],
+                            "upstream_error")
+    return openai_error(502, f"upstream unavailable: {exc}"[:400],
+                        "upstream_error")
+
+
 def _parse_long_side(size: str | None) -> int | None:
     """A "WxH" size as its long edge, or None for ratio/junk.
 
@@ -234,6 +263,10 @@ async def run_job(
                 snippet, resolution, bool(image_png),
                 len(reference_images or []), str(exc)[-80:])
         return wrap_upstream_error(exc)
+    except browser_egress_client.BrowserEgressError as exc:
+        log.warning("run_job browser egress error (status=%s): %s",
+                    exc.status, str(exc)[:300])
+        return wrap_browser_egress_error(exc)
     except mps.MPSError as exc:
         log.warning("run_job mps error: %s", str(exc)[:300])
         return openai_error(502, f"super-resolution failed: {exc.message}",
