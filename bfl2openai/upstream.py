@@ -305,6 +305,10 @@ async def _submit_generation_impl(
                     log.info("submit succeeded via %s", attempt_label)
                 return data["pollToken"]
             last = f"HTTP {r.status_code}: {text[:200]}"
+            # 上游 HTTP/2 指纹级 bot 检测（2026-10-26）：换出口 IP 无效，
+            # 立即抛 access_denied 交给浏览器出口兜底，不再浪费重试。
+            if r.status_code == 403 and "access denied" in text.lower():
+                raise UpstreamError(f"generate failed: {last}", "access_denied")
             retryable = (r.status_code in _RETRY_STATUSES
                          or "Security Checkpoint" in text)
         except Exception as exc:  # noqa: BLE001 - transport errors retry

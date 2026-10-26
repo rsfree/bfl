@@ -88,6 +88,7 @@ async def ensure_page():
             return page
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(
+            executable_path="/usr/bin/chromium",
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
