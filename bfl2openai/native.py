@@ -194,7 +194,9 @@ async def _bridge_upscale(token: str, media: bytes, magnify: int) -> tuple[bytes
     await mps.upload_to_cos(media, ikey)
     try:
         up = await mps.ci_super_resolve_cos(ikey, magnify=magnify, data=media)
-        okey = f"results/{token[:16]}.png"
+        # CI 输出格式跟随输入（超预算的 2k 输入必被压成 JPEG），key 必须
+        # 与内容一致，否则 COS 按扩展名回 image/png 而体是 JPEG。
+        okey = f"results/{token[:16]}.{mps.image_ext(up)}"
         await mps.upload_to_cos(up, okey)
         return up, mps.cos_presigned_get("/" + okey, ttl_s=86400)
     except mps.MPSError as exc:
@@ -548,7 +550,7 @@ def register(app: FastAPI) -> None:
                 try:
                     up_bytes = await mps.ci_super_resolve_cos(
                         key, magnify=magnify, data=media)
-                    out_key = f"results/{token[:16]}.png"
+                    out_key = f"results/{token[:16]}.{mps.image_ext(up_bytes)}"
                     await mps.upload_to_cos(up_bytes, out_key)
                     await store.drop(f"comp:{token}")
                     log.info("composite done (CI sync) token=%s %d bytes",

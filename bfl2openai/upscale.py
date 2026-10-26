@@ -101,6 +101,30 @@ def cos_presigned_get(path: str, ttl_s: int = 3600) -> str:
     )
 
 
+#: 超分链路里会出现的真实图片魔数。CI 同步超分**输出格式跟随输入**：
+#: 输入被压成 JPEG（ci_input_image 超预算时的默认行为）就会拿回 JPEG。
+#: 只认 PNG 会把一次成功的超分判成失败，白等一轮 MPS 异步任务
+#: （2026-10-27 生产实测：2k 输入 5-7MB 必被压 JPEG ⇒ CI 100% 判失败）。
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpeg"),
+    (b"GIF8", "gif"),
+    (b"RIFF", "webp"),
+)
+
+
+def image_ext(data: bytes, default: str = "png") -> str:
+    """按魔数判扩展名（超分产物存 COS 时要与实际格式一致）。"""
+    for magic, ext in _IMAGE_MAGIC:
+        if data[:len(magic)] == magic:
+            return ext
+    return default
+
+
+def is_image(data: bytes) -> bool:
+    return any(data[:len(m)] == m for m, _ in _IMAGE_MAGIC)
+
+
 async def upload_to_cos(data: bytes, object_key: str) -> None:
     """PUT one object into the output bucket.
 
@@ -384,8 +408,8 @@ async def ci_super_resolve_cos(object_key: str, magnify: int,
         if r.status_code != 200:
             raise MPSError(f"CI super-resolution failed: HTTP {r.status_code}: "
                            f"{r.text[:200]}")
-        if r.content[:8] != b"\x89PNG\r\n\x1a\n":
-            raise MPSError(f"CI super-resolution returned non-PNG: "
+        if not is_image(r.content):
+            raise MPSError(f"CI super-resolution returned non-image: "
                            f"{r.content[:120]}")
         return r.content
 

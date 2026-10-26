@@ -37,6 +37,7 @@ from bfl2openai import bridging  # noqa: E402
 from bfl2openai import native  # noqa: E402
 from bfl2openai import server  # noqa: E402
 from bfl2openai import upstream  # noqa: E402
+from bfl2openai import upscale as mps_mod  # noqa: E402
 
 BUF = io.BytesIO()
 Image.new("RGB", (32, 32), (200, 60, 50)).save(BUF, format="PNG")
@@ -263,3 +264,83 @@ def test_images_size_768_maps_to_768sq(client, bridge):
         "prompt": "x", "size": "768x768", "response_format": "url"})
     assert r.status_code == 200, r.text
     assert bridge.get("resolution") == "768sq"
+
+# ---------------------------------------------------------------- 6. CI 格式
+
+
+def test_ci_output_may_be_jpeg_not_png(monkeypatch):
+    """CI 同步超分输出跟随输入：2k 输入被压 JPEG => 返回 JPEG 是成功不是失败。
+
+    修前只认 PNG 魔数，把一次成功的 3840x3840 超分判成失败，白退化到
+    MPS 异步任务多等 60s（2026-10-27 生产日志实测）。
+    """
+    jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"0" * 40
+
+    class _Resp:
+        status_code = 200
+        content = jpeg
+
+    async def fake_get():
+        return _Resp()
+
+    async def fake_upload(data, key):
+        return None
+
+    monkeypatch.setattr(mps_mod, "upload_to_cos", fake_upload)
+    monkeypatch.setattr(mps_mod, "cos_ci_signed_url", lambda k, p: "http://x")
+
+    class _Sess:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            return _Resp()
+
+    monkeypatch.setattr(upstream, "_session_direct", lambda: _Sess())
+
+    import asyncio
+    out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        mps_mod.ci_super_resolve_cos("k.png", magnify=2, data=jpeg))
+    assert out == jpeg
+    assert mps_mod.image_ext(out) == "jpeg"
+
+
+def test_ci_output_non_image_still_fails(monkeypatch):
+    """真正不是图片的响应仍要报错，别把校验放得太松。"""
+    class _Resp:
+        status_code = 200
+        content = b"<html>oops</html>"
+
+    async def fake_upload(data, key):
+        return None
+
+    monkeypatch.setattr(mps_mod, "upload_to_cos", fake_upload)
+    monkeypatch.setattr(mps_mod, "cos_ci_signed_url", lambda k, p: "http://x")
+
+    class _Sess:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            return _Resp()
+
+    monkeypatch.setattr(upstream, "_session_direct", lambda: _Sess())
+
+    import asyncio
+    with pytest.raises(mps_mod.MPSError) as ei:
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            mps_mod.ci_super_resolve_cos("k.png", magnify=2, data=b"x" * 10))
+    assert "non-image" in str(ei.value)
+
+
+def test_image_ext_detects_common_formats():
+    assert mps_mod.image_ext(b"\x89PNG\r\n\x1a\n" + b"0") == "png"
+    assert mps_mod.image_ext(b"\xff\xd8\xff\xe0") == "jpeg"
+    assert mps_mod.image_ext(b"RIFF....WEBP") == "webp"
+    assert mps_mod.image_ext(b"????", default="bin") == "bin"
