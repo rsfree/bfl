@@ -238,3 +238,21 @@ def ensure_resolution_capacity(aspect_ratio: str, resolution: str) -> str:
     except Exception:
         return "1k"                  # "auto"/无法解析：不连坐
     return "2k"
+
+
+def tier_for_long_edge(px: int | None) -> str | None:
+    """像素长边 -> 分辨率档位；只覆盖 1k/1.5k/2k，更大的走升采样复合（返回 None）。
+
+    OpenAI 客户端按 `size` 预期输出像素，而上游的输出尺寸由分辨率档位决定：
+    不做这个映射，"1024x1024" 会在默认 1.5k 档拿到 1536^2（实测矩阵抓到）。
+    显式 `resolution` 永远优先，这个函数只在调用方没给档位时兜底。
+    """
+    if not px:
+        return None
+    if px <= 1024:
+        return "1k"
+    if px <= 1536:
+        return "1.5k"
+    if px <= 2048:
+        return "2k"
+    return None

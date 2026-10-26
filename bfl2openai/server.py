@@ -41,6 +41,7 @@ from .bridging import (
     parse_boxes,
     parse_size_dims,
     size_to_aspect_ratio,
+    tier_for_long_edge,
 )
 from .upstream import UpstreamError
 
@@ -419,7 +420,7 @@ async def images_edits(
     # ---- bfl2openai extensions (beyond the OpenAI spec) ----
     boxes: str | None = Form(None),          # JSON: [{"box":{"x","y","w","h"},"instruction"}]
     aspect_ratio: str | None = Form(None),   # "auto" | "1:1" | "16:9" | ...
-    resolution: str = Form("1.5k"),          # "1k" | "1.5k" | ...
+    resolution: str | None = Form(None),     # 缺省时按 size 像素反推档位
     mode: str = Form("i2i"),
     model: str | None = Form(None),   # 仅用于别名识别，不影响上游选择
 ):
@@ -467,8 +468,12 @@ async def images_edits(
     # >2k asks run the composite: generate at the 2k ceiling, then
     # MPS-upscale. Two spellings arrive here: size "4096x4096" (long edge
     # beyond 2048) or the native resolution tier 4k/8k -- same treatment.
-    upscale_to = _parse_long_side(size)
-    upscale_to = upscale_to if upscale_to and upscale_to > GEN_LONG_EDGE else None
+    long_side = _parse_long_side(size)
+    # size 的像素写法决定档位（OpenAI 客户端按 size 预期输出像素，实测
+    # "1024x1024" 曾在默认 1.5k 档拿到 1536^2）；比例写法不受影响，
+    # 显式 resolution 永远优先。
+    resolution = resolution or tier_for_long_edge(long_side) or "1.5k"
+    upscale_to = long_side if long_side and long_side > GEN_LONG_EDGE else None
     if not upscale_to and resolution in ("4k", "8k"):
         upscale_to = GEN_LONG_EDGE * 2 if resolution == "4k" else GEN_LONG_EDGE * 4
     if upscale_to and not mps.configured():
@@ -549,9 +554,11 @@ async def images_generations(
     n = int(payload.get("n") or 1)
     response_format = payload.get("response_format") or "b64_json"
     ratio = payload.get("aspect_ratio") or size_to_aspect_ratio(payload.get("size"))
-    resolution = str(payload.get("resolution") or "1.5k")
-    upscale_to = _parse_long_side(payload.get("size"))
-    upscale_to = upscale_to if upscale_to and upscale_to > GEN_LONG_EDGE else None
+    long_side = _parse_long_side(payload.get("size"))
+    # size 像素写法决定档位（同 edits）；比例写法/未给 size 落默认档。
+    resolution = str(payload.get("resolution") or "") \
+        or tier_for_long_edge(long_side) or "1.5k"
+    upscale_to = long_side if long_side and long_side > GEN_LONG_EDGE else None
     if not upscale_to and resolution in ("4k", "8k"):
         upscale_to = GEN_LONG_EDGE * 2 if resolution == "4k" else GEN_LONG_EDGE * 4
     if upscale_to and not mps.configured():
