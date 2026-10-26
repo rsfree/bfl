@@ -29,23 +29,26 @@ app = FastAPI()
 _state = {"page": None, "inflight": 0, "lock": asyncio.Lock()}
 
 SUBMIT_JS = """
-async ({prompt, aspectRatio, resolution, mode, imgB64, boxes, refs}) => {
+async ({prompt, aspectRatio, resolution, mode, imgB64, boxes, references, refs}) => {
   const bin = atob(imgB64);
   const arr = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
   const fd = new FormData();
+  fd.append("mode", mode);
   fd.append("prompt", prompt);
   fd.append("aspectRatio", aspectRatio);
   fd.append("resolution", resolution);
-  fd.append("mode", mode);
-  if (boxes) fd.append("boxes", boxes);
+  // 契约（2026-10-09/14 实测）：boxes/references 两个 JSON 字段必须始终存在，
+  // 缺失会被当成 composition（t2i）→ 带 image 即 400。
+  fd.append("boxes", boxes || "[]");
+  fd.append("references", references || "[]");
   fd.append("image", new Blob([arr], {type: "image/png"}), "image.png");
   if (refs && refs.length) {
     for (let i = 0; i < refs.length; i++) {
       const rb = atob(refs[i]);
       const ra = new Uint8Array(rb.length);
       for (let j = 0; j < rb.length; j++) ra[j] = rb.charCodeAt(j);
-      fd.append("image", new Blob([ra], {type: "image/png"}), `ref${i}.png`);
+      fd.append("references", new Blob([ra], {type: "image/png"}), `ref${i}.png`);
     }
   }
   const r = await fetch("/api/flux3-image/generate", {method: "POST", body: fd});
@@ -90,9 +93,22 @@ async def ensure_page():
         browser = await pw.chromium.launch(
             executable_path="/usr/bin/chromium",
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--no-sandbox", "--disable-dev-shm-usage",
+                # 反 headless 检测：上游按 UA/webdriver/视口识别自动化环境
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1920,1080",
+                "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
+            ],
         )
-        ctx = await browser.new_context(locale="en-US")
+        ctx = await browser.new_context(
+            locale="en-US",
+            viewport={"width": 1920, "height": 1080},
+            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"),
+        )
+        await ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
         page = await ctx.new_page()
         await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(2000)
@@ -108,6 +124,7 @@ class GenReq(BaseModel):
     resolution: str = "1k"
     mode: str = "i2i"
     boxes: str | None = None
+    references: str | None = None
     refs: list[str] | None = None
 
 
@@ -121,14 +138,19 @@ async def healthz():
 @app.post("/generate")
 async def generate(req: GenReq):
     _state["inflight"] += 1
+    t_start = time.time()
     try:
         page = await ensure_page()
-        sub = await page.evaluate(SUBMIT_JS, {
+        t_page = time.time()
+        sub = await asyncio.wait_for(page.evaluate(SUBMIT_JS, {
             "prompt": req.prompt, "aspectRatio": req.aspect_ratio,
             "resolution": req.resolution, "mode": req.mode,
             "imgB64": req.image_b64, "boxes": req.boxes,
-            "refs": req.refs or [],
-        })
+            "references": req.references, "refs": req.refs or [],
+        }), timeout=90)
+        t_submit = time.time()
+        print(f"[gen] page={t_page - t_start:.1f}s submit={t_submit - t_page:.1f}s "
+              f"status={sub['status']}", flush=True)
         if sub["status"] != 200:
             return JSONResponse(status_code=502,
                                content={"error": f"submit {sub['status']}: {sub['body'][:200]}"})
@@ -144,7 +166,7 @@ async def generate(req: GenReq):
         image_token = None
         last = ""
         while time.time() < deadline:
-            st = await page.evaluate(STATUS_JS, token)
+            st = await asyncio.wait_for(page.evaluate(STATUS_JS, token), timeout=30)
             last = st["body"][:200]
             if st["status"] == 200:
                 try:
@@ -164,7 +186,10 @@ async def generate(req: GenReq):
         if not image_token:
             return JSONResponse(status_code=504, content={"error": f"poll timeout: {last}"})
 
-        med = await page.evaluate(MEDIA_JS, image_token)
+        t_ready = time.time()
+        med = await asyncio.wait_for(page.evaluate(MEDIA_JS, image_token), timeout=120)
+        print(f"[gen] poll={t_ready - t_submit:.1f}s media={time.time() - t_ready:.1f}s "
+              f"total={time.time() - t_start:.1f}s poll_rounds ok", flush=True)
         if med.get("status") != 200 or not med.get("b64"):
             return JSONResponse(status_code=502,
                                content={"error": f"media {med.get('status')}: {str(med.get('body'))[:150]}"})
@@ -175,6 +200,25 @@ async def generate(req: GenReq):
         _state["inflight"] -= 1
 
 
+async def _prewarm_generate():
+    """启动预热：页面加载后跑一发 dummy 生成，把 TLS/上游会话/页面 JS 全部
+    热起来（实测冷启动首发生成 >300s，预热后首发即稳态 ~50s）。"""
+    try:
+        await ensure_page()
+        from PIL import Image as _Img
+
+        import io as _io
+
+        buf = _io.BytesIO()
+        _Img.new("RGB", (256, 256), (128, 128, 128)).save(buf, "PNG")
+        await generate(GenReq(image_b64=base64.b64encode(buf.getvalue()).decode(),
+                              prompt="a plain gray square",
+                              aspect_ratio="1:1", resolution="1k", mode="i2i"))
+        print("[prewarm] done", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[prewarm] failed: {type(exc).__name__}: {str(exc)[:100]}", flush=True)
+
+
 @app.on_event("startup")
 async def _warm():
-    asyncio.create_task(ensure_page())
+    asyncio.create_task(_prewarm_generate())

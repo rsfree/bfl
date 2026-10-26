@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 
 BROWSER_EGRESS_URL = os.environ.get("BFL2OPENAI_BROWSER_EGRESS", "").rstrip("/")
-_TIMEOUT_S = float(os.environ.get("BFL2OPENAI_BROWSER_EGRESS_TIMEOUT", "330"))
+_TIMEOUT_S = float(os.environ.get("BFL2OPENAI_BROWSER_EGRESS_TIMEOUT", "180"))
 
 
 def configured() -> bool:
@@ -21,6 +21,7 @@ def configured() -> bool:
 
 async def generate(image_png: bytes, prompt: str, aspect_ratio: str,
                    resolution: str, mode: str, boxes_json: str | None = None,
+                   references_json: str | None = None,
                    refs: list[bytes] | None = None) -> bytes:
     """经浏览器 sidecar 完成一次生成，返回图片字节。失败抛 RuntimeError。"""
     payload = {
@@ -29,7 +30,8 @@ async def generate(image_png: bytes, prompt: str, aspect_ratio: str,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
         "mode": mode,
-        "boxes": boxes_json,
+        "boxes": boxes_json or "[]",
+        "references": references_json or "[]",
         "refs": [base64.b64encode(r).decode() for r in (refs or [])],
     }
     def _post() -> tuple[int, str]:
