@@ -108,6 +108,10 @@ GEN_LONG_EDGE = 2048
 #: 用于定位高频违规词；采样期结束务必关掉（客户内容不落日志是默认原则）。
 _MODERATION_DIAG = os.environ.get("BFL2OPENAI_MODERATION_DIAG", "") == "1"
 
+#: 浏览器优先：上游指纹封禁期间（curl_cffi 恒 403 + 代理重试白耗 2-3 分钟），
+#: 置 1 时直接走 browser_egress sidecar，跳过 curl_cffi 尝试链。
+_BROWSER_PRIMARY = os.environ.get("BFL2OPENAI_BROWSER_PRIMARY", "") == "1"
+
 
 async def run_job(
     image_png: bytes | None,
@@ -126,28 +130,13 @@ async def run_job(
         gen_resolution = bridging.ensure_resolution_capacity(
             aspect_ratio, "2k" if upscale_to else resolution)
         browser_media: bytes | None = None
-        try:
-            poll_token = await upstream.submit_generation(
-                image_png=image_png or b"",
-                prompt=prompt,
-                boxes=boxes,
-                aspect_ratio=aspect_ratio,
-                resolution=gen_resolution,
-                mode=mode,
-                base_url=UPSTREAM_BASE,
-                reference_images=reference_images or None,
-            )
-            log.info("submitted pollToken=%s… (resolution=%s)", poll_token[:10], gen_resolution)
-        except UpstreamError as submit_exc:
-            # 上游按 HTTP/2 指纹拒绝 curl_cffi（403 Access denied）——只有真实
-            # 浏览器环境能过。降级到 browser_egress sidecar（页面内 fetch
-            # 直出图片，跳过 wait_for_result/fetch_media）。
-            if submit_exc.kind != "access_denied" or not browser_egress_client.configured():
-                raise
+        if _BROWSER_PRIMARY and browser_egress_client.configured():
+            # 直连浏览器出口：跳过 curl_cffi（当前恒 403，且代理重试链要
+            # 白耗 2-3 分钟）。生成图由 sidecar 直出，后处理复用原有分支。
             import uuid as _uuid
             poll_token = _uuid.uuid4().hex
-            log.warning("fingerprint 403 from upstream; browser egress fallback "
-                        "token=%s… (resolution=%s)", poll_token[:10], gen_resolution)
+            log.info("browser-primary token=%s… (resolution=%s)",
+                     poll_token[:10], gen_resolution)
             browser_media = await browser_egress_client.generate(
                 image_png=image_png or b"", prompt=prompt,
                 aspect_ratio=aspect_ratio, resolution=gen_resolution, mode=mode,
@@ -155,8 +144,41 @@ async def run_job(
                 refs=[b for b, _ in (reference_images or [])])
             image_token = poll_token
         else:
-            image_token = await upstream.wait_for_result(poll_token, UPSTREAM_BASE)
-            log.info("ready imageToken=%s…", image_token[:10])
+            try:
+                poll_token = await upstream.submit_generation(
+                    image_png=image_png or b"",
+                    prompt=prompt,
+                    boxes=boxes,
+                    aspect_ratio=aspect_ratio,
+                    resolution=gen_resolution,
+                    mode=mode,
+                    base_url=UPSTREAM_BASE,
+                    reference_images=reference_images or None,
+                )
+                log.info("submitted pollToken=%s… (resolution=%s)",
+                         poll_token[:10], gen_resolution)
+            except UpstreamError as submit_exc:
+                # 上游按 HTTP/2 指纹拒绝 curl_cffi（403 Access denied）——只有
+                # 真实浏览器环境能过。降级到 browser_egress sidecar。
+                if (submit_exc.kind != "access_denied"
+                        or not browser_egress_client.configured()):
+                    raise
+                import uuid as _uuid
+                poll_token = _uuid.uuid4().hex
+                log.warning("fingerprint 403 from upstream; browser egress "
+                            "fallback token=%s… (resolution=%s)",
+                            poll_token[:10], gen_resolution)
+                browser_media = await browser_egress_client.generate(
+                    image_png=image_png or b"", prompt=prompt,
+                    aspect_ratio=aspect_ratio, resolution=gen_resolution,
+                    mode=mode,
+                    boxes_json=json.dumps(boxes) if boxes else None,
+                    refs=[b for b, _ in (reference_images or [])])
+                image_token = poll_token
+            else:
+                image_token = await upstream.wait_for_result(
+                    poll_token, UPSTREAM_BASE)
+                log.info("ready imageToken=%s…", image_token[:10])
         if upscale_to:
             # Automatic super-resolution for >2k asks: the generated image
             # rides through our COS -- MPS's own fetcher gets 429'd by the
