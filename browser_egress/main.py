@@ -25,7 +25,7 @@ import os
 import random
 import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright
 from pydantic import BaseModel
@@ -399,7 +399,17 @@ async def recycle_entry(entry: dict, *, premarked: bool = False):
                 await entry["ctx"].close()
             except Exception:  # noqa: BLE001
                 pass
-            fresh = await _new_page(browser, idx, version)
+            try:
+                fresh = await _new_page(browser, idx, version)
+            except Exception as exc:  # noqa: BLE001
+                # 回收失败（Page.goto ERR_ABORTED / Target crashed）：把坏页
+                # 摘出池子，否则闭页会一直占位，等全部 closed 后
+                # acquire_entry 兜底拿到空列表（2026-11-05 生产实测）。
+                print(f"[pool] page#{idx} recycle failed: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+                _state["pool"] = [e for e in (_state.get("pool") or [])
+                                  if e is not entry and not e["page"].is_closed()]
+                return
             fresh["recycled"] = entry["recycled"] + 1
             pool = _state["pool"]
             for i, e in enumerate(pool):
@@ -445,6 +455,12 @@ async def acquire_entry(exclude: set[int] | None = None) -> dict:
         if time.time() >= deadline:
             # 兜底：宁可排队超时前先接单，也不要整链 503
             pool = [e for e in pool if not e["page"].is_closed()]
+            if not pool:
+                # 一个可用页都没有（页面全 crash / 回收失败）：快速 503，
+                # 让 app 侧换下一个 sidecar 实例。这里以前直接 min([])，
+                # 会崩成 500 且带上 "min() iterable argument is empty"
+                # （2026-11-05 生产实测）。
+                raise HTTPException(status_code=503, detail="egress pool empty")
             entry = min(pool, key=lambda e: e["inflight"])
             _reserve(entry)
             return entry
