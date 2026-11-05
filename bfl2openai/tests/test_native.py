@@ -238,6 +238,33 @@ def test_native_submit_returns_async_response_shape(client, monkeypatch):
     assert captured["resolution"] == "2k"
 
 
+def test_polling_url_uses_public_base(client, monkeypatch):
+    """nginx 反代下 request.base_url 是 http；polling_url 必须用 PUBLIC_BASE。
+
+    2026-11-05 生产实测：回 http://bfl.1task.cn/... 时客户端裸 GET 连吃 301，
+    轮询永远到不了终态（PUBLIC_BASE 当时只在 result.sample 上生效）。
+    """
+    from bfl2openai import native
+
+    monkeypatch.setattr(native, "PUBLIC_BASE", "https://bfl.example.com")
+    monkeypatch.setattr("bfl2openai.native.browser_egress_client.configured",
+                        lambda: False)
+
+    async def fake_submit(**kw):
+        return "tok-https"
+
+    async def fake_png(ref):
+        return RAW
+
+    monkeypatch.setattr("bfl2openai.native.upstream.submit_generation", fake_submit)
+    monkeypatch.setattr("bfl2openai.native._reference_png", fake_png)
+    r = client.post("/v1/flux-3-image",
+                    json={"prompt": "x", "images": [DATA_URI], "resolution": "1k"})
+    assert r.status_code == 200
+    assert r.json()["polling_url"] == (
+        "https://bfl.example.com/v1/get_result?id=tok-https")
+
+
 def test_native_poll_maps_states(client, monkeypatch):
     import asyncio
 

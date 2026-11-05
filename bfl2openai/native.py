@@ -371,7 +371,10 @@ def register(app: FastAPI) -> None:
                 f"{proxy_base}/v1/flux3-image/results/{token}"))
             _BRIDGE_TASKS.add(task)
             task.add_done_callback(_BRIDGE_TASKS.discard)
-            base = str(request.base_url).rstrip("/")
+            # 🔴 必须用 PUBLIC_BASE：nginx 反代下 request.base_url 是 http，
+            # 回给客户端的 polling_url 会在 :80 吃 301（官方客户端不一定跟随
+            # 重定向，2026-11-05 生产实测连吃 15 次 301 轮询不到终态）。
+            base = PUBLIC_BASE or str(request.base_url).rstrip("/")
             return JSONResponse(
                 {
                     "id": token,
@@ -419,7 +422,7 @@ def register(app: FastAPI) -> None:
                 content={"detail": exc.message},
             )
 
-        base = str(request.base_url).rstrip("/")
+        base = PUBLIC_BASE or str(request.base_url).rstrip("/")
         return JSONResponse(
             {
                 "id": poll_token,
