@@ -616,3 +616,45 @@ def test_negative_cache_ttl_is_7_days(monkeypatch):
     assert expire_ts is not None, "负缓存必须带过期时间"
     assert expire_ts - _t.time() > 6 * 24 * 3600, "负缓存 TTL 应 ~7 天"
     asyncio.run(store.drop(f"pollcache:{tok[:40]}"))
+
+
+def test_polling_url_is_a_capability_url(client, monkeypatch):
+    """polling_url 裸 GET 不带 x-key；提交门仍需 x-key。
+
+    BFL 官方协议：submit 带 x-key，响应里的 polling_url 由客户端直接 GET，
+    不再携带任何头。轮询门若也要求 x-key，官方 SDK / new-api 渠道每次轮询
+    都吃 401（2026-11-05 生产实测、2026-10-27 线上日志 401x25）。
+    id（uuid4 / 上游 pollToken）本身就是不可枚举的凭证。
+    """
+    import asyncio
+
+    from bfl2openai import native, store
+
+    monkeypatch.setattr(native, "NATIVE_API_KEY", "sk-test")
+
+    # 提交门：能创建生成任务，必须带 x-key
+    denied = client.post("/v1/flux-3-image", json={"prompt": "x"})
+    assert denied.status_code == 401
+    assert denied.json()["detail"] == "Invalid x-key"
+    passed = client.post("/v1/flux-3-image", json={}, headers={"x-key": "sk-test"})
+    assert passed.status_code == 422, "带对 x-key 后应落到参数校验，而非鉴权"
+
+    # 轮询门：裸 GET（无 x-key / 无 Authorization）必须放行到业务分支
+    tok = "capability-token-20261105"
+    for k in (f"pollcache:{tok[:40]}", f"comp:{tok}", f"bridge:{tok}",
+              f"bridge_done:{tok}"):
+        asyncio.run(store.drop(k))
+
+    async def fake_poll(token):
+        return {"status": "pending"}
+
+    monkeypatch.setattr("bfl2openai.native.upstream.poll_once", fake_poll)
+    r = client.get("/v1/get_result", params={"id": tok})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "Pending"
+
+    # 旧客户端仍带 x-key 也要正常（向后兼容）
+    asyncio.run(store.drop(f"pollcache:{tok[:40]}"))
+    r2 = client.get("/v1/get_result", params={"id": tok},
+                    headers={"x-key": "sk-test"})
+    assert r2.status_code == 200, r2.text

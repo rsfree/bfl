@@ -94,7 +94,11 @@ POST /v1/flux3-image/upscale 同步超分：{"image":"<公网URL或imageToken>",
 
 说明：
 
-- **鉴权**：接受官方 `x-key` 头；设 `BFL_NATIVE_API_KEY` 后强制校验，缺省不校验。
+- **鉴权**：`POST /v1/flux-3-image` 接受官方 `x-key` 头，设 `BFL_NATIVE_API_KEY`
+  后强制校验（缺省不校验）。**`GET /v1/get_result` 永不校验** —— `polling_url`
+  是能力 URL，官方客户端拿到后裸 GET、不带任何头；`id`（桥路径 uuid4 /
+  直连路径上游 pollToken）即凭证。产物端点与 COS 预签名 sample 本来也免鉴权，
+  在轮询上加 key 保护不了资源，只会让每次轮询 401（2026-11-05 生产实测）。
 - **bbox/layout 是 prompt 约定**（官方文档原文）：`{"id","bbox":[0-1000],"desc"}` 行
   JSON 拼进 prompt + `<id>` 占位符 —— 该写法原样透传即可，模型直接消费；
   `bounding_boxes` 扩展字段才走 Playground 的区域指令通道（每区域独立 instruction）。

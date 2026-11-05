@@ -431,7 +431,17 @@ def register(app: FastAPI) -> None:
 
     @app.get("/v1/get_result")
     async def get_result(request: Request, id: str):
-        _check_x_key(request)
+        # 🔴 故意不校验 x-key：polling_url 是「能力 URL」(capability URL)。
+        # 官方 BFL 协议里 submit 带 x-key，但客户端拿到 polling_url 之后是
+        # 裸 GET，不会再带任何自定义头 —— 这里要求 x-key 会让官方 SDK /
+        # new-api 渠道的每一次轮询都 401（2026-11-05 生产实测：无头
+        # 401 {"detail":"Invalid x-key"}；2026-10-27 线上日志 401×25）。
+        #
+        # 安全模型：id 本身就是凭证。桥路径为 uuid4 hex（128 bit 不可枚举），
+        # 直连路径为上游 pollToken（高熵）。且产物端点
+        # /v1/flux3-image/results/{token} 与 COS 预签名 sample 本来就不鉴权，
+        # 在这里加 x-key 保护不了任何资源，只会挡住状态查询。
+        # 真正需要保护的「创建生成任务」仍由 /v1/flux-3-image 的 x-key 兜住。
         composite = await store.get(f"comp:{id}")
         if composite:
             return await _composite_step(request, id, composite)
