@@ -103,7 +103,62 @@ POST /v1/flux3-image/upscale 同步超分：{"image":"<公网URL或imageToken>",
   JSON 拼进 prompt + `<id>` 占位符 —— 该写法原样透传即可，模型直接消费；
   `bounding_boxes` 扩展字段才走 Playground 的区域指令通道（每区域独立 instruction）。
 - **webhook 不支持**（仅轮询）；`images` 的 URL 输入由本服务代为下载。
-- t2i（无 `images`）按 `mode=t2i` 提交上游 —— **未验证路径**，上游拒绝时原样透出。
+- t2i（无 `images`）按 `mode=t2i` 提交上游，2026-11-05 公网实测已出图。
+
+### curl 示例
+
+> `$KEY` = 部署里的 `BFL_NATIVE_API_KEY`。**轮询不要带任何头** —— `polling_url` 本身就是凭证。
+> 生成通常 20~40s（4k/8k 复合更久）；公网 `bfl.1task.cn` 的轮询会间歇性吃 25s 超时，
+> 客户端必须自带重试，否则会把正常任务误判为失败。
+
+**文生图（无 `images`）**
+
+```bash
+curl -sS https://bfl.1task.cn/v1/flux-3-image \
+  -H 'Content-Type: application/json' \
+  -H "x-key: $KEY" \
+  -d '{"prompt":"a single red apple on a white table, studio lighting","resolution":"1k","aspect_ratio":"1:1"}'
+# → {"id":"fa0719…","polling_url":"https://bfl.1task.cn/v1/get_result?id=fa0719…","cost":null,"input_mp":null}
+```
+
+**图生图（公网 URL）**
+
+```bash
+curl -sS https://bfl.1task.cn/v1/flux-3-image \
+  -H 'Content-Type: application/json' \
+  -H "x-key: $KEY" \
+  -d '{"prompt":"same scene, warmer light","images":["https://example.com/in.png"],"resolution":"1k","aspect_ratio":"1:1"}'
+```
+
+**图生图（本地文件转 base64）**
+
+```bash
+# macOS: B64=$(base64 -i in.png | tr -d '\n')
+B64=$(base64 -w0 in.png)
+curl -sS https://bfl.1task.cn/v1/flux-3-image \
+  -H 'Content-Type: application/json' \
+  -H "x-key: $KEY" \
+  -d "{\"prompt\":\"same scene, warmer light\",\"images\":[\"data:image/png;base64,$B64\"],\"resolution\":\"1k\",\"aspect_ratio\":\"1:1\"}"
+```
+
+**轮询到终态（裸 GET + 重试）**
+
+```bash
+ID=fa0719…                      # 上一步返回的 id
+for i in $(seq 1 60); do
+  R=$(curl -sS --retry 3 --retry-delay 1 --retry-all-errors \
+        "https://bfl.1task.cn/v1/get_result?id=$ID")
+  echo "$R"
+  echo "$R" | grep -qE '"status":"(Ready|Error)"' && break
+  sleep 3
+done
+```
+
+**取图**（`result.sample` 是 24h COS 预签名链）
+
+```bash
+curl -sS -L -o out.png "$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["sample"])')"
+```
 
 ## 逆向结论（上游契约）
 
