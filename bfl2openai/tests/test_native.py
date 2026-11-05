@@ -685,3 +685,27 @@ def test_polling_url_is_a_capability_url(client, monkeypatch):
     r2 = client.get("/v1/get_result", params={"id": tok},
                     headers={"x-key": "sk-test"})
     assert r2.status_code == 200, r2.text
+
+
+def test_stale_bridge_task_reports_error(client, monkeypatch):
+    """容器重建/worker 被 kill 后后台 task 消失，不能让客户端无限 Generating。"""
+    import asyncio
+    import time
+
+    from bfl2openai import store
+
+    tok = "stale-bridge-20261105"
+    asyncio.run(store.put(f"bridge:{tok}",
+                          {"status": "generating", "started_at": time.time()},
+                          ttl_s=60))
+    r = client.get("/v1/get_result", params={"id": tok})
+    assert r.json()["status"] == "Generating"
+
+    asyncio.run(store.put(f"bridge:{tok}",
+                          {"status": "generating", "started_at": time.time() - 999},
+                          ttl_s=60))
+    r = client.get("/v1/get_result", params={"id": tok})
+    assert r.status_code == 200
+    assert r.json()["status"] == "Error"
+    assert "timed out" in r.json()["details"]["error"]
+    asyncio.run(store.drop(f"bridge:{tok}"))

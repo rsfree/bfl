@@ -105,6 +105,12 @@ _BRIDGE_TTL_DONE = 3600
 _BRIDGE_TOMBSTONE_TTL = 86400
 _BRIDGE_TASKS: set = set()  # 持强引用防 GC（asyncio 只存弱引用）
 
+#: 桥任务看门狗：后台 task 只活在 gunicorn worker 内存里，容器重建 / worker
+#: 被 kill / sidecar 页面池空转时它会直接消失，Redis 里的 bridge:{id} 却
+#: 永远停在 generating，客户端会无限轮询（2026-11-05 生产实测三个任务卡死）。
+#: 超过这个秒数仍无终态就明确回 Error，让调用方放弃而不是空等。
+_BRIDGE_STALE_S = float(os.environ.get("BFL2OPENAI_BRIDGE_STALE_S", "300"))
+
 
 def _check_x_key(request: Request) -> None:
     """Honours the official `x-key` header; enforces only when configured."""
@@ -358,7 +364,8 @@ def register(app: FastAPI) -> None:
             # 异步桥：受理即回 id，生成在后台跑 sidecar（上游封 curl_cffi
             # 指纹后，直连 submit 恒 403 => 502；桥让原生方言恢复可用）。
             token = uuid.uuid4().hex
-            await store.put(f"bridge:{token}", {"status": "generating"},
+            await store.put(f"bridge:{token}",
+                            {"status": "generating", "started_at": time.time()},
                             ttl_s=_BRIDGE_TTL_RUNNING)
             proxy_base = PUBLIC_BASE or str(request.base_url).rstrip("/")
             task = asyncio.create_task(_bridge_run(
@@ -459,6 +466,11 @@ def register(app: FastAPI) -> None:
             elif bridge.get("status") == "error":
                 out["status"] = "Error"
                 out["details"] = {"error": bridge.get("error") or "unknown"}
+            elif time.time() - bridge.get("started_at", 0) > _BRIDGE_STALE_S:
+                # 旧记录没有 started_at 也按过期处理：直接清掉历史僵尸 key。
+                out["status"] = "Error"
+                out["details"] = {
+                    "error": "generation timed out (worker lost or egress unavailable)"}
             else:
                 out["status"] = "Generating"
             return JSONResponse(out)
