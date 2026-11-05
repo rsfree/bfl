@@ -424,6 +424,41 @@ async def recycle_entry(entry: dict, *, premarked: bool = False):
 
 
 
+#: Playwright 里「这个页面已经废了」的错误特征：渲染进程崩溃 / context 被关。
+#: 这类错误换一页重试就有救，不能当业务失败 —— 2026-11-05 实测
+#: `Page.evaluate: Target crashed` 直接冒成 500，把一次正常生成白丢了。
+_PAGE_DEAD_MARKERS = (
+    "target crashed", "target closed", "page crashed", "page closed",
+    "has been closed", "session closed", "browser has been closed",
+)
+
+
+def _page_dead(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(m in text for m in _PAGE_DEAD_MARKERS)
+
+
+def _page_ok(entry: dict) -> bool:
+    """页面当前可复用？closed / crashed 任一为真都不行。
+
+    crashed 的页 is_closed() 仍可能是 False（渲染进程没了但 CDP 还挂着），
+    只查 closed 会把它一直选出来，请求连续 500。
+    """
+    pg = entry["page"]
+    try:
+        return not pg.is_closed() and not pg.is_crashed()
+    except Exception:  # noqa: BLE001 - CDP 断了
+        return False
+
+
+def _retire(entry: dict, reason: str) -> None:
+    """摘掉一个废页：立刻长期冷却 + 后台重建，池子不缩水。"""
+    entry["cooldown_until"] = time.time() + 3600
+    entry["want_recycle"] = True
+    print(f"[pool] page#{entry['idx']} retired ({reason})", flush=True)
+    schedule_recycle(entry)
+
+
 def _reserve(entry: dict):
     entry["inflight"] += 1
     _state["total_inflight"] += 1
@@ -445,7 +480,7 @@ async def acquire_entry(exclude: set[int] | None = None) -> dict:
         cands = [e for e in pool
                  if id(e) not in exclude
                  and not e.get("recycling")
-                 and not e["page"].is_closed()
+                 and _page_ok(e)
                  and e["cooldown_until"] <= now
                  and e["inflight"] < per_page_cap]
         if cands:
@@ -454,7 +489,7 @@ async def acquire_entry(exclude: set[int] | None = None) -> dict:
             return entry
         if time.time() >= deadline:
             # 兜底：宁可排队超时前先接单，也不要整链 503
-            pool = [e for e in pool if not e["page"].is_closed()]
+            pool = [e for e in pool if _page_ok(e)]
             if not pool:
                 # 一个可用页都没有（页面全 crash / 回收失败）：快速 503，
                 # 让 app 侧换下一个 sidecar 实例。这里以前直接 min([])，
@@ -574,7 +609,7 @@ async def healthz():
     return {
         "ok": True,
         "pages": len(pool),
-        "pages_ready": sum(1 for e in pool if not e["page"].is_closed()),
+        "pages_ready": sum(1 for e in pool if _page_ok(e)),
         "pages_cooling": sum(1 for e in pool if e["cooldown_until"] > now),
         "pages_recycling": sum(1 for e in pool if e.get("recycling")),
         "inflight": _state["total_inflight"],
@@ -618,12 +653,23 @@ async def generate(req: GenReq):
                 bad["want_recycle"] = True    # 后台任务空闲时换 IP
                 entry = await acquire_entry(exclude=switched)
             t_page = time.time()
-            sub = await _eval(entry, SUBMIT_JS, {
-                "prompt": req.prompt, "aspectRatio": req.aspect_ratio,
-                "resolution": req.resolution, "mode": req.mode,
-                "imgB64": req.image_b64, "boxes": req.boxes,
-                "references": req.references, "refs": req.refs or [],
-            }, timeout=90)
+            try:
+                sub = await _eval(entry, SUBMIT_JS, {
+                    "prompt": req.prompt, "aspectRatio": req.aspect_ratio,
+                    "resolution": req.resolution, "mode": req.mode,
+                    "imgB64": req.image_b64, "boxes": req.boxes,
+                    "references": req.references, "refs": req.refs or [],
+                }, timeout=90)
+            except Exception as exc:  # noqa: BLE001
+                if not _page_dead(exc):
+                    raise
+                _release(entry)
+                _retire(entry, f"submit: {type(exc).__name__}")
+                if attempt >= 2:
+                    raise
+                switched.add(id(entry))
+                entry = await acquire_entry(exclude=switched)
+                continue
             status = sub.get("status")
             if status not in (403, 429):
                 break
@@ -672,7 +718,17 @@ async def generate(req: GenReq):
         last = ""
         rounds = 0
         while time.time() < deadline:
-            st = await _eval(entry, STATUS_JS, token, timeout=30)
+            try:
+                st = await _eval(entry, STATUS_JS, token, timeout=30)
+            except Exception as exc:  # noqa: BLE001
+                if not _page_dead(exc):
+                    raise
+                # 任务已经提交到上游：换一页继续轮询即可，丢任务才是最坏结果
+                _release(entry)
+                _retire(entry, f"poll: {type(exc).__name__}")
+                switched.add(id(entry))
+                entry = await acquire_entry(exclude=switched)
+                continue
             rounds += 1
             last = st["body"][:200]
             if st["status"] == 200:
@@ -700,7 +756,16 @@ async def generate(req: GenReq):
                                                  f"{rounds} rounds: {last}"})
 
         t_ready = time.time()
-        med = await _eval(entry, MEDIA_JS, image_token, timeout=120)
+        try:
+            med = await _eval(entry, MEDIA_JS, image_token, timeout=120)
+        except Exception as exc:  # noqa: BLE001
+            if not _page_dead(exc):
+                raise
+            _release(entry)
+            _retire(entry, f"media: {type(exc).__name__}")
+            switched.add(id(entry))
+            entry = await acquire_entry(exclude=switched)
+            med = await _eval(entry, MEDIA_JS, image_token, timeout=120)
         print(f"[gen] poll={t_ready - t_submit:.1f}s rounds={rounds} "
               f"media={time.time() - t_ready:.1f}s "
               f"total={time.time() - t_start:.1f}s", flush=True)
