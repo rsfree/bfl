@@ -452,12 +452,14 @@ def register(app: FastAPI) -> None:
         # /v1/flux3-image/results/{token} 与 COS 预签名 sample 本来就不鉴权，
         # 在这里加 x-key 保护不了任何资源，只会挡住状态查询。
         # 真正需要保护的「创建生成任务」仍由 /v1/flux-3-image 的 x-key 兜住。
-        composite = await store.get(f"comp:{id}")
+        # 三个状态键一次 MGET：高频轮询（客户端每 2-3s 一次）下把每轮
+        # 3 次 Redis RTT 压到 1 次。桥路径全程零上游请求，状态只在 Redis。
+        composite, bridge, tomb = await store.mget(
+            [f"comp:{id}", f"bridge:{id}", f"bridge_done:{id}"])
         if composite:
             return await _composite_step(request, id, composite)
 
         # 异步桥任务：生成跑在 sidecar 后台任务里，这里只读状态（零上游请求）
-        bridge = await store.get(f"bridge:{id}")
         if bridge:
             out = {"id": id, "progress": None, "details": None, "preview": None}
             if bridge.get("status") == "ready":
@@ -478,7 +480,6 @@ def register(app: FastAPI) -> None:
         # 墓碑：状态记录已过期，但产物还在 COS（24h）。没有这个分支，
         # 1h-24h 之间的查询会掉到最下面的上游兜底，把我们的 uuid 当成
         # 上游 pollToken 发一次真实请求，然后 502。
-        tomb = await store.get(f"bridge_done:{id}")
         if tomb:
             return JSONResponse({
                 "id": id, "progress": None, "details": None, "preview": None,

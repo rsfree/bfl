@@ -58,6 +58,32 @@ async def get(key: str):
     return json.loads(data)
 
 
+async def mget(keys: list[str]) -> list:
+    """批量读：一次 RTT 取多个 key。
+
+    `get_result` 每轮要查 comp / bridge / bridge_done 三个键，高频轮询下
+    3 次 RTT 变 1 次（2026-11-05）。返回与 keys 等长，缺失或过期即 None。
+    """
+    if REDIS_URL:
+        rows = await _r.mget(keys)
+        return [json.loads(r) if r else None for r in rows]
+    _sweep()
+    now = time.time()
+    out = []
+    for key in keys:
+        item = _MEM.get(key)
+        if item is None:
+            out.append(None)
+            continue
+        data, exp = item
+        if exp and exp < now:
+            _MEM.pop(key, None)
+            out.append(None)
+            continue
+        out.append(json.loads(data))
+    return out
+
+
 async def drop(key: str) -> None:
     if REDIS_URL:
         await _r.delete(key)
