@@ -14,9 +14,12 @@ name: bfl2openai
 
 # 出口 sidecar 的公共部分：三台只有容器名 / 静态 IP / 页面数不同，其余全同。
 x-egress: &egress
-  image: bfl-browser-egress:local
+  # 与主服务共用 BFL_IMAGE_TAG：升级/回滚一个变量同时生效，版本不会漂。
+  # 服务器不再保存 sidecar 源码（2026-11-05 起走 GHCR，和 bfl 一起由 release.yml 构建）。
+  # 本地要改 sidecar：docker build -t ghcr.io/rsfree/bfl-egress:dev ./browser_egress
+  #   然后 BFL_IMAGE_TAG=dev docker compose up -d bfl-browser-egress
+  image: ghcr.io/rsfree/bfl-egress:${BFL_IMAGE_TAG:-latest}
   restart: unless-stopped
-  pull_policy: never                  # 本地构建镜像，避免 compose pull 去 registry 找它
   shm_size: 1g                        # Chromium 必需，否则 /dev/shm 不足会崩渲染进程
   logging:
     driver: json-file
@@ -99,8 +102,8 @@ services:
       retries: 3
 
   # ── 浏览器出口 sidecar 池 ────────────────────────────────────────────
-  # 页面池 + 页面内 fetch 完成 提交→轮询→取图。镜像在宿主本地构建（无 registry）：
-  #   cd browser_egress && docker build -t bfl-browser-egress:local .
+  # 页面池 + 页面内 fetch 完成 提交→轮询→取图。镜像走 GHCR：ghcr.io/rsfree/bfl-egress，
+  # 与主服务同一个 tag（release.yml 的 docker job 矩阵构建）。本地改代码用上面的 dev tag。
   #
   # 为什么是多实例：实测单实例舒适区 8 并发 ≈ 1,225 张/h，历史峰值 3,482/h
   # （≈25 并发 × 25.5s 中位）。每实例 8 页 / 闸门 20，三实例给到 24-60 并发、
