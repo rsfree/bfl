@@ -439,14 +439,16 @@ def _page_dead(exc: BaseException) -> bool:
 
 
 def _page_ok(entry: dict) -> bool:
-    """页面当前可复用？closed / crashed 任一为真都不行。
+    """页面当前可复用？
 
-    crashed 的页 is_closed() 仍可能是 False（渲染进程没了但 CDP 还挂着），
-    只查 closed 会把它一直选出来，请求连续 500。
+    🔴 只用 is_closed()，**不要**调 is_crashed()：v0.2.61 实测该调用让
+    `pages_ready` 恒为 0（8 个正常页全被判死），池子直接不可用、/generate
+    全 503，只能回滚。渲染进程崩溃交给异常路径：_page_dead() 判定 +
+    _retire() 摘牌重建 —— 最多多失败一次，代价远小于误杀整池。
     """
     pg = entry["page"]
     try:
-        return not pg.is_closed() and not pg.is_crashed()
+        return not pg.is_closed()
     except Exception:  # noqa: BLE001 - CDP 断了
         return False
 
