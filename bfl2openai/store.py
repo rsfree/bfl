@@ -58,6 +58,25 @@ async def get(key: str):
     return json.loads(data)
 
 
+async def set_nx(key: str, doc, ttl_s: int) -> bool:
+    """原子占位：只有第一个调用者拿到 True（探针跨 worker 去重用）。
+
+    Redis 用 SET NX EX；内存回落用「存在且未过期即失败」。
+    """
+    data = json.dumps(doc).encode()
+    if REDIS_URL:
+        return bool(await _r.set(key, data, ex=ttl_s, nx=True))
+    _sweep()
+    item = _MEM.get(key)
+    if item is not None:
+        _, exp = item
+        if exp is None or exp > time.time():
+            return False
+        _MEM.pop(key, None)
+    _MEM[key] = (data, time.time() + ttl_s if ttl_s else None)
+    return True
+
+
 async def mget(keys: list[str]) -> list:
     """批量读：一次 RTT 取多个 key。
 

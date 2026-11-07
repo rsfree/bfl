@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+from contextlib import asynccontextmanager
 import os
 import time
 from typing import Literal
@@ -36,6 +37,7 @@ from . import bridging
 from . import upscale as mps
 from . import uploads
 from . import async_images
+from . import probe
 from .bridging import (
     image_to_png,
     mask_to_boxes,
@@ -49,7 +51,15 @@ from .upstream import UpstreamError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("bfl2openai")
 
-app = FastAPI(title="bfl2openai", version="0.2.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # 探针在 lifespan 里启动：on_event 已被 FastAPI 标记 deprecated，
+    # 而 requirements 是 fastapi>=0.110（会随 pip 升到最新），不能赌它还在。
+    probe.start()
+    yield
+
+
+app = FastAPI(title="bfl2openai", version="0.2.0", lifespan=_lifespan)
 native.register(app)
 uploads.register(app)
 async_images.register(app)
@@ -428,8 +438,24 @@ async def run_job(
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    return {"ok": True, "model": MODEL_ID, "aliases": model_ids()[1:],
-            "upstream": UPSTREAM_BASE}
+    out = {"ok": True, "model": MODEL_ID, "aliases": model_ids()[1:],
+           "upstream": UPSTREAM_BASE}
+    # 端到端探针摘要：`last_ok=false` + 小 `age_s` 才是真故障；
+    # 读不到（Redis 抖动）不能让 healthz 500，所以整段吞异常。
+    try:
+        out["probe"] = await probe.summary()
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+@app.get("/v1/probe")
+async def probe_endpoint(request: Request, run: int = 0):
+    """探针状态；`?run=1` 立即跑一次（要 x-key，会创建一张真实上游任务）。"""
+    native._check_x_key(request)
+    if run:
+        return await probe.run_once()
+    return await probe.status()
 
 
 @app.get("/v1/models")
