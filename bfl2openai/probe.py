@@ -166,7 +166,11 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     log.info("probe standalone: base=%s interval=%.0fs timeout=%.0fs "
              "resolution=%s", BASE, INTERVAL_S, TIMEOUT_S, RESOLUTION)
+    # 首次先等启动期：探针和 app/sidecar 同时拉起时，8011 还没监听，
+    # 会把「启动竞态」记成一次失败（2026-11-08 实测）。
+    delay = STARTUP_DELAY_S
     while True:
+        await asyncio.sleep(delay)
         res = await run_once()
         try:
             await store.put(_LAST_KEY, res, ttl_s=_LAST_TTL_S)
@@ -178,7 +182,8 @@ async def main() -> None:
         else:
             log.error("probe FAILED elapsed=%.1fs error=%s",
                       res["elapsed_s"], res["error"])
-        await asyncio.sleep(INTERVAL_S)
+        # 成功 → 正常间隔；失败 → 2 分钟后再确认，别让一次抖动挂 30 分钟
+        delay = INTERVAL_S if res["ok"] else min(INTERVAL_S, 120.0)
 
 
 def start() -> None:
