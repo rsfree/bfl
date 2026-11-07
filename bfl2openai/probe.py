@@ -206,17 +206,21 @@ async def status() -> dict:
 
 
 async def summary() -> dict:
-    """给 /healthz 的轻量摘要（不带 steps / 完整 error）。"""
+    """给 /healthz 的轻量摘要（不带 steps / 完整 error）。
+
+    刻意不返回 `enabled`：探针跑在独立容器里，app 进程的 ENABLE 永远是 false，
+    报出来会让人误判「探针没开」。判断新鲜度请看 `age_s` vs `interval_s`。
+    """
     last = None
     try:
         last = await store.get(_LAST_KEY)
     except Exception:  # noqa: BLE001
         pass
     if not last:
-        return {"enabled": ENABLE, "last_ok": None, "age_s": None}
-    return {"enabled": ENABLE,
-            "last_ok": bool(last.get("ok")),
+        return {"last_ok": None, "age_s": None, "interval_s": INTERVAL_S}
+    return {"last_ok": bool(last.get("ok")),
             "age_s": int(time.time()) - int(last.get("ts") or 0),
+            "interval_s": INTERVAL_S,
             "elapsed_s": last.get("elapsed_s"),
             "error": (last.get("error") or "")[:120] or None}
 
