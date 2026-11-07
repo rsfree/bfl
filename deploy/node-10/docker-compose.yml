@@ -101,6 +101,34 @@ services:
       timeout: 5s
       retries: 3
 
+  # ── 端到端探针 ──────────────────────────────────────────────────────
+  # 复用 app 镜像里的 `python -m bfl2openai.probe` 入口，单独一个容器。
+  # 为什么独立：探针要能在 app 挂掉时继续报告 —— 放进 app 的 lifespan 里，
+  # app 一死探针也死，而那正是最需要它的时候。每 30 分钟真跑一张 768sq
+  # 最小图，走完整路径（提交→裸 GET 轮询→取图校验 PNG），结果写 Redis，
+  # app 的 /healthz 读同一份（probe 字段）。镜像不需要额外打包。
+  bfl-probe:
+    image: ghcr.io/rsfree/bfl:${BFL_IMAGE_TAG:-latest}
+    container_name: bfl-probe
+    restart: unless-stopped
+    user: "10001:10001"
+    command: ["python", "-m", "bfl2openai.probe"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      BFL2OPENAI_PROBE_BASE: "http://bfl2openai:8000"
+      BFL2OPENAI_PROBE_INTERVAL_S: "${BFL2OPENAI_PROBE_INTERVAL_S:-1800}"
+      BFL2OPENAI_PROBE_TIMEOUT_S: "150"
+      BFL2OPENAI_PROBE_RESOLUTION: "768sq"
+    env_file: ./.env                    # BFL_NATIVE_API_KEY 等
+    depends_on:
+      - bfl2openai
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+    mem_limit: 256m
+
   # ── 浏览器出口 sidecar 池 ────────────────────────────────────────────
   # 页面池 + 页面内 fetch 完成 提交→轮询→取图。镜像走 GHCR：ghcr.io/rsfree/bfl-egress，
   # 与主服务同一个 tag（release.yml 的 docker job 矩阵构建）。本地改代码用上面的 dev tag。
