@@ -526,6 +526,37 @@ def _breaker_on_block(reason: str):
               flush=True)
 
 
+async def _fill_pool_gap() -> None:
+    """池子缩水时补回缺的槽位（不重建健康页，一次补一页）。
+
+    背景：回收失败（Page.goto ERR_ABORTED）会把坏页摘出池子 ⇒ 池子只会缩、
+    不会长；缩到 0 就只剩「外部看门狗重启容器」一条路（2026-11-06 凌晨
+    1.5 小时内重启 8 次，期间服务不可用）。让池子自己长回来：上游恢复后
+    最多 PAGES×15s 补满，不依赖容器重启。
+    """
+    if len(_state["pool"]) >= PAGES:
+        return
+    browser = _state.get("browser")
+    if browser is None or not browser.is_connected():
+        return          # 浏览器都没了：交给 ensure_pool 全量重建
+    async with _state["lock"]:
+        pool = _state["pool"]
+        have = {e["idx"] for e in pool if _page_ok(e)}
+        missing = [i for i in range(PAGES) if i not in have]
+        if not missing:
+            return
+        idx = missing[0]
+        try:
+            fresh = await _new_page(browser, idx, browser.version)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[pool] refill#{idx} failed: "
+                  f"{type(exc).__name__}: {str(exc)[:120]}", flush=True)
+            return
+        _state["pool"] = [e for e in pool if e["idx"] != idx] + [fresh]
+        print(f"[pool] page#{idx} refilled "
+              f"({len(_state['pool'])}/{PAGES})", flush=True)
+
+
 async def _maintain_pool():
     """后台维护：空闲页才回收。
 
@@ -535,6 +566,11 @@ async def _maintain_pool():
     """
     while True:
         await asyncio.sleep(15)
+        try:
+            await _fill_pool_gap()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[maintain] refill error: {type(exc).__name__}: "
+                  f"{str(exc)[:100]}", flush=True)
         try:
             pool = _state["pool"]
             for e in list(pool):
@@ -608,10 +644,13 @@ async def fingerprint():
 async def healthz():
     pool = _state.get("pool") or []
     now = time.time()
+    ready = sum(1 for e in pool if _page_ok(e))
     return {
-        "ok": True,
+        # ok 必须反映「能不能干活」：pages_ready=0 时进程活着但 /generate 必 503
+        # （2026-11-06 凌晨那 1.5 小时就处于这个状态，应用日志里却看不到 5xx）。
+        "ok": ready > 0,
         "pages": len(pool),
-        "pages_ready": sum(1 for e in pool if _page_ok(e)),
+        "pages_ready": ready,
         "pages_cooling": sum(1 for e in pool if e["cooldown_until"] > now),
         "pages_recycling": sum(1 for e in pool if e.get("recycling")),
         "inflight": _state["total_inflight"],
