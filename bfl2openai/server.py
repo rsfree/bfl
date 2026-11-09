@@ -18,7 +18,9 @@ Run:  uvicorn bfl2openai.server:app --host 127.0.0.1 --port 8977
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -38,6 +40,7 @@ from . import upscale as mps
 from . import uploads
 from . import async_images
 from . import probe
+from . import store
 from .bridging import (
     image_to_png,
     mask_to_boxes,
@@ -255,7 +258,99 @@ _MODERATION_DIAG = os.environ.get("BFL2OPENAI_MODERATION_DIAG", "") == "1"
 _BROWSER_PRIMARY = os.environ.get("BFL2OPENAI_BROWSER_PRIMARY", "") == "1"
 
 
-async def run_job(
+# ---- images 门幂等（2026-11-09）------------------------------------------
+# 背景：到机房 64.178.99.0/24 的 TCP 握手丢包 20–58%（实测），客户端超时
+# 重试是常态。`/v1/images/generations` 是同步长请求（18–45s），没有幂等时
+# 每次重试都会**真的再生成一遍**：白烧上游额度、白等一遍，两次结果还不一样。
+# 这里用「参数指纹 + 单飞（singleflight）+ 结果短缓存」把重试变成廉价操作：
+# 同指纹的第二个请求等第一个的结果，而不是另起炉灶。
+# 边界：只能兜住「请求到了、响应没回来」；SYN 阶段就丢的请求服务端根本
+# 收不到，那种只能靠客户端重试再打进来 —— 但那时重试也安全了。
+_IDEM_TTL_S = int(os.environ.get("BFL2OPENAI_IDEM_TTL_S") or 900)
+_IDEM_LOCK_TTL_S = int(os.environ.get("BFL2OPENAI_IDEM_LOCK_TTL_S") or 900)
+_IDEM_WAIT_S = float(os.environ.get("BFL2OPENAI_IDEM_WAIT_S") or 240)
+#: 结果超过此体积不落 Redis：b64 模式单图约 2.7MB，缓存会挤占任务状态空间。
+#: 跳过缓存不影响正确性，只是等待者复用不到、退回 504 让客户端稍后重试。
+_IDEM_MAX_CACHE_BYTES = int(
+    os.environ.get("BFL2OPENAI_IDEM_MAX_CACHE_BYTES") or 3_000_000)
+
+
+def _fp_feed(h, val) -> None:
+    """把任意嵌套结构稳定地喂进 sha256（bytes 原样，其余取 repr）。"""
+    if isinstance(val, bytes):
+        h.update(b"b" + str(len(val)).encode() + b":")
+        h.update(val)
+    elif isinstance(val, (list, tuple)):
+        h.update(b"l" + str(len(val)).encode() + b":")
+        for item in val:
+            _fp_feed(h, item)
+    elif isinstance(val, dict):
+        h.update(b"d" + str(len(val)).encode() + b":")
+        for key in sorted(val, key=str):
+            h.update(str(key).encode())
+            _fp_feed(h, val[key])
+    else:
+        h.update(repr(val).encode())
+
+
+def job_fingerprint(**parts) -> str:
+    h = hashlib.sha256()
+    for key in sorted(parts):
+        h.update(key.encode())
+        _fp_feed(h, parts[key])
+    return h.hexdigest()[:32]
+
+
+async def _idem_run(fp: str, produce) -> JSONResponse:
+    """同指纹请求单飞：第一个执行并缓存，其余等它的结果。
+
+    `produce` 只在拿到锁的进程里执行一次。锁用 SET NX 保证跨 worker 唯一；
+    异常路径一定释放，避免一次失败把后续重试全卡死在 504 上。
+    """
+    done_key = f"idem_done:{fp}"
+    lock_key = f"idem:{fp}"
+
+    cached = await store.get(done_key)
+    if cached is not None:
+        log.info("idem replay fp=%s", fp[:8])
+        resp = JSONResponse(cached)
+        resp.headers["X-Bfl-Idempotent"] = "replay"
+        return resp
+
+    if await store.set_nx(lock_key, {"ts": time.time()}, _IDEM_LOCK_TTL_S):
+        try:
+            resp = await produce()
+            raw = bytes(resp.body)
+            if resp.status_code == 200 and len(raw) <= _IDEM_MAX_CACHE_BYTES:
+                try:
+                    await store.put(done_key, json.loads(raw), _IDEM_TTL_S)
+                    log.info("idem cached fp=%s bytes=%d", fp[:8], len(raw))
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("idem cache skipped fp=%s: %s", fp[:8], exc)
+            return resp
+        finally:
+            await store.drop(lock_key)
+
+    deadline = time.time() + _IDEM_WAIT_S
+    log.info("idem wait fp=%s (identical job in flight)", fp[:8])
+    while time.time() < deadline:
+        await asyncio.sleep(1.0)
+        cached = await store.get(done_key)
+        if cached is not None:
+            log.info("idem replay-after-wait fp=%s", fp[:8])
+            resp = JSONResponse(cached)
+            resp.headers["X-Bfl-Idempotent"] = "replay"
+            return resp
+        if not await store.get(lock_key):
+            break
+    log.warning("idem wait timeout fp=%s", fp[:8])
+    return openai_error(
+        504,
+        "an identical generation is still in flight; retry in a few seconds",
+        "timeout")
+
+
+async def _run_job_impl(
     image_png: bytes | None,
     prompt: str,
     boxes: list[dict],
@@ -430,6 +525,54 @@ async def run_job(
                 "total_tokens": 0,
             },
         }
+    )
+
+
+async def run_job(
+    image_png: bytes | None,
+    prompt: str,
+    boxes: list[dict],
+    aspect_ratio: str,
+    resolution: str,
+    mode: str,
+    n: int,
+    response_format: str,
+    request: Request,
+    upscale_to: int | None = None,
+    reference_images: list[tuple[bytes, str]] | None = None,
+) -> JSONResponse:
+    """幂等包装：同参数请求在窗口内只真正生成一次。
+
+    指纹只取「影响出图结果」的参数，不含 request —— 同一个 prompt 从不同
+    连接打进来（客户端重试）必须命中同一笔。
+    """
+    fp = job_fingerprint(
+        image_png=image_png or b"",
+        prompt=prompt,
+        boxes=boxes,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        mode=mode,
+        n=n,
+        response_format=response_format,
+        upscale_to=upscale_to or 0,
+        reference_images=[[b, nm] for b, nm in (reference_images or [])],
+    )
+    return await _idem_run(
+        fp,
+        lambda: _run_job_impl(
+            image_png=image_png,
+            prompt=prompt,
+            boxes=boxes,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+            mode=mode,
+            n=n,
+            response_format=response_format,
+            request=request,
+            upscale_to=upscale_to,
+            reference_images=reference_images,
+        ),
     )
 
 

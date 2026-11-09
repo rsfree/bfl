@@ -1,0 +1,93 @@
+"""images 门幂等：同参数请求在窗口内只真正生成一次。
+
+背景（2026-11-09）：到机房的 TCP 握手丢包 20–58%，客户端超时重试是常态。
+`/v1/images/generations` 是同步长请求（18–45s），没有幂等时每次重试都会
+再生成一遍 —— 白烧上游额度、白等一遍，两次结果还不一样。这里锁住三条
+不变量：串行重试不重生成、并发重试不重生成、参数不同必须各生成一次。
+"""
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+from bfl2openai import server
+
+
+@pytest.fixture(autouse=True)
+def _noauth(monkeypatch):
+    monkeypatch.setattr(server, "API_KEY", "")
+
+
+@pytest.fixture()
+def client():
+    return TestClient(server.app)
+
+
+@pytest.fixture()
+def fake_impl(monkeypatch):
+    """替掉真正的生成实现，只数调用次数。"""
+    calls: list[dict] = []
+
+    async def impl(**kwargs):
+        calls.append(kwargs)
+        return server.JSONResponse(
+            {"created": 1, "data": [{"url": "https://example.test/a.png"}]})
+
+    monkeypatch.setattr(server, "_run_job_impl", impl)
+    return calls
+
+
+PAYLOAD = {"prompt": "a lighthouse on a cliff", "size": "1024x1024"}
+
+
+def test_serial_retry_generates_once(client, fake_impl):
+    """客户端超时后重发同样的请求：不该再生成一遍。"""
+    r1 = client.post("/v1/images/generations", json=PAYLOAD)
+    r2 = client.post("/v1/images/generations", json=PAYLOAD)
+
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert len(fake_impl) == 1, "重试触发了重复生成"
+    assert r2.headers.get("X-Bfl-Idempotent") == "replay"
+    assert r1.json() == r2.json()
+
+
+def test_different_prompt_generates_twice(client, fake_impl):
+    """参数不同就不能合并，否则会串图。"""
+    client.post("/v1/images/generations", json=PAYLOAD)
+    client.post("/v1/images/generations",
+                json={**PAYLOAD, "prompt": "a red sports car"})
+
+    assert len(fake_impl) == 2
+
+
+def test_different_size_generates_twice(client, fake_impl):
+    """size 影响出图尺寸，必须进指纹。"""
+    client.post("/v1/images/generations", json=PAYLOAD)
+    client.post("/v1/images/generations",
+                json={**PAYLOAD, "size": "1536x1024"})
+
+    assert len(fake_impl) == 2
+
+
+def test_fingerprint_is_order_and_type_stable():
+    assert (server.job_fingerprint(a="1", b="2")
+            == server.job_fingerprint(b="2", a="1"))
+    assert (server.job_fingerprint(img=b"\x89PNG")
+            != server.job_fingerprint(img=b"\x89PNJ"))
+
+
+def test_oversize_result_not_cached(client, monkeypatch):
+    """b64 大响应不落缓存：等待者宁可 504，也不该把 Redis 挤爆。"""
+    monkeypatch.setattr(server, "_IDEM_MAX_CACHE_BYTES", 10)
+
+    async def impl(**kwargs):
+        return server.JSONResponse({"data": [{"b64_json": "x" * 1000}]})
+
+    monkeypatch.setattr(server, "_run_job_impl", impl)
+    r1 = client.post("/v1/images/generations", json=PAYLOAD)
+    r2 = client.post("/v1/images/generations", json=PAYLOAD)
+
+    # 第一次正常返回；缓存被跳过，第二次只能重新生成（不是 replay）
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert r2.headers.get("X-Bfl-Idempotent") is None
