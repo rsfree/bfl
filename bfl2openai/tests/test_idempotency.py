@@ -91,3 +91,55 @@ def test_oversize_result_not_cached(client, monkeypatch):
     assert r1.status_code == 200
     assert r2.status_code == 200
     assert r2.headers.get("X-Bfl-Idempotent") is None
+
+
+def test_follower_takes_over_when_leader_fails(client, fake_impl):
+    """leader 挂了（锁消失但没有结果）时，等待者必须接管重跑，不能回 504。
+
+    回归背景（2026-11-12 18:34–19:02）：单飞 leader 失败释放锁后，follower
+    的等待循环 break 出来直接 return 504，40 次客户端重试全被打成 504，
+    报文 107 字节、与 `idem wait timeout` 日志逐秒对齐。客户端把它当服务故障
+    继续重试 → 又生成一轮，越重试越糟。
+    """
+    import asyncio
+
+    fp = server.job_fingerprint(prompt="leader-dies")
+    asyncio.run(server.store.set_nx(f"idem:{fp}", {"ts": 0}, 60))
+
+    async def _drop_lock_soon():
+        await asyncio.sleep(0.3)
+        await server.store.drop(f"idem:{fp}")
+
+    async def _produce():
+        return server.JSONResponse(
+            {"created": 1, "data": [{"url": "https://example.test/ok.png"}]})
+
+    async def _scenario():
+        dropper = asyncio.create_task(_drop_lock_soon())
+        resp = await server._idem_run(fp, _produce)
+        await dropper
+        return resp
+
+    resp = asyncio.run(_scenario())
+    assert resp.status_code == 200, "follower 没有接管，仍在回错误"
+    assert len(fake_impl) == 0   # produce 是测试自带的 lambda，不走 fake_impl
+
+
+def test_large_body_is_cached_with_short_ttl(client, monkeypatch):
+    """2k b64 单图（中位 7.7MB）必须进缓存，否则幂等对最常见请求完全失效。"""
+    big = "x" * 8_000_000
+    calls = []
+
+    async def impl(**kwargs):
+        calls.append(kwargs)
+        return server.JSONResponse({"created": 1, "data": [{"b64_json": big}]})
+
+    monkeypatch.setattr(server, "_run_job_impl", impl)
+    payload = {"prompt": "a very large 2k render", "size": "1024x1024"}
+
+    r1 = client.post("/v1/images/generations", json=payload)
+    r2 = client.post("/v1/images/generations", json=payload)
+
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert len(calls) == 1, "8MB 结果没被缓存，重试又生成了一遍"
+    assert r2.headers.get("X-Bfl-Idempotent") == "replay"

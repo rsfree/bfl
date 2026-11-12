@@ -269,10 +269,19 @@ _BROWSER_PRIMARY = os.environ.get("BFL2OPENAI_BROWSER_PRIMARY", "") == "1"
 _IDEM_TTL_S = int(os.environ.get("BFL2OPENAI_IDEM_TTL_S") or 900)
 _IDEM_LOCK_TTL_S = int(os.environ.get("BFL2OPENAI_IDEM_LOCK_TTL_S") or 900)
 _IDEM_WAIT_S = float(os.environ.get("BFL2OPENAI_IDEM_WAIT_S") or 240)
-#: 结果超过此体积不落 Redis：b64 模式单图约 2.7MB，缓存会挤占任务状态空间。
-#: 跳过缓存不影响正确性，只是等待者复用不到、退回 504 让客户端稍后重试。
+#: 结果超过此体积不落 Redis：缓存会挤占任务状态空间。
+#: 3MB 是旧值，而 2k b64 单图中位 **7.7MB**（2026-11-13 线上实测 n=244）——
+#: 最常见的成功响应恰好落在缓存之外，幂等对它们完全失效，客户端每次重试都
+#: 重新生成一张、白烧上游配额。这里放宽到 12MB（覆盖 p90），并用
+#: `_IDEM_BIG_TTL_S` 给大体积结果一个很短的 TTL：Redis 的
+#: maxmemory-policy=volatile-ttl 优先淘汰 TTL 最短的键，大图缓存会先于
+#: `bridge:*`（TTL 1800/3600）被淘汰，不会把任务状态挤掉。
 _IDEM_MAX_CACHE_BYTES = int(
-    os.environ.get("BFL2OPENAI_IDEM_MAX_CACHE_BYTES") or 3_000_000)
+    os.environ.get("BFL2OPENAI_IDEM_MAX_CACHE_BYTES") or 12_000_000)
+#: 大体积结果的缓存寿命（秒）。幂等窗口只需覆盖「客户端重试间隔」，
+#: 留 15 分钟没有收益，只会长期占着每条 7~12MB 的内存。
+_IDEM_BIG_TTL_S = int(os.environ.get("BFL2OPENAI_IDEM_BIG_TTL_S") or 180)
+_IDEM_BIG_BYTES = 3_000_000
 
 
 def _fp_feed(h, val) -> None:
@@ -306,48 +315,71 @@ async def _idem_run(fp: str, produce) -> JSONResponse:
 
     `produce` 只在拿到锁的进程里执行一次。锁用 SET NX 保证跨 worker 唯一；
     异常路径一定释放，避免一次失败把后续重试全卡死在 504 上。
+
+    🔴 等不到结果时**不能直接 504**：锁消失（leader 抛错 / 被回收 / 超时退出）
+    而没有缓存，说明这笔活现在没人干，follower 必须接管重跑。旧实现一 break
+    就返回 504，等于把 leader 的一次失败放大成「所有并发重试全部 504」，
+    客户端再重试又生成一轮（2026-11-12 18:34–19:02 的 40 次 504 全走这条
+    路径：报文 107 字节、与 `idem wait timeout` 日志逐秒对齐，且同期
+    `browser egress status=0` 计数为 0，证明上游根本没超时）。
     """
     done_key = f"idem_done:{fp}"
     lock_key = f"idem:{fp}"
 
-    cached = await store.get(done_key)
-    if cached is not None:
-        log.info("idem replay fp=%s", fp[:8])
-        resp = JSONResponse(cached)
-        resp.headers["X-Bfl-Idempotent"] = "replay"
-        return resp
-
-    if await store.set_nx(lock_key, {"ts": time.time()}, _IDEM_LOCK_TTL_S):
-        try:
-            resp = await produce()
-            raw = bytes(resp.body)
-            if resp.status_code == 200 and len(raw) <= _IDEM_MAX_CACHE_BYTES:
-                try:
-                    await store.put(done_key, json.loads(raw), _IDEM_TTL_S)
-                    log.info("idem cached fp=%s bytes=%d", fp[:8], len(raw))
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("idem cache skipped fp=%s: %s", fp[:8], exc)
-            return resp
-        finally:
-            await store.drop(lock_key)
-
-    deadline = time.time() + _IDEM_WAIT_S
-    log.info("idem wait fp=%s (identical job in flight)", fp[:8])
-    while time.time() < deadline:
-        await asyncio.sleep(1.0)
+    # 两轮：第一轮可能是 follower，第二轮（接管）才有机会真正执行 produce。
+    for _ in (1, 2):
         cached = await store.get(done_key)
         if cached is not None:
-            log.info("idem replay-after-wait fp=%s", fp[:8])
+            log.info("idem replay fp=%s", fp[:8])
             resp = JSONResponse(cached)
             resp.headers["X-Bfl-Idempotent"] = "replay"
             return resp
-        if not await store.get(lock_key):
-            break
-    log.warning("idem wait timeout fp=%s", fp[:8])
-    return openai_error(
-        504,
-        "an identical generation is still in flight; retry in a few seconds",
-        "timeout")
+
+        if await store.set_nx(lock_key, {"ts": time.time()}, _IDEM_LOCK_TTL_S):
+            try:
+                resp = await produce()
+                raw = bytes(resp.body)
+                if resp.status_code == 200 and len(raw) <= _IDEM_MAX_CACHE_BYTES:
+                    ttl = _IDEM_BIG_TTL_S if len(raw) > _IDEM_BIG_BYTES else _IDEM_TTL_S
+                    try:
+                        await store.put(done_key, json.loads(raw), ttl)
+                        log.info("idem cached fp=%s bytes=%d ttl=%d",
+                                 fp[:8], len(raw), ttl)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("idem cache skipped fp=%s: %s", fp[:8], exc)
+                return resp
+            finally:
+                await store.drop(lock_key)
+
+        deadline = time.time() + _IDEM_WAIT_S
+        log.info("idem wait fp=%s (identical job in flight)", fp[:8])
+        while time.time() < deadline:
+            await asyncio.sleep(1.0)
+            cached = await store.get(done_key)
+            if cached is not None:
+                log.info("idem replay-after-wait fp=%s", fp[:8])
+                resp = JSONResponse(cached)
+                resp.headers["X-Bfl-Idempotent"] = "replay"
+                return resp
+            if not await store.get(lock_key):
+                break
+        else:
+            # 锁一直在，说明 leader 确实还在跑：这次是「等不到」而非「没人干」
+            log.warning("idem wait timeout fp=%s (leader still running)", fp[:8])
+            resp = openai_error(
+                504,
+                "an identical generation is still in flight; retry in a few seconds",
+                "timeout")
+            resp.headers["Retry-After"] = "3"
+            return resp
+
+        # 走到这里 = 锁已消失但没缓存：leader 失败/退出，接管重跑
+        log.warning("idem leader gone without result fp=%s, taking over", fp[:8])
+
+    # 两轮都被抢走（极端并发）：让客户端退避重试，别继续压
+    resp = openai_error(504, "generation slot busy; retry shortly", "timeout")
+    resp.headers["Retry-After"] = "2"
+    return resp
 
 
 async def _run_job_impl(

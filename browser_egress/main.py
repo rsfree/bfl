@@ -59,6 +59,11 @@ BREAKER_COOLDOWN_S = float(
     os.environ.get("BFL2OPENAI_EGRESS_BREAKER_COOLDOWN", "60"))
 #: 429 后该页冷却秒数（出口 IP 配额被打热，短期复用只会继续 429）。
 IP_COOLDOWN_S = float(os.environ.get("BFL2OPENAI_EGRESS_IP_COOLDOWN", "20"))
+#: cgroup 内存水位。Chromium 的分配器不会把回收的 context 内存还给内核，
+#: 长时间跑必然单调上涨，到 mem_limit 就被内核 OOM-kill（杀哪组进程不可控）。
+#: 与其等 OOM，不如到水位自己重启整池：soft 只在完全空闲时动手，hard 立即动手。
+MEM_SOFT_RATIO = float(os.environ.get("BFL2OPENAI_EGRESS_MEM_SOFT", "0.80"))
+MEM_HARD_RATIO = float(os.environ.get("BFL2OPENAI_EGRESS_MEM_HARD", "0.92"))
 
 app = FastAPI()
 _state: dict = {
@@ -336,33 +341,83 @@ async def _eval(entry: dict, script: str, arg=None, timeout: float = 90):
             await _page_sleep(entry)
 
 
+async def _teardown_browser() -> None:
+    """彻底关掉当前 Chromium 与 Playwright 驱动，把内存还给内核。
+
+    🔴 重建池子**必须**先走这里。旧实现只把 `_state` 里的引用换掉、不关实例：
+    每轮「页面全崩 → ensure_pool」都会再拉起一整个 Chromium（主进程 + zygote
+    + utility + gpu 一组 6~8 个进程），旧的那组留在 cgroup 里直到 OOM-killer
+    出手。2026-11-13 03:00 的 egress-2 里同时挂着 **24 个 browser 主进程**、
+    cgroup 内存 2.96/3 GiB、一小时内 24 次 memcg OOM（kill 目标全是
+    chromium），就是这条路径。泄漏与崩溃互为因果：OOM 杀渲染进程 → 页面
+    is_closed() → 重建池子 → 再泄漏一份，滚到必定 OOM。
+    """
+    browser = _state.get("browser")
+    pw = _state.get("pw")
+    # 先摘引用再关：关闭过程有 await，期间不能被别的协程拿到半死实例
+    _state.update({"pool": [], "browser": None, "pw": None, "sem": None})
+    if browser is not None:
+        try:
+            await browser.close()
+        except Exception:  # noqa: BLE001 - 已崩的实例关不掉是正常的
+            pass
+    if pw is not None:
+        try:
+            await pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def ensure_pool():
+    """保证「浏览器活着 + 池子非空」。
+
+    判定从「所有页都没关」放宽成「浏览器连着且池子非空」：单页崩溃由
+    `_retire` / `_fill_pool_gap` 原位处理，不该为此重建整个浏览器——每次
+    重建都是一份常驻内存（见 _teardown_browser）。
+    """
     pool = _state["pool"]
-    if pool and all(not e["page"].is_closed() for e in pool):
+    browser = _state.get("browser")
+    if pool and browser is not None and browser.is_connected():
         return pool
     async with _state["lock"]:
         pool = _state["pool"]
-        if pool and all(not e["page"].is_closed() for e in pool):
+        browser = _state.get("browser")
+        if pool and browser is not None and browser.is_connected():
             return pool
-        _state["pool"] = []
+        await _teardown_browser()
         pw = await async_playwright().start()
         proxy_cfg = _parse_proxy(PROXY_URL)
         print(f"[pool] proxy={'on' if proxy_cfg else 'off'} pages={PAGES} "
               f"max_inflight={MAX_INFLIGHT} tz={TZ_ID}", flush=True)
-        browser = await pw.chromium.launch(
-            executable_path="/usr/bin/chromium",
-            headless=True,
-            proxy=proxy_cfg,
-            args=[
-                "--no-sandbox", "--disable-dev-shm-usage", "--lang=en-US",
-                # 反 headless 检测：上游按 UA/webdriver/视口识别自动化环境
-                "--disable-blink-features=AutomationControlled",
-                "--window-size=1920,1080",
-                "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
-            ],
-        )
-        version = browser.version
-        pages = [await _new_page(browser, i, version) for i in range(PAGES)]
+        browser = None
+        try:
+            browser = await pw.chromium.launch(
+                executable_path="/usr/bin/chromium",
+                headless=True,
+                proxy=proxy_cfg,
+                args=[
+                    "--no-sandbox", "--disable-dev-shm-usage", "--lang=en-US",
+                    # 反 headless 检测：上游按 UA/webdriver/视口识别自动化环境
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1920,1080",
+                    "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
+                ],
+            )
+            version = browser.version
+            pages = [await _new_page(browser, i, version) for i in range(PAGES)]
+        except BaseException:
+            # 半成品（浏览器起来了但页面没建全）也要收干净，否则又是一份泄漏。
+            # 此刻还没登记进 _state，_teardown_browser() 看不到它，必须就地关。
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                await pw.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         _state.update({"pw": pw, "browser": browser, "pool": pages,
                        "sem": asyncio.Semaphore(MAX_INFLIGHT)})
         print(f"[pool] {len(pages)} pages ready (chromium {version})", flush=True)
@@ -493,10 +548,18 @@ async def acquire_entry(exclude: set[int] | None = None) -> dict:
             # 兜底：宁可排队超时前先接单，也不要整链 503
             pool = [e for e in pool if _page_ok(e)]
             if not pool:
-                # 一个可用页都没有（页面全 crash / 回收失败）：快速 503，
-                # 让 app 侧换下一个 sidecar 实例。这里以前直接 min([])，
-                # 会崩成 500 且带上 "min() iterable argument is empty"
-                # （2026-11-05 生产实测）。
+                # 一个可用页都没有（页面全 crash / 回收失败）。先原位补一页
+                # 再决定要不要 503：浏览器还活着时补位只要几秒，而 503 会让
+                # app 立刻切实例、把「单页崩溃」放大成「整机不可用」。
+                try:
+                    await _fill_pool_gap()
+                except Exception:  # noqa: BLE001 - 补不上就走 503
+                    pass
+                pool = [e for e in _state["pool"] if _page_ok(e)]
+            if not pool:
+                # 仍然没有可用页：快速 503，让 app 侧换下一个 sidecar 实例。
+                # 这里以前直接 min([])，会崩成 500 且带上
+                # "min() iterable argument is empty"（2026-11-05 生产实测）。
                 raise HTTPException(status_code=503, detail="egress pool empty")
             entry = min(pool, key=lambda e: e["inflight"])
             _reserve(entry)
@@ -557,13 +620,54 @@ async def _fill_pool_gap() -> None:
               f"({len(_state['pool'])}/{PAGES})", flush=True)
 
 
+def _cgroup_mem() -> tuple[int, int] | None:
+    """返回 (已用字节, 上限字节)。cgroup v2 优先，回落 v1；取不到返回 None。
+
+    容器 mem_limit 就是 cgroup 上限，所以这里看到的就是 docker stats 的口径，
+    比轮询 `docker stats` 更省事、也比读 /proc 更准（含 page cache）。
+    """
+    for used_p, limit_p in (
+        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+        ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
+         "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        try:
+            used = int(open(used_p).read().strip())
+            raw = open(limit_p).read().strip()
+            if raw == "max":
+                return None
+            limit = int(raw)
+        except Exception:  # noqa: BLE001 - 非容器环境直接跳过
+            continue
+        if limit <= 0 or limit > (1 << 60):
+            return None
+        return used, limit
+    return None
+
+
+async def _restart_browser(reason: str) -> None:
+    """整池重启：关浏览器 → 立刻重建。
+
+    这是「优雅版 OOM」：水位到顶时主动重启，代价是此刻 in-flight 的请求
+    失败（本来也会被内核 OOM-killer 杀掉，且杀哪一组进程不可控、还会连带
+    打崩同一 cgroup 里其他页面）。
+    """
+    async with _state["lock"]:
+        if _state.get("browser") is None and not _state["pool"]:
+            return                      # 别人刚重启过
+        print(f"[pool] RESTART browser: {reason}", flush=True)
+        await _teardown_browser()
+    await ensure_pool()
+
+
 async def _maintain_pool():
-    """后台维护：空闲页才回收。
+    """后台维护：空闲页才回收 + 内存水位自保。
 
     回收必须与请求生命周期解耦——在请求里关 ctx 无论怎么加锁都会有窗口
     打断并发请求（实测 TargetClosedError → 500）。这里只在 inflight==0
     且已标记时才动手，标记与判定在同一个 tick 内完成（无 await）。
     """
+    mem_restarts: list[float] = []
     while True:
         await asyncio.sleep(15)
         try:
@@ -582,6 +686,27 @@ async def _maintain_pool():
         except Exception as exc:  # noqa: BLE001
             print(f"[maintain] error: {type(exc).__name__}: {str(exc)[:100]}",
                   flush=True)
+        # ---- 内存水位自保 ----------------------------------------------
+        try:
+            mem = _cgroup_mem()
+            if mem:
+                used, limit = mem
+                ratio = used / limit
+                now = time.time()
+                mem_restarts = [t for t in mem_restarts if now - t < 600]
+                idle = _state["total_inflight"] == 0
+                reason = ""
+                if ratio >= MEM_HARD_RATIO and len(mem_restarts) < 6:
+                    reason = f"mem {ratio:.0%} >= hard {MEM_HARD_RATIO:.0%}"
+                elif ratio >= MEM_SOFT_RATIO and idle and \
+                        len(mem_restarts) < 6:
+                    reason = f"mem {ratio:.0%} >= soft {MEM_SOFT_RATIO:.0%} (idle)"
+                if reason:
+                    mem_restarts.append(now)
+                    await _restart_browser(reason)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[maintain] mem check error: {type(exc).__name__}: "
+                  f"{str(exc)[:100]}", flush=True)
 
 
 class GenReq(BaseModel):
