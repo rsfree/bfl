@@ -282,6 +282,15 @@ _IDEM_MAX_CACHE_BYTES = int(
 #: 留 15 分钟没有收益，只会长期占着每条 7~12MB 的内存。
 _IDEM_BIG_TTL_S = int(os.environ.get("BFL2OPENAI_IDEM_BIG_TTL_S") or 180)
 _IDEM_BIG_BYTES = 3_000_000
+#: 锁心跳：leader 执行期间每 N 秒刷新一次锁的 ts。
+#: 没有心跳时，进程被重启（发版 / OOM / worker 回收）会在 Redis 里留下一条
+#: 活到 TTL 结束的「僵尸锁」：后续同指纹请求只能干等到 `_IDEM_WAIT_S` 再收
+#: 504，而那个任务其实早就没人跑了。2026-11-13 03:14 发版后 a107942e 就是
+#: 这么卡了 240 秒。
+_IDEM_HEARTBEAT_S = float(os.environ.get("BFL2OPENAI_IDEM_HEARTBEAT_S") or 5)
+#: 锁上的心跳超过这个秒数没更新 ⇒ 认定 leader 已死，follower 可以抢锁重跑。
+#: 必须明显大于心跳间隔（丢一两次心跳不算死），又必须小于客户端超时。
+_IDEM_STALE_S = float(os.environ.get("BFL2OPENAI_IDEM_STALE_S") or 30)
 
 
 def _fp_feed(h, val) -> None:
@@ -310,6 +319,36 @@ def job_fingerprint(**parts) -> str:
     return h.hexdigest()[:32]
 
 
+async def _idem_heartbeat(lock_key: str) -> None:
+    """执行期间定期刷新锁的 ts，让 follower 能区分「还在跑」和「人都没了」。"""
+    while True:
+        await asyncio.sleep(_IDEM_HEARTBEAT_S)
+        try:
+            await store.put(lock_key, {"ts": time.time()}, _IDEM_LOCK_TTL_S)
+        except Exception:  # noqa: BLE001 - 心跳失败不该打断生成
+            return
+
+
+async def _idem_lock_alive(lock_key: str) -> bool:
+    """锁还在、且心跳没有过期。过期 = leader 进程已经不在了（僵尸锁）。"""
+    doc = await store.get(lock_key)
+    if doc is None:
+        return False
+    try:
+        ts = float((doc or {}).get("ts") or 0)
+    except (TypeError, ValueError):
+        return True          # 结构不认识就当成活的，宁可等也别抢
+    if ts and time.time() - ts > _IDEM_STALE_S:
+        log.warning("idem lock stale (%.0fs without heartbeat), stealing",
+                    time.time() - ts)
+        try:
+            await store.drop(lock_key)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+    return True
+
+
 async def _idem_run(fp: str, produce) -> JSONResponse:
     """同指纹请求单飞：第一个执行并缓存，其余等它的结果。
 
@@ -336,6 +375,7 @@ async def _idem_run(fp: str, produce) -> JSONResponse:
             return resp
 
         if await store.set_nx(lock_key, {"ts": time.time()}, _IDEM_LOCK_TTL_S):
+            hb = asyncio.create_task(_idem_heartbeat(lock_key))
             try:
                 resp = await produce()
                 raw = bytes(resp.body)
@@ -349,6 +389,7 @@ async def _idem_run(fp: str, produce) -> JSONResponse:
                         log.warning("idem cache skipped fp=%s: %s", fp[:8], exc)
                 return resp
             finally:
+                hb.cancel()
                 await store.drop(lock_key)
 
         deadline = time.time() + _IDEM_WAIT_S
@@ -361,7 +402,7 @@ async def _idem_run(fp: str, produce) -> JSONResponse:
                 resp = JSONResponse(cached)
                 resp.headers["X-Bfl-Idempotent"] = "replay"
                 return resp
-            if not await store.get(lock_key):
+            if not await _idem_lock_alive(lock_key):
                 break
         else:
             # 锁一直在，说明 leader 确实还在跑：这次是「等不到」而非「没人干」

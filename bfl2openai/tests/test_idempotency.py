@@ -143,3 +143,30 @@ def test_large_body_is_cached_with_short_ttl(client, monkeypatch):
     assert r1.status_code == 200 and r2.status_code == 200
     assert len(calls) == 1, "8MB 结果没被缓存，重试又生成了一遍"
     assert r2.headers.get("X-Bfl-Idempotent") == "replay"
+
+
+def test_stale_lock_is_stolen(client, monkeypatch):
+    """leader 进程已死留下的僵尸锁必须被抢，不能让 follower 干等 240s。
+
+    回归背景（2026-11-13 03:14 发版后）：容器重建会把正在执行的那条锁留在
+    Redis 里活到 TTL 结束，同指纹请求看到「锁还在」就一路等到 _IDEM_WAIT_S，
+    最后回 504 —— 而那个任务根本没人跑了。
+    """
+    import asyncio
+    import time as _t
+
+    monkeypatch.setattr(server, "_IDEM_STALE_S", 30.0)
+    fp = server.job_fingerprint(prompt="zombie-lock")
+    # 心跳停在 5 分钟前：锁还在，但持有者显然已经不在了
+    asyncio.run(server.store.put(f"idem:{fp}", {"ts": _t.time() - 300}, 900))
+
+    calls = []
+
+    async def _produce():
+        calls.append(1)
+        return server.JSONResponse({"created": 1, "data": [{"url": "u"}]})
+
+    resp = asyncio.run(server._idem_run(fp, _produce))
+
+    assert resp.status_code == 200, "僵尸锁没有被抢，follower 又被打回 504"
+    assert calls == [1]
