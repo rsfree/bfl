@@ -175,17 +175,19 @@ def test_generations_multi_image_uses_single_branch(seen_single):
     assert seen_single["ref_mode"] == "single"
 
 
-def test_single_branch_falls_back_to_composition_on_400(seen_single, monkeypatch):
-    """single 被上游拒绝(400/422)时必须降级 composition，不能把 400 甩给客户端。"""
+def test_single_branch_error_propagates_without_downgrade(seen_single, monkeypatch):
+    """single 被上游拒绝时**不许**静默降级 composition。
+
+    composition 已实测证伪：模糊 prompt 下会把整幅重画成无关物体，却仍返回
+    200 + 正常尺寸。那种「看起来成功、内容全错」的降级比报错危险得多。
+    """
     calls: list[dict] = []
 
-    async def flaky_generate(**kwargs):
+    async def boom(**kwargs):
         calls.append(dict(kwargs))
-        if len(calls) == 1:
-            raise bec.BrowserEgressError("submit 400: invalid reference", 400)
-        return png_bytes((0, 0, 0))
+        raise bec.BrowserEgressError("submit 400: invalid reference", 400)
 
-    monkeypatch.setattr(bec, "generate", flaky_generate)
+    monkeypatch.setattr(bec, "generate", boom)
     client = TestClient(server.app)
     r = client.post(
         "/v1/images/edits",
@@ -195,10 +197,9 @@ def test_single_branch_falls_back_to_composition_on_400(seen_single, monkeypatch
         ],
         data={"prompt": "x", "response_format": "b64_json"},
     )
-    assert r.status_code == 200, r.text
-    assert len(calls) == 2, "应当重试一次"
+    # 上游 400 经 wrap_browser_egress_error 映射为 502（既有契约，本次不动）
+    assert r.status_code == 502, r.text
+    assert len(calls) == 1, "只允许调用一次，不得降级重试"
     assert calls[0]["ref_mode"] == "single"
-    assert calls[1].get("ref_mode") is None, "降级后的第二次必须走复数字段名"
-    assert calls[1]["mode"] == "t2i"
-    assert calls[1]["image_png"] == b"", "降级后 canvas 要并入 refs"
-    assert len(calls[1]["refs"]) == 2
+    # 对外不能泄漏上游原文
+    assert "invalid reference" not in r.text

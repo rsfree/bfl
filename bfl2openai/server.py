@@ -568,25 +568,16 @@ async def _run_job_impl(
             log.info("browser-primary token=%s… (resolution=%s main=%dB refs=%d)",
                      poll_token[:10], gen_resolution, len(fit_main or b""),
                      len(fit_refs))
-            want_single = "single" if single_branch else None
-            try:
-                browser_media = await browser_egress_client.generate(
-                    image_png=fit_main or b"", prompt=prompt,
-                    aspect_ratio=aspect_ratio, resolution=gen_resolution, mode=mode,
-                    boxes_json=json.dumps(boxes) if boxes else None,
-                    refs=[b for b, _ in fit_refs], ref_mode=want_single)
-            except browser_egress_client.BrowserEgressError as exc:
-                # 单数分支若被上游拒绝（结构收紧/灰度回滚），降级回 composition
-                # 保证「至少出图」；451(审核)/429(频控) 降级无意义，原样抛。
-                if not want_single or exc.status not in (400, 422):
-                    raise
-                log.warning("reference(单数)分支被拒 status=%s，降级 composition: %s",
-                            exc.status, str(exc)[:160])
-                browser_media = await browser_egress_client.generate(
-                    image_png=b"", prompt=prompt,
-                    aspect_ratio=aspect_ratio, resolution=gen_resolution,
-                    mode="t2i", boxes_json=json.dumps(boxes) if boxes else None,
-                    refs=([fit_main] if fit_main else []) + [b for b, _ in fit_refs])
+            # 不做任何自动降级：composition 分支已被实测证伪——它对 prompt 的
+            # 名词覆盖极敏感，模糊指令下会把整幅重画成无关物体，却照样返回
+            # 200 + 正常尺寸。那种"看起来成功、内容全错"的静默降级比直接报错
+            # 危险得多（客户无法察觉）。失败就让错误上行。
+            browser_media = await browser_egress_client.generate(
+                image_png=fit_main or b"", prompt=prompt,
+                aspect_ratio=aspect_ratio, resolution=gen_resolution, mode=mode,
+                boxes_json=json.dumps(boxes) if boxes else None,
+                refs=[b for b, _ in fit_refs],
+                ref_mode="single" if single_branch else None)
             image_token = poll_token
         else:
             try:
