@@ -180,7 +180,8 @@ Content-Type: multipart/form-data
 | `resolution` | string | `1.5k` |
 | `boxes` | JSON 字符串 | `[{"id":"b-muzslh3m-4","box":{"x":0.3,"y":0.3,"w":0.4,"h":0.4},"instruction":"change the wheels to gold","source":"user"}]`（0~1 归一化坐标） |
 | `image` | file(png) | 当前画布整图（约 4MB PNG） |
-| `references` | JSON 字符串 | `[]`（参考图，未验证非空结构） |
+| `references` | JSON 字符串 | `["reference-1"]` —— **参考图文件名的字符串数组**，与同名文件部件配对（2026-11-16 取证） |
+| `reference` | file(png) ×N | 参考图文件部件。**字段名单数**，filename 为 `reference-1` / `reference-2` …（1 起） |
 
 响应：`{"status":"submitted","requestId":"<uuid>","pollToken":"...","prompt":"..."}`
 
@@ -215,7 +216,7 @@ multipart 字段：
 
 | 字段 | 说明 |
 | --- | --- |
-| `image` / `image[]` | 必填（≥1 张），任意常见格式（自动转 PNG）。**重复该字段即多图生图**：多图一律走上游 composition：第 1 张作为**编辑目标**、与其余图一起按 `references` 转发，`mode` 由适配器置 `t2i`（2026-10-26 契约修订，见「已知边界」）。两种拼法都接——`image[]` 是 OpenAI 官方 curl 示例的写法，重复 `image` 是 openai-python SDK 的写法（2026-10-20 实测两者均出图） |
+| `image` / `image[]` | 必填（≥1 张），任意常见格式（自动转 PNG）。**重复该字段即多图生图**：第 1 张作为**编辑目标（canvas）**，其余图以 `reference-N` 文件部件 + `references` 文件名数组上送（2026-11-16 取证并修复字段名，此前参考图从未生效）。两种拼法都接——`image[]` 是 OpenAI 官方 curl 示例的写法，重复 `image` 是 openai-python SDK 的写法（2026-10-20 实测两者均出图） |
 | `prompt` | 全局编辑指令 |
 | `mask` | 可选，OpenAI 语义（透明=可编辑区）；自动求连通域外接矩形 → 上游 `boxes`，每框 instruction=prompt |
 | `n` | 1~4，并发提交 |
@@ -342,6 +343,61 @@ curl -s -X POST http://127.0.0.1:8977/v1/images/edits \
 
 实测：提交 1.6s，生成约 26s，全链路约 33s 返回 1536×1536 PNG。
 
+### 本地联调：假上游 + 分支埋点
+
+不需要外网、不需要真实 key，就能看清「服务到底把什么发给了上游」。
+
+```sh
+# 0) 依赖（Windows 用 .venv\Scripts\python.exe 替换 .venv/bin/python）
+python -m venv .venv
+.venv/bin/pip install -r bfl2openai/requirements.txt pytest httpx pytest-asyncio
+
+# 1) 假上游：把 multipart 原样录下来（GET /_records 读回）
+.venv/bin/python -m uvicorn scripts.fake_upstream:app --port 8799
+
+# 2) 被测服务，指向上面的假上游
+BFL2OPENAI_UPSTREAM=http://127.0.0.1:8799 BFL2OPENAI_API_KEY=sk-local \
+.venv/bin/python -m uvicorn bfl2openai.server:app --port 8798
+
+# 3) 一次跑完 5 种请求形状，打印各自走了哪条分支
+.venv/bin/python scripts/probe_compose.py --base http://127.0.0.1:8798 --key sk-local
+```
+
+`probe_compose.py` 也能指向生产（`--base https://bfl.1task.cn --key sk-xxx`），
+用来确认线上请求的分支分布。
+
+### composition 分支埋点
+
+每次请求都会确定一个分支，并通过三处暴露出来：
+
+| 输出 | 位置 | 内容 |
+|---|---|---|
+| 日志 | `compose branch=... mode=i2i->t2i canvas=2835B->merged refs=1->2 downgraded=1` | 全量事实源，上游 429/502 前就已打出 |
+| 响应头 | `X-Bfl-Branch` / `X-Bfl-Mode` / `X-Bfl-Refs` / `X-Bfl-Downgraded` | 成功与错误响应都带 |
+| 计数 | `GET /v1/_compose` | 各分支命中次数、降级占比（单 worker 口径，带 pid） |
+
+分支含义：
+
+| 分支 | 触发条件 | 语义 |
+|---|---|---|
+| `t2i_plain` | 无图无垫图 | 本来就是文生图 |
+| `i2i_canvas` | 只有画布 | 正常编辑，画布锁定 |
+| `compose_canvas_refs` | 画布 + 垫图 | canvas 并入 references 首位，`mode` 置 `t2i`；参考图**仍然生效**（2026-11-16 内容级实测） |
+| `compose_refs_only` | 只有垫图 | `t2i` + refs |
+| `compose_canvas_refs_keep` | 画布 + 垫图，且 `BFL2OPENAI_MULTI_IMAGE_MODE=i2i` | `i2i` + canvas + refs 形态（同实测有效，保留作对照） |
+
+`X-Bfl-Downgraded: 1` 只表示「这条请求走了 composition 形态」，**不再等于参考图失效**。
+2026-11-16 修掉字段名（`reference` 单数 + `references` 文件名数组）之前，它确实等于失效；
+修复后 `t2i+refs` 与 `i2i+canvas+refs` 都能消费参考图。判断参考图是否生效请看
+`X-Bfl-Refs`（发出的参考图数量）而不是 `X-Bfl-Downgraded`。
+
+对照实验（默认关闭，不改变生产行为）：
+
+```sh
+BFL2OPENAI_MULTI_IMAGE_MODE=i2i .venv/bin/python -m uvicorn bfl2openai.server:app --port 8798
+```
+
+
 ### 精确区域编辑（boxes 扩展）
 
 ```sh
@@ -372,11 +428,18 @@ curl -s -X POST http://127.0.0.1:8977/v1/images/edits \
   BFL 随时可能收紧，请勿高并发滥用；复测脚本 `tests/probe_ratelimit.py`。
   **2026-10-26 修订**：已观测到 `429 You've used today's 30 free generations`（按出口 IP 计），
   早期「未触发任何限流/额度」的结论已不成立；现网靠 socks 代理池轮换出口 IP 规避。
-- `references`（参考图）**2026-10-26 实测定型**：上游 `mode` 枚举只有 `t2i` | `i2i`，
-  canvas（`image` 部件）与 references **互斥** —— `i2i`+canvas+refs → 400
-  `A composition must not include a canvas image.`；`i2i`+refs 无 canvas → 400
-  `An image is required for an edit.`；只有 **`t2i`+refs 无 canvas** 能出图。
-  语义是「第一张参考图即编辑目标」（上游 prompt 模板原文 `Edit the first reference image.`）。
+- `references`（参考图）**2026-11-16 取证并修正**：参考图走**两个必须配套的部件**——
+  `references`（JSON 字符串，值是 filename 数组）与 `reference`（图片文件部件，**字段名单数**，
+  filename 为 `reference-N`）。上游按 JSON 里的名字配对同名文件。
+  三者有一处不对，参考图就完全不参与生成，且**不报错、HTTP 200**，只是输出与参考图无关。
+  - **同日的实测更正**：`i2i`+canvas+refs **不再报 400**（2026-10-26 记录的
+    `A composition must not include a canvas image.` 已复现不出来），
+    `t2i`+refs、`i2i`+canvas+refs **两种形态都能消费参考图**（内容级验证，见下）。
+  - 内容级判据：参考图用 prompt 不可描述的配色（`#7B2FF7` + `#00FF7F`），
+    修字段名前后紫色像素占比 0.00% → 11~13.8%（参考图基线 14.00%），同 prompt 无图对照仍为 0.00%。
+  - 历史结论「`references` 消费是名词驱动、序号指代无效」来自 10-25 那次 `i2i+canvas+refs` 的观察，
+    但那次实验的 prompt 描述本身可用文字复现，**不构成参考图被消费的证据**。
+    上游前端另有 `@<filename>` 提及语法（`@reference-1`），未做内容级验证，暂按未确认处理。
 - **区域编辑与参考图互斥**：`boxes`/`mask` 是画布坐标指令，composition 是整图语义。
   两者同时出现时适配器直接返回 **400**，而不是让上游 400 被包成 502 且 boxes 静默失效。
 - `aspectRatio` 只实测 `auto`（其余值透传由上游校验）；`resolution` 五档已全实测（见顶部档位表）。

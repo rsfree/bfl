@@ -32,6 +32,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from . import browser_egress_client
+from . import compose as compose_mod
 from . import payload
 from . import upstream
 from . import native
@@ -66,6 +67,22 @@ app = FastAPI(title="bfl2openai", version="0.2.0", lifespan=_lifespan)
 native.register(app)
 uploads.register(app)
 async_images.register(app)
+
+
+@app.middleware("http")
+async def _compose_header(request: Request, call_next):
+    """把 composition 决策写进响应头——成功和失败都带。
+
+    埋点目的：客户报"参考图没生效"时，不需要翻服务端日志，直接看响应头
+    就知道这次走的是 i2i_canvas（参考图生效）还是 compose_*（降级分支）。
+    """
+    response = await call_next(request)
+    plan = getattr(request.state, "compose_plan", None)
+    if plan is not None:
+        for key, value in plan.headers().items():
+            response.headers[key] = value
+    return response
+
 
 MODEL_ID = os.environ.get("BFL2OPENAI_MODEL", "flux-precise-edit")
 API_KEY = os.environ.get("BFL2OPENAI_API_KEY", "")  # optional; empty = auth disabled
@@ -435,20 +452,20 @@ async def _run_job_impl(
     request: Request,
     upscale_to: int | None = None,
     reference_images: list[tuple[bytes, str]] | None = None,
+    plan: compose_mod.Plan | None = None,
 ) -> JSONResponse:
     # ---- 多图（composition）归一化 -------------------------------------
-    # 上游契约（2026-10-26 实测，Zod 报错暴露枚举）：mode 只有 't2i' | 'i2i'，
-    # 且 canvas(`image` 部件) 与 references 互斥：
-    #     i2i + canvas + refs  -> 400 "A composition must not include a canvas image."
-    #     i2i + refs（无 canvas）-> 400 "An image is required for an edit."
-    #     t2i + refs（无 canvas）-> 200 正常出图（1536x1536，带 C2PA）
-    # 所以带参考图的请求一律降级成 composition：canvas 并入 references 首位
-    # （上游前端 prompt 也是 "Edit the first reference image."），mode 置 t2i。
-    if reference_images:
-        if image_png:
-            reference_images = [(image_png, "canvas.png"), *reference_images]
-            image_png = None
-        mode = "t2i"
+    # 契约与降级逻辑收敛在 compose.plan()：它返回归一化后的
+    # (canvas, refs, mode) 三元组，同时打一条结构化埋点日志、给出响应头。
+    # 现行行为（b442808 起）：带参考图 -> canvas 并入 references 首位、
+    # mode 置 t2i，即「降级成 composition」。
+    # plan 由 run_job 在幂等包装之外算好传进来——命中幂等缓存直接回放时，
+    # 这里根本不会执行，但响应头仍要有分支信息。
+    plan = plan or compose_mod.plan(image_png, reference_images, mode)
+    image_png = plan.image_png
+    reference_images = list(plan.reference_images)
+    mode = plan.mode_out
+    request.state.compose_plan = plan
 
     # 浏览器出口路径的上传预算：sidecar 直连上游，不走
     # upstream.submit_generation 的 normalize，这里必须自己压一遍，
@@ -477,9 +494,9 @@ async def _run_job_impl(
             import uuid as _uuid
             poll_token = _uuid.uuid4().hex
             fit_main, fit_refs = fit_upload()
-            log.info("browser-primary token=%s… (resolution=%s main=%dB refs=%d)",
+            log.info("browser-primary token=%s… (resolution=%s main=%dB refs=%d mode=%s branch=%s)",
                      poll_token[:10], gen_resolution, len(fit_main or b""),
-                     len(fit_refs))
+                     len(fit_refs), mode, plan.branch)
             browser_media = await browser_egress_client.generate(
                 image_png=fit_main or b"", prompt=prompt,
                 aspect_ratio=aspect_ratio, resolution=gen_resolution, mode=mode,
@@ -498,8 +515,8 @@ async def _run_job_impl(
                     base_url=UPSTREAM_BASE,
                     reference_images=reference_images or None,
                 )
-                log.info("submitted pollToken=%s… (resolution=%s)",
-                         poll_token[:10], gen_resolution)
+                log.info("submitted pollToken=%s… (resolution=%s mode=%s branch=%s)",
+                         poll_token[:10], gen_resolution, mode, plan.branch)
             except UpstreamError as submit_exc:
                 # 上游按 HTTP/2 指纹拒绝 curl_cffi（403 Access denied）——只有
                 # 真实浏览器环境能过。降级到 browser_egress sidecar。
@@ -510,9 +527,9 @@ async def _run_job_impl(
                 poll_token = _uuid.uuid4().hex
                 fit_main, fit_refs = fit_upload()
                 log.warning("fingerprint 403 from upstream; browser egress "
-                            "fallback token=%s… (resolution=%s main=%dB refs=%d)",
+                            "fallback token=%s… (resolution=%s main=%dB refs=%d mode=%s branch=%s)",
                             poll_token[:10], gen_resolution,
-                            len(fit_main or b""), len(fit_refs))
+                            len(fit_main or b""), len(fit_refs), mode, plan.branch)
                 browser_media = await browser_egress_client.generate(
                     image_png=fit_main or b"", prompt=prompt,
                     aspect_ratio=aspect_ratio, resolution=gen_resolution,
@@ -631,6 +648,10 @@ async def run_job(
         upscale_to=upscale_to or 0,
         reference_images=[[b, nm] for b, nm in (reference_images or [])],
     )
+    # 分支决策放在幂等包装之前：命中缓存回放时不再进 _run_job_impl，
+    # 但客户端仍然需要 X-Bfl-Branch 等响应头来判定走的哪条路。
+    plan = compose_mod.plan(image_png, reference_images, mode)
+    request.state.compose_plan = plan
     return await _idem_run(
         fp,
         lambda: _run_job_impl(
@@ -645,6 +666,7 @@ async def run_job(
             request=request,
             upscale_to=upscale_to,
             reference_images=reference_images,
+            plan=plan,
         ),
     )
 
@@ -672,6 +694,18 @@ async def probe_endpoint(request: Request, run: int = 0):
     if run:
         return await probe.run_once()
     return await probe.status()
+
+
+@app.get("/v1/_compose")
+async def compose_stats(request: Request) -> dict:
+    """降级埋点读数：本次进程内各 composition 分支的命中次数。
+
+    用来回答「到底有多少比例走了降级分支」。注意 gunicorn 多 worker 时这是
+    单个 worker 的计数（响应里带 pid），全量口径仍以 `compose branch=...`
+    日志为准。
+    """
+    await check_auth(request)
+    return compose_mod.snapshot()
 
 
 @app.get("/v1/models")

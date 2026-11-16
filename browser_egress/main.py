@@ -94,7 +94,7 @@ _IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _breaker = {"fails": 0, "opened_until": 0.0, "trips": 0, "last_reason": ""}
 
 SUBMIT_JS = """
-async ({prompt, aspectRatio, resolution, mode, imgB64, boxes, references, refs}) => {
+async ({prompt, aspectRatio, resolution, mode, model, imgB64, boxes, references, refs}) => {
   // 契约（2026-10-09 实测）：空 image 部件 ≠ 无 image —— 上游会回
   // 400 "A composition must not include a canvas image."。无图时必须整个省略。
   const hasImage = !!(imgB64 && imgB64.length);
@@ -104,26 +104,36 @@ async ({prompt, aspectRatio, resolution, mode, imgB64, boxes, references, refs})
 
   const fd = new FormData();
   fd.append("mode", mode);
+  fd.append("model", model || "flux-3-image");
   fd.append("prompt", prompt);
   fd.append("aspectRatio", ar);
   fd.append("resolution", resolution);
   // boxes/references 两个 JSON 字段必须始终存在，缺失会被当成 composition
   // （t2i）→ 带 image 即 400（2026-10-09/14 实测）。
   fd.append("boxes", boxes || "[]");
-  fd.append("references", references || "[]");
+
+  // 参考图契约（2026-11-16 从上游前端 bundle 取证，precise-editing chunk）：
+  //   fd.append("references", JSON.stringify(refs.map(e => e.name)))  // 文件名字符串数组
+  //   fd.append("reference", blob, "reference-" + (i + 1))            // 字段名单数、1 起
+  // 此前我们发的是「复数 references 文件部件 + 恒空 "[]" JSON」，上游按
+  // `reference` 取文件、按 JSON 名字配对，两者都拿不到 → 参考图从未被消费。
+  const refList = refs || [];
+  const refNames = refList.map((_, i) => `reference-${i + 1}`);
+  fd.append("references", refList.length
+    ? JSON.stringify(refNames)
+    : (references || "[]"));
+
   if (hasImage) {
     const bin = atob(imgB64);
     const arr = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-    fd.append("image", new Blob([arr], {type: "image/png"}), "image.png");
+    fd.append("image", new Blob([arr], {type: "image/png"}), "image");
   }
-  if (refs && refs.length) {
-    for (let i = 0; i < refs.length; i++) {
-      const rb = atob(refs[i]);
-      const ra = new Uint8Array(rb.length);
-      for (let j = 0; j < rb.length; j++) ra[j] = rb.charCodeAt(j);
-      fd.append("references", new Blob([ra], {type: "image/png"}), `ref${i}.png`);
-    }
+  for (let i = 0; i < refList.length; i++) {
+    const rb = atob(refList[i]);
+    const ra = new Uint8Array(rb.length);
+    for (let j = 0; j < rb.length; j++) ra[j] = rb.charCodeAt(j);
+    fd.append("reference", new Blob([ra], {type: "image/png"}), refNames[i]);
   }
   const r = await fetch("/api/flux3-image/generate", {method: "POST", body: fd});
   const t = await r.text();
@@ -822,6 +832,7 @@ class GenReq(BaseModel):
     aspect_ratio: str = "1:1"
     resolution: str = "1k"
     mode: str = "i2i"
+    model: str = "flux-3-image"
     boxes: str | None = None
     references: str | None = None
     refs: list[str] | None = None
@@ -939,6 +950,7 @@ async def generate(req: GenReq):
                 sub = await _eval(entry, SUBMIT_JS, {
                     "prompt": req.prompt, "aspectRatio": req.aspect_ratio,
                     "resolution": req.resolution, "mode": req.mode,
+                    "model": req.model,
                     "imgB64": req.image_b64, "boxes": req.boxes,
                     "references": req.references, "refs": req.refs or [],
                 }, timeout=90)

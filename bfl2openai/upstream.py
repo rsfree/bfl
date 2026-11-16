@@ -194,6 +194,7 @@ async def submit_generation(
     """Submit an edit job, return the pollToken."""
     fields: list[tuple[str, Any]] = [
         ("mode", mode),
+        ("model", "flux-3-image"),
         ("prompt", prompt),
         ("aspectRatio", aspect_ratio),
         ("resolution", resolution),
@@ -207,7 +208,8 @@ async def submit_generation(
         # demands an explicit ratio ("Choose an aspect ratio for the canvas.",
         # measured 2026-10-09). Square is the neutral t2i default (t2i
         # verified live the same day: 4k composite produced a real landscape).
-        fields[2] = ("aspectRatio", "1:1")
+        # 按 key 改，不用下标：插字段（如 model）时下标会平移。
+        fields = [(k, ("1:1" if k == "aspectRatio" else v)) for k, v in fields]
     try:
         # 多参考图：联合预算规范化（主图 60% + 参考图均分），再以重复文件
         # 部件转发（契约实测 2026-10-14：按部件数量与 filename 配对）。
@@ -288,19 +290,26 @@ async def _submit_generation_impl(
             index += 1
         # mime 每次重建：CurlMime 的重放语义不可靠
         mp = CurlMime()
+        # 参考图契约（2026-11-16 从上游前端 bundle 取证）：
+        #   references = JSON 字符串，内容是「文件名字符串数组」，如 ["reference-1"]
+        #   reference  = 重复文件部件，字段名单数，filename 为 reference-1/2/3…
+        # 上游按 JSON 里的名字去配对同名文件部件。此前我们发的是复数
+        # `references` 文件部件 + 恒空 "[]" JSON，两者都取不到 → 参考图从未生效。
+        ref_names = [f"reference-{i}" for i in range(1, len(reference_parts or []) + 1)]
+        if ref_names:
+            fields = [(k, json.dumps(ref_names) if k == "references" else v)
+                      for k, v in fields]
         for name, value in fields:
             mp.addpart(name=name, data=str(value).encode())
         if image_png:
             # An empty image part is NOT "no image": upstream answers
             # 400 "A composition must not include a canvas image." (measured
             # 2026-10-09 on a t2i attempt). Omit the part entirely instead.
-            mp.addpart(name="image", filename="image.png",
+            mp.addpart(name="image", filename="image",
                        content_type=content_type_of(image_png),
                        data=image_png)
-        for ref_bytes, ref_name in (reference_parts or []):
-            # 多参考图契约（实测 2026-10-14）：references 是重复的文件部件，
-            # 每张自带 filename —— 服务端按部件数量与文件名配对。
-            mp.addpart(name="references", filename=ref_name,
+        for ref_bytes, ref_name in zip(reference_parts or [], ref_names):
+            mp.addpart(name="reference", filename=ref_name,
                        content_type=content_type_of(ref_bytes),
                        data=ref_bytes)
         try:

@@ -72,6 +72,7 @@ from . import upstream
 from . import upscale as mps
 from . import bridging
 from . import browser_egress_client
+from . import compose as compose_mod
 from . import payload as payload_mod
 from .payload import normalize_image
 from . import uploads as uploads_mod
@@ -222,10 +223,14 @@ async def _bridge_run(token: str, image_png: bytes, prompt: str, boxes: list[dic
     """
     key = f"bridge:{token}"
     try:
-        if reference_images and image_png:
-            reference_images = [(image_png, "canvas.png"), *reference_images]
-            image_png = b""
-            mode = "t2i"
+        # 与 server._run_job_impl 共用同一套归一化与埋点（compose.plan）：
+        # 带参考图 -> canvas 并入 references 首位、mode 置 t2i。两处若各写一份
+        # 迟早分叉，这里统一走 compose。
+        plan = compose_mod.plan(image_png or None, reference_images, mode,
+                                note=f"native token={token[:8]}")
+        image_png = plan.image_png or b""
+        reference_images = list(plan.reference_images)
+        mode = plan.mode_out
         gen_resolution = bridging.ensure_resolution_capacity(aspect_ratio, resolution)
         # 同一套上传预算（桥也直连 sidecar，不走 upstream 的 normalize）
         fit_main, fit_refs = payload_mod.fit_body_budget(
