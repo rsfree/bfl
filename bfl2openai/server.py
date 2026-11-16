@@ -25,6 +25,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 import os
+import re
 import time
 from typing import Literal
 
@@ -175,6 +176,58 @@ def openai_error(status: int, message: str, err_type: str = "invalid_request_err
     return JSONResponse(status_code=status, content={"error": {"message": message, "type": err_type}})
 
 
+#: 对外错误文案的唯一来源。上游原文**只进日志**，因为它会泄漏：
+#:   - CF ray id（`sin1::mqx5x-…` 直接暴露出口机房区域）
+#:   - 上游 Zod 报错的枚举清单（等于把内部契约交出去）
+#:   - 内部拓扑（`browser egress 500` / `127.0.0.1:8011`）
+#:   - 代理 URL（万一异常信息里带了 user:pass）
+_SAFE_ERRORS = {
+    "content_policy_violation": "content rejected by upstream policy",
+    "rate_limit": "upstream quota exhausted; retry later",
+    "upstream_timeout": "upstream timeout; retry later",
+    "upstream_unavailable": "upstream temporarily unavailable",
+    "upstream_rejected": "upstream rejected the request",
+}
+
+_SECRET_RE = re.compile(r"(?:socks5h?|https?|wss?)://[^@\s/]+@")
+#: CF 边缘 ray id（`sin1::mqx5x-1794…`）前缀是机房代码，等于暴露出口区域。
+_RAY_RE = re.compile(r"\b[a-z]{3}\d{1,2}::[0-9A-Za-z_-]+")
+
+#: 上游固定文案 → 标准词。日志里保留原文没意义（都是已知分类），
+#: 而 `You've used today's 30 free generations` 这类句子会把额度规则写进日志。
+_PHRASE_MAP = (
+    (re.compile(r"you'?ve used today'?s \d+ free generations", re.I),
+     "<quota_exhausted>"),
+    (re.compile(r"\btoo many requests\b", re.I), "<rate_limited>"),
+    (re.compile(r"\baccess denied\b", re.I), "<access_denied>"),
+    (re.compile(r"\bcontent moderation\b", re.I), "<moderation_rejected>"),
+)
+
+#: 内部 kind → 对外 type。只放行 OpenAI 规范的词汇，
+#: 其余一律 api_error（避免 access_denied / composition 这类内部词外泄）。
+_PUBLIC_TYPE = {
+    "invalid_request_error": "invalid_request_error",
+    "content_policy": "content_policy_violation",
+    "rate_limit": "rate_limit_error",
+}
+
+
+def _public_type(kind: str) -> str:
+    return _PUBLIC_TYPE.get(kind, "api_error")
+
+
+def _redact(text: str, limit: int = 400) -> str:
+    """日志用：清 URL 凭据、CF ray id，并把上游固定文案归一成标准词。
+
+    对外响应不要用它 —— 用 _SAFE_ERRORS 的固定文案。
+    """
+    s = _SECRET_RE.sub("<redacted>://", str(text))
+    s = _RAY_RE.sub("<ray>", s)
+    for pat, token in _PHRASE_MAP:
+        s = pat.sub(token, s)
+    return s[:limit]
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     """兜底：未捕获异常一律回 JSON 错误体，而不是纯文本 500。
@@ -193,10 +246,18 @@ def wrap_upstream_error(exc: UpstreamError) -> JSONResponse:
     # "换内容"而不是"重试"（此前误映射为 502，客户会无效重试且监控失真）。
     if exc.kind == "content_policy":
         # 451 Unavailable For Legal Reasons：内容合规拒绝的 HTTP 标准语义
-        return openai_error(451, f"Content moderation rejected: {exc.message}",
+        log.warning("moderation rejected: %s", _redact(exc.message, 300))
+        return openai_error(451, _SAFE_ERRORS["content_policy_violation"],
                             "content_policy_violation")
     status = 400 if exc.kind == "invalid_request_error" else 502
-    return openai_error(status, f"Upstream error: {exc.message}", exc.kind)
+    log.warning("upstream error kind=%s status=%s: %s",
+                exc.kind, status, _redact(exc.message))
+    if status == 400:
+        # invalid_request_error 基本都是本网关自己产生的参数校验文案
+        # （如 "at most 10 images"），对上上游原文无暴露风险，保留可纠正性。
+        return openai_error(400, _redact(exc.message, 200), _public_type(exc.kind))
+    return openai_error(502, _SAFE_ERRORS["upstream_unavailable"],
+                        _public_type(exc.kind))
 
 
 def wrap_browser_egress_error(
@@ -214,23 +275,24 @@ def wrap_browser_egress_error(
       - 0  ：传输层（连接/超时）→ 504，语义是"等得到但没等到"
       - 其它：上游契约/内部错误 → 502，重试有意义但不该被当成 4xx
     """
+    log.warning("browser egress failure status=%s: %s",
+                exc.status, _redact(exc, 400))
     if exc.status == 451:
-        return openai_error(451, f"Content moderation rejected: {exc}",
+        return openai_error(451, _SAFE_ERRORS["content_policy_violation"],
                             "content_policy_violation")
     if exc.status == 429:
         # 配额细节只进日志（含"免费额度"字样），不透给调用方
-        return openai_error(429, "upstream quota exhausted; retry later",
-                            "rate_limit")
+        return openai_error(429, _SAFE_ERRORS["rate_limit"], "rate_limit_error")
     if "413" in str(exc) or "Request Entity Too Large" in str(exc):
         # 上游 body 上限：重试无用，必须让调用方缩图（此前笼统报 502，
         # 客户端会当成服务故障无限重试）。
         return openai_error(413, "payload too large for upstream; "
                                  "downscale the input images", "invalid_request_error")
     if exc.status == 0:
-        return openai_error(504, f"upstream timeout: {exc}"[:300],
-                            "upstream_error")
-    return openai_error(502, f"upstream unavailable: {exc}"[:400],
-                        "upstream_error")
+        return openai_error(504, _SAFE_ERRORS["upstream_timeout"],
+                            "api_error")
+    return openai_error(502, _SAFE_ERRORS["upstream_unavailable"],
+                        "api_error")
 
 
 def _parse_long_side(size: str | None) -> int | None:
@@ -256,6 +318,16 @@ _MODERATION_DIAG = os.environ.get("BFL2OPENAI_MODERATION_DIAG", "") == "1"
 #: 浏览器优先：上游指纹封禁期间（curl_cffi 恒 403 + 代理重试白耗 2-3 分钟），
 #: 置 1 时直接走 browser_egress sidecar，跳过 curl_cffi 尝试链。
 _BROWSER_PRIMARY = os.environ.get("BFL2OPENAI_BROWSER_PRIMARY", "") == "1"
+
+#: 参考图分支策略（2026-11-16 官网抓包新增第二条分支；2026-11-17 起默认走新版）：
+#:   "single"（默认）-> reference(单数) 文件部件 + references 退化成 id 数组 + i2i
+#:                 = 官网 precise-editing 分支，canvas 作为 image 部件受保护。
+#:                   **实测保真度比 composition 好约 10 倍**（墙面偏差 89→8.7），
+#:                   且模糊 prompt 下不会丢物体（composition 会整幅重画成别的东西）。
+#:   "multi"      -> references(复数) 文件部件 + t2i + canvas 并入 refs[0]
+#:                 = 旧 composition 语义，保留作回退开关。
+#: 两条都保留：single 被上游拒绝(400/422)时自动降级 multi（见 _run_job_impl）。
+REF_BRANCH = os.environ.get("BFL2OPENAI_REF_BRANCH", "single")
 
 
 # ---- images 门幂等（2026-11-09）------------------------------------------
@@ -444,11 +516,27 @@ async def _run_job_impl(
     #     t2i + refs（无 canvas）-> 200 正常出图（1536x1536，带 C2PA）
     # 所以带参考图的请求一律降级成 composition：canvas 并入 references 首位
     # （上游前端 prompt 也是 "Edit the first reference image."），mode 置 t2i。
+    #
+    # 2026-11-16 官网抓包修正：上面第三条 400 的触发条件是**复数字段名**
+    # `references`。官网 precise-editing 用另一条分支——文件部件名是单数
+    # `reference`，`references` 退化成 id 数组（["ref","ref-2","<hash>"]），
+    # 且 mode 仍是 i2i 并保留 canvas。两条分支共存，语义不同：
+    #   multi  : 4 张图当素材重新画一张（画布也会被重绘）
+    #   single : 编辑原图 + 注入素材（画布受保护，保真度高）
+    # 单数分支依赖 sidecar 改写文件部件名；curl_cffi 路径（upstream.py）只会
+    # 发复数字段名，混用必然 400，因此该分支仅在浏览器优先模式下启用。
+    single_branch = (REF_BRANCH == "single" and bool(reference_images)
+                     and _BROWSER_PRIMARY)
     if reference_images:
-        if image_png:
-            reference_images = [(image_png, "canvas.png"), *reference_images]
-            image_png = None
-        mode = "t2i"
+        if single_branch:
+            # canvas 留在 image 部件里不动；reference_images 只放真正的素材。
+            # 上游要求 references 与 reference 部件一一对应，id 由 sidecar 生成。
+            mode = "i2i"
+        else:
+            if image_png:
+                reference_images = [(image_png, "canvas.png"), *reference_images]
+                image_png = None
+            mode = "t2i"
 
     # 浏览器出口路径的上传预算：sidecar 直连上游，不走
     # upstream.submit_generation 的 normalize，这里必须自己压一遍，
@@ -480,11 +568,25 @@ async def _run_job_impl(
             log.info("browser-primary token=%s… (resolution=%s main=%dB refs=%d)",
                      poll_token[:10], gen_resolution, len(fit_main or b""),
                      len(fit_refs))
-            browser_media = await browser_egress_client.generate(
-                image_png=fit_main or b"", prompt=prompt,
-                aspect_ratio=aspect_ratio, resolution=gen_resolution, mode=mode,
-                boxes_json=json.dumps(boxes) if boxes else None,
-                refs=[b for b, _ in fit_refs])
+            want_single = "single" if single_branch else None
+            try:
+                browser_media = await browser_egress_client.generate(
+                    image_png=fit_main or b"", prompt=prompt,
+                    aspect_ratio=aspect_ratio, resolution=gen_resolution, mode=mode,
+                    boxes_json=json.dumps(boxes) if boxes else None,
+                    refs=[b for b, _ in fit_refs], ref_mode=want_single)
+            except browser_egress_client.BrowserEgressError as exc:
+                # 单数分支若被上游拒绝（结构收紧/灰度回滚），降级回 composition
+                # 保证「至少出图」；451(审核)/429(频控) 降级无意义，原样抛。
+                if not want_single or exc.status not in (400, 422):
+                    raise
+                log.warning("reference(单数)分支被拒 status=%s，降级 composition: %s",
+                            exc.status, str(exc)[:160])
+                browser_media = await browser_egress_client.generate(
+                    image_png=b"", prompt=prompt,
+                    aspect_ratio=aspect_ratio, resolution=gen_resolution,
+                    mode="t2i", boxes_json=json.dumps(boxes) if boxes else None,
+                    refs=([fit_main] if fit_main else []) + [b for b, _ in fit_refs])
             image_token = poll_token
         else:
             try:
@@ -518,7 +620,8 @@ async def _run_job_impl(
                     aspect_ratio=aspect_ratio, resolution=gen_resolution,
                     mode=mode,
                     boxes_json=json.dumps(boxes) if boxes else None,
-                    refs=[b for b, _ in fit_refs])
+                    refs=[b for b, _ in fit_refs],
+                    ref_mode="single" if single_branch else None)
                 image_token = poll_token
             else:
                 image_token = await upstream.wait_for_result(
@@ -585,8 +688,8 @@ async def _run_job_impl(
         return wrap_browser_egress_error(exc)
     except mps.MPSError as exc:
         log.warning("run_job mps error: %s", str(exc)[:300])
-        return openai_error(502, f"super-resolution failed: {exc.message}",
-                            "upstream_error")
+        return openai_error(502, "super-resolution failed",
+                            "api_error")
 
     return JSONResponse(
         {

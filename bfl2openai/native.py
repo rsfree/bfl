@@ -78,6 +78,24 @@ from . import uploads as uploads_mod
 
 log = logging.getLogger("bfl2openai.native")
 
+#: 上游错误原文只进日志，对外一律通用文案。原文会泄漏 CF ray id（`sin1::…`，
+#: 暴露出口机房区域）、上游 Zod 枚举、内部拓扑与代理 URL（2026-11-17 加固）。
+_TIMEOUT_MSG = "upstream temporarily unavailable"
+_RAY_RE = re.compile(r"\b[a-z]{3}\d{1,2}::[0-9A-Za-z_-]+")
+_SECRET_RE = re.compile(r"(?:socks5h?|https?|wss?)://[^@\s/]+@")
+
+
+def _redact_upstream(text: object, limit: int = 400) -> str:
+    s = _SECRET_RE.sub("<redacted>://", str(text))
+    s = _RAY_RE.sub("<ray>", s)
+    return s[:limit]
+
+
+def _upstream_502(exc: object) -> JSONResponse:
+    """上游失败对外只回通用文案；细节打日志（脱敏后）。"""
+    log.warning("upstream failure: %s", _redact_upstream(exc))
+    return JSONResponse(status_code=502, content={"detail": _TIMEOUT_MSG})
+
 PUBLIC_BASE = os.environ.get("BFL2OPENAI_PUBLIC_BASE", "").rstrip("/")
 
 NATIVE_API_KEY = os.environ.get("BFL_NATIVE_API_KEY", "")  # optional enforcement
@@ -424,10 +442,7 @@ def register(app: FastAPI) -> None:
                 if resolution in COMPOSITE_TIERS:
                     await store.put(f"comp:{poll_token}", {"phase": "gen", "target": resolution}, ttl_s=_COMP_TTL)
         except upstream.UpstreamError as exc:
-            return JSONResponse(
-                status_code=502,
-                content={"detail": exc.message},
-            )
+            return _upstream_502(exc.message)
 
         base = PUBLIC_BASE or str(request.base_url).rstrip("/")
         return JSONResponse(
@@ -502,7 +517,7 @@ def register(app: FastAPI) -> None:
                     await store.put(cache_key, {"status": "gone"}, ttl_s=300)
                     return JSONResponse(status_code=404,
                                         content={"detail": "unknown or expired result id"})
-                return JSONResponse(status_code=502, content={"detail": exc.message})
+                return _upstream_502(exc.message)
             ttl = 120 if state.get("status") in ("ready", "error") else 3
             await store.put(cache_key, state, ttl_s=ttl)
 
@@ -548,7 +563,7 @@ def register(app: FastAPI) -> None:
             try:
                 state = await upstream.poll_once(token)
             except upstream.UpstreamError as exc:
-                return JSONResponse(status_code=502, content={"detail": exc.message})
+                return _upstream_502(exc.message)
             if state.get("status") == "error":
                 await store.drop(f"comp:{token}")
                 out["status"] = "Error"
@@ -631,7 +646,7 @@ def register(app: FastAPI) -> None:
         try:
             media = await upstream.fetch_media(image_token)
         except upstream.UpstreamError as exc:
-            return JSONResponse(status_code=502, content={"detail": exc.message})
+            return _upstream_502(exc.message)
         return Response(content=media, media_type="image/png")
 
     # NOTE: deliberately no standalone /upscale endpoint. Super-resolution is

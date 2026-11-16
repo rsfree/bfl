@@ -37,6 +37,20 @@ POLL_INTERVAL_S = float(os.environ.get("BFL2OPENAI_EGRESS_POLL_S", "1.0"))
 #: 轮询上限必须短于调用方超时（bfl2openai 侧 180s）：否则客户先断开，
 #: 我们连"为什么失败"都送不回去（实测一笔 pending 280s 的请求就这么消失的）。
 POLL_TIMEOUT_S = float(os.environ.get("BFL2OPENAI_EGRESS_POLL_TIMEOUT", "165"))
+#: 取图（页面内 fetch media）的超时。**注意这不是轮询**：轮询是
+#: POLL_TIMEOUT_S（等 status 变 ready），这里是 ready 之后把图片字节下回来。
+#: 上游 CDN 到客户端这段走页面 fetch，带宽差时 1k PNG 实测 78–111s，
+#: 原来硬编码 120s 贴着上限、偶发 500。放到 300s（2026-11-16）。
+#: 约束：调用方总超时必须 > POLL_TIMEOUT_S + MEDIA_TIMEOUT_S，否则先断。
+MEDIA_TIMEOUT_S = float(os.environ.get("BFL2OPENAI_EGRESS_MEDIA_TIMEOUT", "300"))
+
+#: 生成耗时基线（秒），用于轮询节奏「先疏后密」。
+#: 来源：2026-11-16 本地实测 —— LARGE i2i 1.5k 的 poll≈27.3s（13 轮），
+#: KLEIN 768sq 的 poll≈6.4s（4 轮）。生成在 ETA 前 55% 内几乎必然是 pending，
+#: 密集轮询纯属浪费：既抬高该 IP 的 CF 请求速率，又反复唤醒冻结页面。
+POLL_ETA_S = {"flux-3-image-klein": 8.0, "flux-3-image": 28.0}
+DEFAULT_MODEL = "flux-3-image"
+DEFAULT_ETA_S = 28.0
 #: 页面池大小。默认 8。每页独立 context ⇒ 独立 socket 池 ⇒ 通常各自一个出口 IP；
 #: 但 IP 是「每条 TCP 连接」分配的（poolclient 逐连接轮换，见 socksbridge.py），
 #: 所以连接重建/context 回收就会换 IP，不是固定绑定。与生产 compose 的显式
@@ -94,7 +108,7 @@ _IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _breaker = {"fails": 0, "opened_until": 0.0, "trips": 0, "last_reason": ""}
 
 SUBMIT_JS = """
-async ({prompt, aspectRatio, resolution, mode, imgB64, boxes, references, refs}) => {
+async ({prompt, aspectRatio, resolution, mode, imgB64, boxes, references, refs, refMode, model}) => {
   // 契约（2026-10-09 实测）：空 image 部件 ≠ 无 image —— 上游会回
   // 400 "A composition must not include a canvas image."。无图时必须整个省略。
   const hasImage = !!(imgB64 && imgB64.length);
@@ -104,13 +118,24 @@ async ({prompt, aspectRatio, resolution, mode, imgB64, boxes, references, refs})
 
   const fd = new FormData();
   fd.append("mode", mode);
+  // 官网下拉里有两个模型（FLUX 3 LARGE / KLEIN，2026-11-16 实测）。
+  // 官网请求体里带 model=flux-3-image；此前我们靠上游默认值。留空即不发，
+  // 保持旧行为，仅在显式指定时才追加。
+  if (model) fd.append("model", model);
   fd.append("prompt", prompt);
   fd.append("aspectRatio", ar);
   fd.append("resolution", resolution);
   // boxes/references 两个 JSON 字段必须始终存在，缺失会被当成 composition
   // （t2i）→ 带 image 即 400（2026-10-09/14 实测）。
   fd.append("boxes", boxes || "[]");
-  fd.append("references", references || "[]");
+  // 两条上游分支（2026-11-16 抓包发现，此前只用了第一条）：
+  //   references(复数) 文件部件 -> composition 契约，canvas 必须缺席，mode=t2i
+  //   reference(单数) 文件部件  -> editing 契约，references 退化成 id 数组，
+  //                                mode=i2i 且带 image 画布。官网 precise-editing
+  //                                页走的是后者（canvas 受保护，保真度更高）。
+  const single = refMode === "single";
+  const refIds = (refs || []).map((_, i) => (i === 0 ? "ref" : `ref-${i + 1}`));
+  fd.append("references", single ? JSON.stringify(refIds) : (references || "[]"));
   if (hasImage) {
     const bin = atob(imgB64);
     const arr = new Uint8Array(bin.length);
@@ -122,7 +147,9 @@ async ({prompt, aspectRatio, resolution, mode, imgB64, boxes, references, refs})
       const rb = atob(refs[i]);
       const ra = new Uint8Array(rb.length);
       for (let j = 0; j < rb.length; j++) ra[j] = rb.charCodeAt(j);
-      fd.append("references", new Blob([ra], {type: "image/png"}), `ref${i}.png`);
+      fd.append(single ? "reference" : "references",
+                new Blob([ra], {type: "image/png"}),
+                single ? refIds[i] : `ref${i}.png`);
     }
   }
   const r = await fetch("/api/flux3-image/generate", {method: "POST", body: fd});
@@ -426,7 +453,8 @@ async def ensure_pool():
         browser = None
         try:
             browser = await pw.chromium.launch(
-                executable_path="/usr/bin/chromium",
+                executable_path=os.environ.get(
+                    "BFL2OPENAI_EGRESS_CHROMIUM", "/usr/bin/chromium"),
                 headless=True,
                 proxy=proxy_cfg,
                 args=[
@@ -825,6 +853,12 @@ class GenReq(BaseModel):
     boxes: str | None = None
     references: str | None = None
     refs: list[str] | None = None
+    #: "single" -> reference(单数) 文件部件 + references(id 数组)，editing 分支
+    #: 缺省 -> references(复数) 文件部件，composition 分支（现网行为）
+    ref_mode: str | None = None
+    #: 上游 model 字段（"flux-3-image" / 待确认的 klein 取值）。
+    #: 留空不发，与历史行为一致。
+    model: str | None = None
 
 
 FP_JS = """
@@ -941,6 +975,7 @@ async def generate(req: GenReq):
                     "resolution": req.resolution, "mode": req.mode,
                     "imgB64": req.image_b64, "boxes": req.boxes,
                     "references": req.references, "refs": req.refs or [],
+                    "refMode": req.ref_mode, "model": req.model,
                 }, timeout=90)
             except Exception as exc:  # noqa: BLE001
                 if not _page_dead(exc):
@@ -999,6 +1034,10 @@ async def generate(req: GenReq):
         image_token = None
         last = ""
         rounds = 0
+        #: 轮询阶段吃到的 429 次数。status 是 GET、走同一个出口 IP，
+        #: 与 submit 共用 CF 的边缘速率窗口（但**不消耗** generate 的业务额度）。
+        poll_429 = 0
+        eta_s = POLL_ETA_S.get(req.model or DEFAULT_MODEL, DEFAULT_ETA_S)
         while time.time() < deadline:
             try:
                 st = await _eval(entry, STATUS_JS, token, timeout=30)
@@ -1027,11 +1066,28 @@ async def generate(req: GenReq):
                                        content={"error": f"upstream: {last}"})
             elif st["status"] in (422, 451):
                 return JSONResponse(status_code=451, content={"error": last})
-            # 抖动：固定 1.000s 的等间隔轮询是最容易被识别的机器节奏
-            await asyncio.sleep(POLL_INTERVAL_S * random.uniform(0.85, 1.5))
+            elif st["status"] == 429:
+                # 轮询侧同样会吃 CF 边缘频率限制。原实现把 429 当普通抖动，
+                # 以固定 1s 间隔打满整个 165s 窗口 —— 频控下最坏的应对方式：
+                # 任务救不回来，还持续加码把自己锁更久。这里指数退避。
+                poll_429 += 1
+                await asyncio.sleep(min(2 ** poll_429, 8))
+                continue
+            # 抖动：固定 1.000s 的等间隔轮询是最容易被识别的机器节奏。
+            # 节奏按 ETA 分三段（先疏后密）：55% ETA 之前几乎不可能 ready，
+            # 用 3s 稀疏探测；接近 ETA 时 1.2s；超过 ETA 说明偏慢，0.8s 抢时间。
+            elapsed = time.time() - t_submit
+            if elapsed < eta_s * 0.55:
+                interval = 3.0
+            elif elapsed < eta_s:
+                interval = 1.2
+            else:
+                interval = 0.8
+            await asyncio.sleep(interval * random.uniform(0.85, 1.5))
         if not image_token:
             print(f"[gen] poll timeout after {rounds} rounds "
-                  f"({time.time() - t_submit:.0f}s) last={last[:120]!r}",
+                  f"({time.time() - t_submit:.0f}s) 429x{poll_429} "
+                  f"last={last[:120]!r}",
                   flush=True)
             return JSONResponse(status_code=504,
                                content={"error": f"poll timeout after "
@@ -1039,7 +1095,7 @@ async def generate(req: GenReq):
 
         t_ready = time.time()
         try:
-            med = await _eval(entry, MEDIA_JS, image_token, timeout=120)
+            med = await _eval(entry, MEDIA_JS, image_token, timeout=MEDIA_TIMEOUT_S)
         except Exception as exc:  # noqa: BLE001
             if not _page_dead(exc):
                 raise
@@ -1047,7 +1103,7 @@ async def generate(req: GenReq):
             _retire(entry, f"media: {type(exc).__name__}")
             switched.add(id(entry))
             entry = await acquire_entry(exclude=switched)
-            med = await _eval(entry, MEDIA_JS, image_token, timeout=120)
+            med = await _eval(entry, MEDIA_JS, image_token, timeout=MEDIA_TIMEOUT_S)
         print(f"[gen] poll={t_ready - t_submit:.1f}s rounds={rounds} "
               f"media={time.time() - t_ready:.1f}s "
               f"total={time.time() - t_start:.1f}s", flush=True)

@@ -582,7 +582,10 @@ def test_moderation_maps_to_451():
                       'by content moderation.","code":"moderation"}',
                       "content_policy"))
     assert r.status_code == 451
-    assert b"moderation" in r.body.lower()
+    # 2026-11-17 起不回流上游原文（可能含上游规则/内部标识），
+    # 对外统一 content_policy_violation 文案；原文只进日志。
+    assert b"content rejected by upstream policy" in r.body.lower()
+    assert b"flagged by content moderation" not in r.body.lower()
 
 
 def test_poll_negative_cache_for_moderation(monkeypatch):

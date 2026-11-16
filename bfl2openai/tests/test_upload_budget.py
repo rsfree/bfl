@@ -88,6 +88,9 @@ def sidecar(monkeypatch):
     """sidecar 在线，捕获它实际收到的字节。"""
     monkeypatch.setattr(bec, "configured", lambda: True)
     monkeypatch.setattr(server, "_BROWSER_PRIMARY", True)
+    # 本文件断言的是 composition 的字节布局（canvas 并入 refs），
+    # 2026-11-17 起默认已改为 single，必须显式固定。
+    monkeypatch.setattr(server, "REF_BRANCH", "multi")
     seen: dict = {}
 
     async def fake_generate(**kwargs):

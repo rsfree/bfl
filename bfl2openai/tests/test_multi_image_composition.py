@@ -47,6 +47,9 @@ def seen(monkeypatch):
         return png_bytes((0, 0, 0))
 
     monkeypatch.setattr(server, "_BROWSER_PRIMARY", True)
+    # 分支必须显式固定：2026-11-17 起默认已改为 single（官网分支），
+    # 本文件的用例验证的是 composition 回退分支，不依赖默认值。
+    monkeypatch.setattr(server, "REF_BRANCH", "multi")
     monkeypatch.setattr(bec, "configured", lambda: True)
     monkeypatch.setattr(bec, "generate", fake_generate)
     monkeypatch.setattr(server, "API_KEY", "")
@@ -117,3 +120,85 @@ def test_boxes_with_references_is_rejected(seen):
     assert r.status_code == 400, r.text
     assert "reference images" in r.json()["error"]["message"]
     assert not seen, "拒绝路径不该下发到 sidecar"
+
+
+# ---------------------------------------------------------------- single 分支
+# 2026-11-17 起的默认分支（官网 precise-editing 语义）：canvas 留在 image 部件，
+# 素材走 `reference`(单数) 文件部件，`references` 退化成 id 数组，mode 保持 i2i。
+@pytest.fixture()
+def seen_single(monkeypatch):
+    captured: dict = {}
+
+    async def fake_generate(**kwargs):
+        captured.clear()
+        captured.update(kwargs)
+        return png_bytes((0, 0, 0))
+
+    monkeypatch.setattr(server, "_BROWSER_PRIMARY", True)
+    monkeypatch.setattr(server, "REF_BRANCH", "single")
+    monkeypatch.setattr(bec, "configured", lambda: True)
+    monkeypatch.setattr(bec, "generate", fake_generate)
+    monkeypatch.setattr(server, "API_KEY", "")
+    return captured
+
+
+def test_edits_multi_image_uses_single_branch(seen_single):
+    """有参考图时默认走官网分支：canvas 保留、素材走 reference(单数)。"""
+    client = TestClient(server.app)
+    r = client.post(
+        "/v1/images/edits",
+        files=[
+            ("image", ("canvas.png", png_bytes(), "image/png")),
+            ("image", ("ref.png", png_bytes((40, 40, 200)), "image/png")),
+        ],
+        data={"prompt": "put the blue square next to the red one",
+              "response_format": "b64_json"},
+    )
+    assert r.status_code == 200, r.text
+    assert seen_single["mode"] == "i2i", "官网分支必须保持编辑语义"
+    assert seen_single["image_png"], "canvas 必须留在 image 部件（保真的前提）"
+    assert len(seen_single["refs"]) == 1, "refs 只能放真正的素材，不含 canvas"
+    assert seen_single["ref_mode"] == "single"
+
+
+def test_generations_multi_image_uses_single_branch(seen_single):
+    client = TestClient(server.app)
+    r = client.post("/v1/images/generations", json={
+        "prompt": "merge these two",
+        "image": [data_uri(), data_uri((40, 200, 40))],
+        "response_format": "b64_json",
+    })
+    assert r.status_code == 200, r.text
+    assert seen_single["mode"] == "i2i"
+    assert seen_single["image_png"]
+    assert len(seen_single["refs"]) == 1
+    assert seen_single["ref_mode"] == "single"
+
+
+def test_single_branch_falls_back_to_composition_on_400(seen_single, monkeypatch):
+    """single 被上游拒绝(400/422)时必须降级 composition，不能把 400 甩给客户端。"""
+    calls: list[dict] = []
+
+    async def flaky_generate(**kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise bec.BrowserEgressError("submit 400: invalid reference", 400)
+        return png_bytes((0, 0, 0))
+
+    monkeypatch.setattr(bec, "generate", flaky_generate)
+    client = TestClient(server.app)
+    r = client.post(
+        "/v1/images/edits",
+        files=[
+            ("image", ("canvas.png", png_bytes(), "image/png")),
+            ("image", ("ref.png", png_bytes((40, 40, 200)), "image/png")),
+        ],
+        data={"prompt": "x", "response_format": "b64_json"},
+    )
+    assert r.status_code == 200, r.text
+    assert len(calls) == 2, "应当重试一次"
+    assert calls[0]["ref_mode"] == "single"
+    assert calls[1].get("ref_mode") is None, "降级后的第二次必须走复数字段名"
+    assert calls[1]["mode"] == "t2i"
+    assert calls[1]["image_png"] == b"", "降级后 canvas 要并入 refs"
+    assert len(calls[1]["refs"]) == 2

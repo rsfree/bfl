@@ -65,6 +65,9 @@ def client():
 def bridge(monkeypatch):
     """sidecar 在线；generate 立即返回一张合法 PNG（不碰上游）。"""
     monkeypatch.setattr(bec, "configured", lambda: True)
+    # 必须同时打开浏览器优先：否则请求走 upstream.submit_generation 真打上游，
+    # 本机 IP 一旦被 CF 限流(429 sin1)测试就红，与代码无关（2026-11-17 修）。
+    monkeypatch.setattr(server, "_BROWSER_PRIMARY", True)
     monkeypatch.setattr(native.mps, "configured", lambda: False)
     calls: dict = {}
 

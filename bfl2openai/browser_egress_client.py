@@ -102,8 +102,16 @@ def _post(url: str, payload: dict) -> tuple[int, str]:
 async def generate(image_png: bytes, prompt: str, aspect_ratio: str,
                    resolution: str, mode: str, boxes_json: str | None = None,
                    references_json: str | None = None,
-                   refs: list[bytes] | None = None) -> bytes:
-    """经浏览器 sidecar 完成一次生成，返回图片字节。失败抛 BrowserEgressError。"""
+                   refs: list[bytes] | None = None,
+                   ref_mode: str | None = None) -> bytes:
+    """经浏览器 sidecar 完成一次生成，返回图片字节。失败抛 BrowserEgressError。
+
+    `ref_mode`：
+      None/"multi" -> references(复数) 文件部件，composition 语义（默认）
+      "single"     -> reference(单数) 文件部件 + references 为 id 数组，
+                      官网 precise-editing 分支：canvas 保留为 image 部件，
+                      mode 应为 i2i，素材不被当作画布参与重绘。
+    """
     global _rr
     urls = _endpoints()
     if not urls:
@@ -118,6 +126,7 @@ async def generate(image_png: bytes, prompt: str, aspect_ratio: str,
         "boxes": boxes_json or "[]",
         "references": references_json or "[]",
         "refs": [base64.b64encode(r).decode() for r in (refs or [])],
+        "ref_mode": ref_mode,
     }
 
     order = _order()
