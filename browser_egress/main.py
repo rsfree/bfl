@@ -23,6 +23,7 @@ import base64
 import json
 import os
 import random
+import re
 import time
 
 from fastapi import FastAPI, HTTPException
@@ -59,6 +60,20 @@ BREAKER_COOLDOWN_S = float(
     os.environ.get("BFL2OPENAI_EGRESS_BREAKER_COOLDOWN", "60"))
 #: 429 后该页冷却秒数（出口 IP 配额被打热，短期复用只会继续 429）。
 IP_COOLDOWN_S = float(os.environ.get("BFL2OPENAI_EGRESS_IP_COOLDOWN", "20"))
+#: 单页连续失败的冷却上限。原实现硬编码 3×IP_COOLDOWN_S=60s，8 页同时进
+#: 冷却时 acquire_entry 只能干等到 25s 兜底——池子明明有网络容量，却被自己
+#: 的冷却墙堵死（2026-11-16 实测三台 502 率已到 51~57%）。默认 60s 与旧值
+#: 等价，现网行为不变，需要时再下调。
+IP_COOLDOWN_MAX_S = float(
+    os.environ.get("BFL2OPENAI_EGRESS_IP_COOLDOWN_MAX", "60"))
+#: 全局提交速率（次/秒，0=不限）。CF 侧 429 按 IP+时间窗计，而当前每台常驻
+#: 43~57 条连接、三台约 150 条并发摊在 13 个 /24 上，单 IP 速率是限流的直接
+#: 推手。默认 0 = 关闭，不改变现网行为。注意：2026-11-16 实测饱和模型下，
+#: 降速只缩短排队长度、不提升单次成功率（单次仅 ~22%），优先级低于扩池。
+GLOBAL_RPS = float(os.environ.get("BFL2OPENAI_EGRESS_RPS", "0"))
+#: 出口 IP 采样间隔（秒，0=关闭）。用途：① 把 429 归因到网段；② 捕捉代理
+#: 失效回落直连（2026-11-16 实测 299 次抽样中 1.3% 的出口 = 本机公网 IP）。
+EXIT_IP_SAMPLE_S = float(os.environ.get("BFL2OPENAI_EGRESS_IP_SAMPLE", "60"))
 #: cgroup 内存水位。Chromium 的分配器不会把回收的 context 内存还给内核，
 #: 长时间跑必然单调上涨，到 mem_limit 就被内核 OOM-kill（杀哪组进程不可控）。
 #: 与其等 OOM，不如到水位自己重启整池：soft 只在完全空闲时动手，hard 立即动手。
@@ -69,7 +84,13 @@ app = FastAPI()
 _state: dict = {
     "pool": [], "lock": asyncio.Lock(), "recycle_lock": asyncio.Lock(),
     "browser": None, "pw": None, "sem": None, "total_inflight": 0,
+    # 限速与出口 IP 观测（2026-11-16 增加，不影响原有字段语义）
+    "rps_lock": asyncio.Lock(), "rps_next": 0.0,
+    "exit_ip": None, "exit_ip_local": None,
+    "exit_ip_leak": 0, "exit_ip_samples": 0, "exit_ip_seen": [],
 }
+
+_IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _breaker = {"fails": 0, "opened_until": 0.0, "trips": 0, "last_reason": ""}
 
 SUBMIT_JS = """
@@ -246,21 +267,33 @@ def _parse_proxy(url: str) -> dict | None:
     return cfg
 
 
-def _build_profile(idx: int, version: str) -> dict:
-    """每页一份指纹档案（确定性：同一 idx 稳定，避免同页刷新后画像跳变）。
+def _build_profile(idx: int, version: str, gen: int = 0) -> dict:
+    """每页一份指纹档案。
+
+    gen = 该 page 的会话代次（context 每重建一次 +1）。同一 gen 内同一 idx
+    恒定（避免同页刷新后画像跳变），跨 gen 换一组组合。
+
+    2026-11-16 实测纠正：旧实现直接 idx % len() 取模，PAGES=8 时每个维度都
+    落在低基数上，而 recycle_entry 又复用同一 idx 重建 → 整个容器生命周期
+    只有 8 套固定指纹，等于 8 张面孔跑一整天。
 
     UA 版本必须取真实 Chromium 版本：Chromium 会自动发 sec-ch-ua，
     与 UA 大版本不一致是比 headless 更硬的指纹矛盾。
     """
     major = version.split(".")[0] if version else "156"
-    vw, vh, dpr = _VIEWPORTS[idx % len(_VIEWPORTS)]
-    gl_vendor, gl_renderer = _GL_PROFILES[idx % len(_GL_PROFILES)]
+    # 各维度用互质步长错开，让 (idx, gen) 在 8×3×5×4=480 个组合上铺开；
+    # 同一 gen 内 idx 0..7 仍保证每个维度全覆盖。
+    vw, vh, dpr = _VIEWPORTS[(idx + 2 * gen) % len(_VIEWPORTS)]
+    gl_vendor, gl_renderer = _GL_PROFILES[
+        (2 * idx + gen) % len(_GL_PROFILES)]
+    hw = _HW[(idx + 3 * gen) % len(_HW)]
+    mem = _MEM[(idx + gen) % len(_MEM)]
     return {
         "ua": (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"),
         "vw": vw, "vh": vh, "dpr": dpr,
-        "hw": _HW[idx % len(_HW)],
-        "mem": _MEM[idx % len(_MEM)],
+        "hw": hw,
+        "mem": mem,
         "langs": ["en-US", "en"],
         "glVendor": gl_vendor,
         "glRenderer": gl_renderer,
@@ -287,8 +320,8 @@ DEFUSE_JS = """
 """
 
 
-async def _new_page(browser, idx: int, version: str) -> dict:
-    prof = _build_profile(idx, version)
+async def _new_page(browser, idx: int, version: str, gen: int = 0) -> dict:
+    prof = _build_profile(idx, version, gen)
     ctx = await browser.new_context(
         locale="en-US",
         timezone_id=TZ_ID,
@@ -306,7 +339,8 @@ async def _new_page(browser, idx: int, version: str) -> dict:
     except Exception:  # noqa: BLE001
         pass
     cdp = await ctx.new_cdp_session(pg)
-    entry = {"idx": idx, "ctx": ctx, "page": pg, "cdp": cdp, "profile": prof,
+    entry = {"idx": idx, "gen": gen, "ctx": ctx, "page": pg, "cdp": cdp,
+             "profile": prof,
              "inflight": 0, "submits": 0, "errors": 0, "err_streak": 0,
              "cooldown_until": 0.0, "recycled": 0,
              "eval_lock": asyncio.Lock()}
@@ -455,7 +489,9 @@ async def recycle_entry(entry: dict, *, premarked: bool = False):
             except Exception:  # noqa: BLE001
                 pass
             try:
-                fresh = await _new_page(browser, idx, version)
+                # gen 递增 ⇒ 回收后换一组指纹，不再 8 张面孔跑一整天
+                fresh = await _new_page(browser, idx, version,
+                                        entry.get("gen", 0) + 1)
             except Exception as exc:  # noqa: BLE001
                 # 回收失败（Page.goto ERR_ABORTED / Target crashed）：把坏页
                 # 摘出池子，否则闭页会一直占位，等全部 closed 后
@@ -524,6 +560,67 @@ def _reserve(entry: dict):
 def _release(entry: dict):
     entry["inflight"] = max(0, entry["inflight"] - 1)
     _state["total_inflight"] = max(0, _state["total_inflight"] - 1)
+
+
+async def _curl_ip(*, via_proxy: bool) -> str | None:
+    """取一次出口 IP。via_proxy=False 用于拿本机公网 IP 作对照基线。"""
+    args = ["curl", "-s", "--max-time", "6"]
+    if via_proxy:
+        args += ["--noproxy", "", "-x", "socks5h://127.0.0.1:1080"]
+    args.append("https://api.ipify.org")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except Exception:  # noqa: BLE001 - 采样失败绝不冒到业务路径
+        return None
+    ip = out.decode(errors="replace").strip()
+    return ip if _IP_RE.match(ip) else None
+
+
+async def _detect_local_ip() -> None:
+    """启动时用直连取本机公网 IP，作为「代理失效」的对照基线。"""
+    ip = await _curl_ip(via_proxy=False)
+    if ip:
+        _state["exit_ip_local"] = ip
+        print(f"[pool] local egress ip={ip}", flush=True)
+
+
+async def _sample_exit_ip() -> None:
+    """经代理采一次出口 IP：归因 429 到网段 + 捕捉代理失效回落直连。
+
+    2026-11-16 实测依据：299 次抽样得 122 个不同 IP（Chao1 估计池规模约
+    158），但只有 13 个 /24，其中 38.6.213.0/24 单段塞了 79 个 IP、承担
+    61.5% 流量 —— IP 在换、网段没换，这是「只加 IP 无效」的直接解释。
+    同批抽样中 1.3% 的出口等于本机公网 IP，即代理失效后回落直连。
+    """
+    ip = await _curl_ip(via_proxy=True)
+    if not ip:
+        return
+    _state["exit_ip"] = ip
+    _state["exit_ip_samples"] += 1
+    seen = _state["exit_ip_seen"]
+    seen.append(ip)
+    del seen[:-64]
+    if ip == _state.get("exit_ip_local"):
+        _state["exit_ip_leak"] += 1
+        print(f"[pool] EXIT IP LEAK: 出口={ip} 等于本机公网 IP，"
+              f"该请求绕过了代理", flush=True)
+
+
+async def _rate_wait() -> None:
+    """全局限速令牌桶。GLOBAL_RPS<=0 时零开销直接返回。"""
+    if GLOBAL_RPS <= 0:
+        return
+    interval = 1.0 / GLOBAL_RPS
+    async with _state["rps_lock"]:
+        now = time.time()
+        slot = max(now, _state["rps_next"])
+        _state["rps_next"] = slot + interval
+    delay = slot - time.time()
+    if delay > 0:
+        await asyncio.sleep(delay)
 
 
 async def acquire_entry(exclude: set[int] | None = None) -> dict:
@@ -668,8 +765,18 @@ async def _maintain_pool():
     且已标记时才动手，标记与判定在同一个 tick 内完成（无 await）。
     """
     mem_restarts: list[float] = []
+    last_ip_sample = 0.0
     while True:
         await asyncio.sleep(15)
+        # ---- 出口 IP 采样（低频，走容器内 curl，不占用浏览器 page）----
+        if EXIT_IP_SAMPLE_S > 0 and \
+                time.time() - last_ip_sample >= EXIT_IP_SAMPLE_S:
+            last_ip_sample = time.time()
+            try:
+                await _sample_exit_ip()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[maintain] ip sample error: "
+                      f"{type(exc).__name__}: {str(exc)[:80]}", flush=True)
         try:
             await _fill_pool_gap()
         except Exception as exc:  # noqa: BLE001
@@ -783,7 +890,14 @@ async def healthz():
         "breaker": {"open": _breaker_open(), "trips": _breaker["trips"],
                     "fails": _breaker["fails"],
                     "last_reason": _breaker["last_reason"]},
-        "per_page": [{"idx": e["idx"], "inflight": e["inflight"],
+        "rps_limit": GLOBAL_RPS,
+        "exit_ip": _state.get("exit_ip"),
+        "exit_ip_local": _state.get("exit_ip_local"),
+        "exit_ip_leak": _state.get("exit_ip_leak", 0),
+        "exit_ip_samples": _state.get("exit_ip_samples", 0),
+        "exit_ip_distinct": len(set(_state.get("exit_ip_seen") or [])),
+        "per_page": [{"idx": e["idx"], "gen": e.get("gen", 0),
+                      "inflight": e["inflight"],
                       "submits": e["submits"], "errors": e["errors"],
                       "streak": e["err_streak"],
                       "recycled": e["recycled"],
@@ -802,6 +916,7 @@ async def generate(req: GenReq):
     await ensure_pool()
     sem = _state.get("sem") or asyncio.Semaphore(MAX_INFLIGHT)
     _state["sem"] = sem
+    await _rate_wait()
     await sem.acquire()
     entry: dict | None = None
     switched: set[int] = set()
@@ -813,7 +928,8 @@ async def generate(req: GenReq):
             if entry["err_streak"] >= 3:
                 # 该页连续失败：冷却 + 后台换新会话，避免在同一坏出口反复撞墙
                 bad = entry
-                bad["cooldown_until"] = time.time() + IP_COOLDOWN_S * 3
+                bad["cooldown_until"] = time.time() + min(
+                    IP_COOLDOWN_S * 3, IP_COOLDOWN_MAX_S)
                 _release(entry)
                 switched.add(id(bad))
                 bad["want_recycle"] = True    # 后台任务空闲时换 IP
@@ -979,5 +1095,6 @@ async def _prewarm_generate():
 
 @app.on_event("startup")
 async def _warm():
+    asyncio.create_task(_detect_local_ip())
     asyncio.create_task(_prewarm_generate())
     asyncio.create_task(_maintain_pool())
