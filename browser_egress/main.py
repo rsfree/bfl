@@ -450,11 +450,25 @@ async def _rebind(entry: dict, slot: int) -> None:
     try:
         await ctx.add_init_script(INIT_JS.replace("%PROFILE%", json.dumps(prof)))
         pg = await ctx.new_page()
-        await pg.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+        # wait_until="load" 而不是 domcontentloaded：Vercel 的机器人挑战是页面
+        # 加载后由 JS 完成的，脚本没跑完就提交必然是 403 Access denied
+        # （实测：rebind 后立即 submit 全被拒，同 IP 的老页面却能成功）。
+        await pg.goto(PAGE_URL, wait_until="load", timeout=60000)
         try:
             await pg.evaluate(DEFUSE_JS)
         except Exception:  # noqa: BLE001
             pass
+        # 再留一段静默期，模拟"人打开页面看一眼再点生成"的自然间隔
+        settle = float(os.environ.get("BFL2OPENAI_POOL_REBIND_SETTLE", "3.0"))
+        if settle > 0:
+            for _ in range(int(settle / 0.25)):
+                try:
+                    if await pg.evaluate("document.readyState") == "complete":
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(0.25)
+            await asyncio.sleep(settle)
         cdp = await ctx.new_cdp_session(pg)
     except BaseException:
         # 新 context 建失败必须就地关掉，否则每失败一次泄漏一份渲染进程

@@ -27,6 +27,8 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Iterable
 from urllib.parse import quote
 
@@ -44,6 +46,10 @@ DEFAULT_429_COOLDOWN_S = int(os.environ.get("BFL2OPENAI_POOL_429_COOLDOWN", "600
 #: 建映射时探测出口 IP 的并发度。探测只打 ipify，不消耗上游额度。
 SCAN_CONCURRENCY = int(os.environ.get("BFL2OPENAI_POOL_SCAN_CONCURRENCY", "16"))
 
+#: 上游按「天」计额度，但没公开重置时区。账本必须跟着换日，
+#: 否则第二天一开始所有槽位都还是昨天的用量（TTL 3 天到期才整批消失）。
+DAILY_RESET_TZ = os.environ.get("BFL2OPENAI_POOL_TZ", "UTC")
+
 _DAY_TTL_S = 3 * 24 * 3600
 _PREFIX = "egress:v2"
 
@@ -57,6 +63,18 @@ class PoolNotConfigured(RuntimeError):
 
 
 # --------------------------------------------------------------- 配置
+
+def _today() -> str:
+    """当前「账本日」，按 DAILY_RESET_TZ 计算（默认 UTC）。
+
+    换日只重置 `used` 与 429 计数；`n403` 是出口被封的历史，跨日仍然有效。
+    """
+    try:
+        tz = ZoneInfo(DAILY_RESET_TZ)
+    except Exception:  # noqa: BLE001 - 时区名写错不该把服务打挂
+        tz = ZoneInfo("UTC")
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
 
 def _prefix(ip: str, octets: int = 3) -> str:
     """/24 前缀（IPv4 取前三段）。非 IPv4 原样返回，交由调用方当独立段处理。
@@ -284,7 +302,8 @@ async def _scan_impl(slots: Iterable[int] | None) -> dict[str, Any]:
     for n, ip in results:
         key = _slot_key(n)
         cur = await b.hgetall(key) or {}
-        keep = {"used": cur.get("used", 0),
+        keep = {"day": cur.get("day", ""),
+                "used": cur.get("used", 0),
                 "quota": cur.get("quota", c["quota"]),
                 "soft_quota": cur.get("soft_quota", c["soft_quota"]),
                 "last_used": cur.get("last_used", 0)}
@@ -368,9 +387,12 @@ class Slot:
 
 
 def _to_slot(n: int, d: dict[str, str], default_quota: int) -> Slot:
+    # 跨日：昨天的 used 不算数。用读时归零而不是写时重置，避免
+    # 每个请求都产生一次写。
+    fresh = d.get("day") == _today()
     return Slot(
         slot=n, ip=d.get("ip", ""), state=d.get("state", STATE_ERROR),
-        used=int(d.get("used", 0) or 0),
+        used=int(d.get("used", 0) or 0) if fresh else 0,
         quota=int(d.get("quota", default_quota) or default_quota),
         cool_until=float(d.get("cool_until", 0) or 0),
         n429=int(d.get("n429", 0) or 0),
@@ -450,7 +472,14 @@ async def note_success(slot: int) -> int:
     """一次成功生成：该 IP 用掉 1 次额度，并刷新 last_used（驱动轮询）。"""
     b = _b()
     key = _slot_key(slot)
-    n = await b.hincrby(key, "used", 1)
+    today = _today()
+    d = await b.hgetall(key) or {}
+    if d.get("day") != today:
+        # 当日首单：把用量重新起算（昨天的账不带到今天）
+        await b.hset(key, mapping={"day": today, "used": 1, "n429": 0})
+        n = 1
+    else:
+        n = await b.hincrby(key, "used", 1)
     await b.hset(key, mapping={"last_used": time.time()})
     return n
 
@@ -475,6 +504,9 @@ async def note_rate_limited(slot: int, cooldown_s: int | None = None,
     upd: dict[str, Any] = {"cool_until": int(until)}
     if field != "n403":
         d = await b.hgetall(key) or {}
+        # day 必须一起写：otherwise 读侧会把它当成"昨天的账"归零，
+        # 额度耗尽的标记就失效了（单测抓到的就是这个）。
+        upd["day"] = _today()
         upd["used"] = int(d.get("quota", _cfg()["quota"]) or _cfg()["quota"])
     await b.hset(key, mapping=upd)
     return until
@@ -503,7 +535,8 @@ async def reset_day() -> int:
     b = _b()
     for s in slots:
         await b.hset(_slot_key(s.slot), mapping={
-            "used": 0, "n429": 0, "fail": 0, "cool_until": 0, "last_used": 0})
+            "day": _today(), "used": 0, "n429": 0, "fail": 0,
+            "cool_until": 0, "last_used": 0})
     return len(slots)
 
 

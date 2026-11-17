@@ -307,3 +307,54 @@ def test_403_does_not_inflate_usage(monkeypatch):
     assert not rows[1].available(), "被封后必须退出调度"
     snap = asyncio.run(ep.snapshot())
     assert snap["used_today"] == 1, "今日用量只算真实出图"
+
+
+# ---------------------------------------------------------------- 换日
+def test_used_resets_when_day_changes(monkeypatch):
+    """账本必须按天走：昨天的用量不能算在今天头上。"""
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "1")
+    monkeypatch.setattr(ep, "_probe_ip", _probe_by_slot({"1.1.1.1": [1]}))
+    asyncio.run(ep.scan())
+    for _ in range(5):
+        asyncio.run(ep.note_success(1))
+    assert asyncio.run(ep.list_slots())[0].used == 5
+
+    # 模拟跨日：把 day 改成昨天
+    import asyncio as a2
+    async def age():
+        b = ep._b()
+        d = await b.hgetall(ep._slot_key(1))
+        await b.hset(ep._slot_key(1), mapping={"day": "2000-01-01",
+                                              "used": d.get("used", 0)})
+    a2.run(age())
+
+    rows = asyncio.run(ep.list_slots())
+    assert rows[0].used == 0, "跨日后应归零"
+    assert rows[0].available()
+
+
+def test_403_history_survives_day_change(monkeypatch):
+    """403 是「出口被封」，不是当日额度，跨日不应被抹掉。"""
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "1")
+    monkeypatch.setattr(ep, "_probe_ip", _probe_by_slot({"1.1.1.1": [1]}))
+    asyncio.run(ep.scan())
+    asyncio.run(ep.note_rate_limited(1, field="n403"))
+
+    async def age():
+        b = ep._b()
+        await b.hset(ep._slot_key(1), mapping={"day": "2000-01-01"})
+    asyncio.run(age())
+
+    rows = asyncio.run(ep.list_slots())
+    assert rows[0].n403 == 1, "封禁历史要保留"
+    assert not rows[0].available(), "冷却未到期前仍不可用"
+
+
+def test_tz_is_configurable(monkeypatch):
+    monkeypatch.setenv("BFL2OPENAI_POOL_TZ", "Asia/Shanghai")
+    import importlib
+    importlib.reload(ep)
+    d = ep._today()
+    assert len(d) == 10 and d[4] == "-" and d[7] == "-"
