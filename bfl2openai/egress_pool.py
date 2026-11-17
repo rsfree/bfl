@@ -435,6 +435,12 @@ async def list_slots(scope: str = "primary") -> list[Slot]:
     return [_to_slot(n, d, c["quota"]) for n, d in zip(nums, res) if d]
 
 
+async def get_slot(n: int) -> Slot | None:
+    """按编号取单个槽位（黏性调度用）。"""
+    d = await _b().hgetall(_slot_key(n))
+    return _to_slot(n, d, _cfg()["quota"]) if d else None
+
+
 async def acquire(*, exclude: Iterable[int] = ()) -> Slot | None:
     """取下一个槽位：**按 /24 分段的轮询（两级 LRU）**。
 

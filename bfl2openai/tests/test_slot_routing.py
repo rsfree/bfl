@@ -92,6 +92,7 @@ def test_429_rotates_to_another_slot(monkeypatch):
 
     monkeypatch.setattr(bec, "generate", fake_generate)
 
+    server._STICKY["slot"] = 0
     out = asyncio.run(server._browser_generate(prompt="x"))
     assert out == b"PNG"
     assert len(calls) == 2, "429 之后必须换槽重试"
@@ -242,3 +243,29 @@ def test_403_also_rotates(monkeypatch):
     assert all(b.n403 == 1 for b in blocked), "403 计入 n403"
     assert all(b.n429 == 0 for b in blocked), "403 不该记进 429 计数"
     assert all(b.used == 0 for b in blocked), "403 不消耗额度，今日用量要真实"
+
+
+def test_sticky_slot_reuses_until_exhausted(monkeypatch):
+    """同一 worker 应复用同一出口，避免每请求都重建 context（Vercel 挑战代价）。"""
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "3")
+    monkeypatch.setattr(server, "_STICKY", {"slot": 0})
+    monkeypatch.delenv("BFL2OPENAI_POOL_QUOTA", raising=False)
+    monkeypatch.setenv("BFL2OPENAI_POOL_SOFT_QUOTA", "2")
+
+    async def fake_probe(slot, timeout=12.0):
+        return {1: "1.1.1.1", 2: "2.2.2.2", 3: "3.3.3.3"}[slot]
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+
+    calls: list[int] = []
+
+    async def fake_generate(proxy_slot=None, **kw):
+        calls.append(proxy_slot)
+        return b"PNG"
+
+    monkeypatch.setattr(bec, "generate", fake_generate)
+    for _ in range(4):
+        asyncio.run(server._browser_generate(prompt="x"))
+    assert calls[0] == calls[1], "前两次必须复用同一槽位"
+    assert calls[0] != calls[2], "用满停手点后必须换槽"

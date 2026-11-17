@@ -551,6 +551,25 @@ async def _egress_mode_mw(request: Request, call_next):
         _EGRESS_MODE.reset(tok)
 
 
+#: 进程内黏性槽位：同一个 worker 反复用同一个出口，直到它没额度。
+#: 为什么黏：换槽位就要重建 context，而 Vercel 挑战只对"活了一会儿的页面"
+#: 放行。实测每次请求都换槽 → 延迟 31~98s；黏住之后页面是热的。
+#: 代价：并发出口数 ≈ worker 数（6），但每个槽位仍按额度轮转，总吞吐不变。
+_STICKY: dict[str, int] = {"slot": 0}
+
+
+async def _next_slot(exclude: set[int]):
+    cur = _STICKY["slot"]
+    if cur and cur not in exclude:
+        s = await egress_pool.get_slot(cur)
+        if s is not None and s.available():
+            return s
+    s = await egress_pool.acquire(exclude=exclude)
+    if s is not None:
+        _STICKY["slot"] = s.slot
+    return s
+
+
 async def _browser_generate(**kwargs) -> bytes:
     """经侧车生成，并**把成败记到出口 IP 头上**。
 
@@ -577,7 +596,7 @@ async def _browser_generate(**kwargs) -> bytes:
     tried: set[int] = set()
     last: browser_egress_client.BrowserEgressError | None = None
     for _ in range(_SLOT_ATTEMPTS):
-        slot = await egress_pool.acquire(exclude=tried)
+        slot = await _next_slot(tried)
         if slot is None:
             # 全部槽位额度耗尽/冷却中：429 比 502 更接近真相
             raise browser_egress_client.BrowserEgressError(
