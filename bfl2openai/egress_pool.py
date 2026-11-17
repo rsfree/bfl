@@ -322,7 +322,9 @@ async def _scan_impl(slots: Iterable[int] | None) -> dict[str, Any]:
             await b.hset(key, mapping={
                 "ip": ip, "state": STATE_PRIMARY, "prefix": _prefix(ip),
                 "dup_of": 0, **keep})
-        await b.expire(key, _DAY_TTL_S)
+        # 不给槽位记录设 TTL：Redis 的 maxmemory-policy=volatile-ttl 会优先
+        # 淘汰带过期时间的 key，实测 588 个槽位被清到 471。跨日重置由 day
+        # 字段负责，这里不需要 TTL。
 
     await b.hset(_meta_key(), mapping={
         "built_at": int(time.time()),

@@ -358,3 +358,21 @@ def test_tz_is_configurable(monkeypatch):
     importlib.reload(ep)
     d = ep._today()
     assert len(d) == 10 and d[4] == "-" and d[7] == "-"
+
+
+def test_scan_does_not_set_ttl_on_slot_keys(monkeypatch):
+    """槽位记录不能带 TTL：volatile-ttl 策略下会优先被 Redis 淘汰。"""
+    import asyncio
+    calls = []
+
+    class Spy(ep._Memory):
+        async def expire(self, key, ttl):
+            calls.append((key, ttl))
+
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "2")
+    monkeypatch.setattr(ep, "_probe_ip", _probe_by_slot({"1.1.1.1": [1],
+                                                          "2.2.2.2": [2]}))
+    ep.reset_backend()
+    ep._backend = Spy()
+    asyncio.run(ep.scan())
+    assert not [c for c in calls if "slot:" in c[0]], "槽位 key 不得设 TTL"
