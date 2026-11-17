@@ -130,13 +130,25 @@ def test_acquire_alternates_subnets(monkeypatch):
     asyncio.run(ep.scan())
 
     segs = []
-    for _ in range(4):
+    for _ in range(8):
         s = asyncio.run(ep.acquire())
         segs.append(ep._prefix(s.ip))
         asyncio.run(ep.note_success(s.slot))
     for a, b in zip(segs, segs[1:]):
         assert a != b, f"相邻两次落在同一网段：{segs}"
     assert len(set(segs)) == 2, "四个槽位两个段，应严格交替"
+
+
+def test_acquire_does_not_bias_by_prefix_name(monkeypatch):
+    """时间戳相同时不得按段名排序 —— 否则会一直从字母序最小的段开打。"""
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "4")
+    monkeypatch.setattr(ep, "_probe_ip", _probe_by_slot({
+        "1.1.1.1": [1], "1.1.1.2": [2],
+        "9.9.9.1": [3], "9.9.9.2": [4]}))
+    asyncio.run(ep.scan())
+    picks = {asyncio.run(ep.acquire()).seg for _ in range(40)}
+    assert picks == {"1.1.1", "9.9.9"}, "两个段都必须被抽到，不能只打 1.1.1"
 
 
 def test_hset_always_uses_mapping_kwarg():

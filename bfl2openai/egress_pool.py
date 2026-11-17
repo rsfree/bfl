@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -433,11 +434,16 @@ async def acquire(*, exclude: Iterable[int] = ()) -> Slot | None:
     by_seg: dict[str, list[Slot]] = {}
     for s in cand:
         by_seg.setdefault(s.seg, []).append(s)
-    # 段级时间戳取组内最大值（最近一次用过），越小越该轮到它
+    # 段级时间戳取组内最大值（最近一次用过），越小越该轮到它。
+    # 同年龄的段**随机**挑，不能按名字排 —— 否则会从字母序最小的段开始
+    # 逐个打过去，一头撞死在同一个坏 C 段里（实测 142.4.107.* 连续 18 次 403）。
     seg_last = {seg: max(x.last_used for x in g) for seg, g in by_seg.items()}
-    best_seg = min(seg_last, key=lambda seg: (seg_last[seg], seg))
-    group = sorted(by_seg[best_seg], key=lambda s: (s.last_used, s.slot))
-    return group[0]
+    oldest = min(seg_last.values())
+    ties = [seg for seg, ts in seg_last.items() if ts == oldest]
+    best_seg = random.choice(ties)
+    group = by_seg[best_seg]
+    floor = min(x.last_used for x in group)
+    return random.choice([x for x in group if x.last_used == floor])
 
 
 async def note_success(slot: int) -> int:
