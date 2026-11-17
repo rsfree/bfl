@@ -72,11 +72,18 @@ services:
       - "127.0.0.1:39100:8000"           # 仅回环；公网入口走 bfl.1task.cn（nginx）
     environment:
       REDIS_URL: redis://redis:6379/0   # 跨 worker 状态外置（见 store.py）
-      GUNICORN_WORKERS: "3"             # 多 worker 依赖上面的 Redis
-      # 满载：上游 showcase key 全局并发槽 = 50，3 worker x 16 = 48，留 2 槽余量。
-      # ⚠️ 2026-10-23 用户明确要求「并发拉满，不降级」——不再用 12 的保守值。
-      #    代价要清楚：48/50 意味着自身流量一冲高就会打出 503「50 of 50 slots in use」，
-      #    该现象在 ai-prod 时期单小时曾致成功率跌至 68.7%（见 reports/…success-rate…）。
+      # 2026-11-17：3 -> 6。实测（18:30）：3 worker 每进程 RSS ~640MB（site-packages
+      # 仅 102MB，其余是 PIL/base64 处理大图后的分配器高水位，不归还 OS），
+      # 单容器 1.86GB；同时在途只有 3~4 个请求、容器 CPU 12% —— 说明卡的是上游
+      # 而不是 worker 数，加 worker 买的是「突发时多接几个」和 CPU 并行度，
+      # 不是吞吐翻倍。8 核留 2 核给 3 个 Chromium sidecar，故取 6。
+      GUNICORN_WORKERS: "6"
+      # ⚠️ 这条只对非浏览器路径（upstream.py 的 _SUBMIT_SEM）生效；当前
+      # BFL2OPENAI_BROWSER_PRIMARY=1，线上根本不走那条代码，并发上限实际由
+      # 三个 sidecar 的 BFL2OPENAI_EGRESS_MAX_INFLIGHT=20 决定（3x20=60）。
+      # 所以调 worker 数不会动上游 50 槽的预算，无需重新平衡这个值。
+      # 历史（2026-10-23）：曾按「3 worker x 16 = 48，留 2 槽」配，代价是流量
+      # 冲高会打出 503「50 of 50 slots in use」，ai-prod 时期单小时成功率跌至 68.7%。
       BFL2OPENAI_SUBMIT_CONCURRENCY: "${BFL2OPENAI_SUBMIT_CONCURRENCY:-16}"
       # 浏览器出口：地址必须与下面 sidecar 的静态 IP 一致（Docker 内嵌 DNS
       # 在容器重建后会缓存旧 IP，实测导致 connection refused，故用固定 IP）。
@@ -94,7 +101,10 @@ services:
       options:
         max-size: "50m"
         max-file: "2"
-    mem_limit: 4g
+    # 6 worker x ~640MB ≈ 3.8GB，留 1.2GB 给突发大图（6 路同时在处理 6~9MB body
+    # 时每路会多占用几十到上百 MB）。宿主机 15GB，sidecar 约 6.6GB，别超过 5g，
+    # 否则一旦真的吃满会把 Chromium 挤到 OOM。
+    mem_limit: 5g
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
       interval: 30s
