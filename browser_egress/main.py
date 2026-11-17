@@ -1176,8 +1176,12 @@ async def generate(req: GenReq):
             entry["err_streak"] += 1
             body = sub["body"][:200]
             if sub["status"] == 403:
-                # 三个出口都 403 才算一次"上游在拒绝浏览器"（单个坏 IP 不算）
-                _breaker_on_block("403 access_denied (browser)")
+                # 三个出口都 403 才算一次"上游在拒绝浏览器"（单个坏 IP 不算）。
+                # pin 模式下不熔断：403 只说明**这一个**出口被拒，上层会换槽；
+                # 在这里熔断会把"某个 IP 被封"放大成"全站停止出图"（实测
+                # 3 次 403 后所有请求 0.13s 直接 502）。
+                if want_slot is None:
+                    _breaker_on_block("403 access_denied (browser)")
                 entry["cooldown_until"] = time.time() + IP_COOLDOWN_S
             # 429 必须原样上报。折叠成 502 会让上层把"配额耗尽、应当退避"误判成
             # "服务故障、立即重试"，单小时能放大出数百次无效重试（2026-11-17 实测）。
