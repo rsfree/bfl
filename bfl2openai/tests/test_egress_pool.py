@@ -394,3 +394,34 @@ def test_throttle_does_not_burn_quota(monkeypatch):
     assert not s.available(), "冷却期内不可用"
     snap = asyncio.run(ep.snapshot())
     assert snap["used_today"] == 1
+
+
+def test_throttle_cooldown_backs_off(monkeypatch):
+    """连续被限速要指数退避：实测单个 IP 12 分钟仍未恢复，固定 90s 会反复撞墙。"""
+    import asyncio, time
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "1")
+    monkeypatch.setenv("BFL2OPENAI_POOL_THROTTLE_BASE", "120")
+    monkeypatch.setenv("BFL2OPENAI_POOL_THROTTLE_MAX", "1800")
+    monkeypatch.setattr(ep, "_probe_ip", _probe_by_slot({"1.1.1.1": [1]}))
+    asyncio.run(ep.scan())
+
+    gaps = []
+    for _ in range(6):
+        until = asyncio.run(ep.note_throttled(1))
+        gaps.append(int(until - time.time()))
+    assert gaps[0] <= 121
+    assert gaps[1] > gaps[0], "第二次必须更久"
+    assert gaps[-1] <= 1800, "不得超过上限"
+    assert gaps == sorted(gaps), f"应单调递增：{gaps}"
+
+
+def test_success_resets_throttle_backoff(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "1")
+    monkeypatch.setattr(ep, "_probe_ip", _probe_by_slot({"1.1.1.1": [1]}))
+    asyncio.run(ep.scan())
+    asyncio.run(ep.note_throttled(1))
+    asyncio.run(ep.note_throttled(1))
+    asyncio.run(ep.note_success(1))
+    rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
+    assert rows[1].nthrottle == 0, "出图成功后退避计数要清零"

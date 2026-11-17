@@ -500,11 +500,12 @@ async def note_success(slot: int) -> int:
     d = await b.hgetall(key) or {}
     if d.get("day") != today:
         # 当日首单：把用量重新起算（昨天的账不带到今天）
-        await b.hset(key, mapping={"day": today, "used": 1, "n429": 0})
+        await b.hset(key, mapping={"day": today, "used": 1,
+                                   "n429": 0, "nthrottle": 0})
         n = 1
     else:
         n = await b.hincrby(key, "used", 1)
-    await b.hset(key, mapping={"last_used": time.time()})
+    await b.hset(key, mapping={"last_used": time.time(), "nthrottle": 0})
     return n
 
 
@@ -543,12 +544,19 @@ async def note_throttled(slot: int, cooldown_s: int | None = None) -> float:
     自愈，没有任何时区零点落在这个区间。把这种 429 记成"当日额度耗尽"
     会让好 IP 被白白扔掉 10 分钟以上。
     """
-    cd = int(os.environ.get("BFL2OPENAI_POOL_THROTTLE_COOLDOWN", "90")) \
-        if cooldown_s is None else cooldown_s
-    until = time.time() + cd
     b = _b()
     key = _slot_key(slot)
-    await b.hincrby(key, "nthrottle", 1)
+    n = await b.hincrby(key, "nthrottle", 1)
+    if cooldown_s is None:
+        # 指数退避：实测单个 IP 被 Vercel 边缘限速后，12 分钟仍未恢复
+        # （重启容器换 context 也无效 ⇒ 限速绑 IP 而非会话）。固定 90s
+        # 会让它反复撞墙，所以每撞一次翻倍，上限 30 分钟。
+        base = int(os.environ.get("BFL2OPENAI_POOL_THROTTLE_BASE", "120"))
+        cap = int(os.environ.get("BFL2OPENAI_POOL_THROTTLE_MAX", "1800"))
+        cd = min(base * (2 ** (n - 1)), cap)
+    else:
+        cd = cooldown_s
+    until = time.time() + cd
     await b.hset(key, mapping={"cool_until": int(until)})
     return until
 
