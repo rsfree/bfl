@@ -76,8 +76,8 @@ async def api_quota(request: Request):
 async def api_scan(request: Request):
     """重建槽位→IP 映射（后台执行，就地消除碰撞，不清零既有用量）。"""
     _check(request)
-    if not egress_pool.configured():
-        raise HTTPException(status_code=400, detail="pool not configured")
+    if not egress_pool._has_creds():
+        raise HTTPException(status_code=400, detail="pool credentials missing")
     st = await egress_pool.scan_status()
     if st["running"]:
         return {"ok": False, "running": True, "started": st["started"]}

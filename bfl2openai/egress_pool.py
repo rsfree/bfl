@@ -111,6 +111,19 @@ def _cfg() -> dict[str, Any]:
     }
 
 
+def _has_creds() -> bool:
+    """只判断"有没有池凭证"，与全局开关无关（扫描/灰度用）。"""
+    c = _cfg()
+    return bool(c["host"] and c["password"])
+
+
+def _scan_slots() -> int:
+    """扫描号段上限。与全局开关解耦：全局关闭时仍要能重建映射给灰度用。"""
+    # 注意 "0" 是 truthy：必须先转 int 再判空，否则配置为空时会拿到 0
+    raw = int(os.environ.get("BFL2OPENAI_POOL_SCAN_SLOTS") or 0)
+    return raw or _cfg()["slots"] or 3000
+
+
 def configured() -> bool:
     c = _cfg()
     return bool(c["host"] and c["password"] and c["slots"] > 0)
@@ -250,8 +263,8 @@ async def scan(slots: Iterable[int] | None = None) -> dict[str, Any]:
     - 探测失败标 `error`（保留配额字段，便于人工重扫）
     - 已存在当日用量的槽位**不清零**（重扫不能把已消耗的额度抹掉）
     """
-    if not configured():
-        raise PoolNotConfigured("BFL2OPENAI_POOL_HOST / _PASS / _SLOTS 未配置")
+    if not _has_creds():
+        raise PoolNotConfigured("BFL2OPENAI_POOL_HOST / _PASS 未配置")
     b0 = _b()
     st = await b0.hgetall(_meta_key()) or {}
     # 扫描状态必须放 Redis：gunicorn 6 个 worker，进程内变量互相看不见，
@@ -284,7 +297,8 @@ async def scan_status() -> dict:
 
 async def _scan_impl(slots: Iterable[int] | None) -> dict[str, Any]:
     c = _cfg()
-    want = list(slots) if slots is not None else list(range(1, c["slots"] + 1))
+    n = _scan_slots()
+    want = list(slots) if slots is not None else list(range(1, n + 1))
 
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
 
