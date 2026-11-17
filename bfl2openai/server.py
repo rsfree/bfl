@@ -589,6 +589,7 @@ def _release(n: int) -> None:
 
 
 def _has_room(n: int) -> bool:
+    """进程内快速预筛（只用于跳过明显满载的槽位，真正的判定靠租约）。"""
     return _INFLIGHT.get(n, 0) < _SLOT_CAP
 
 
@@ -597,7 +598,8 @@ async def _next_slot(exclude: set[int]):
     cur = _STICKY["slot"]
     if cur and cur not in exclude and _has_room(cur):
         s = await egress_pool.get_slot(cur)
-        if s is not None and s.available():
+        if s is not None and s.available() \
+                and await egress_pool.try_lease(s.slot, _SLOT_CAP):
             _take(s.slot)
             return s
 
@@ -607,7 +609,8 @@ async def _next_slot(exclude: set[int]):
         if n in exclude or not _has_room(n):
             continue
         s = await egress_pool.get_slot(n)
-        if s is not None and s.available():
+        if s is not None and s.available() \
+                and await egress_pool.try_lease(s.slot, _SLOT_CAP):
             _STICKY["slot"] = n
             _take(s.slot)
             return s
@@ -618,17 +621,18 @@ async def _next_slot(exclude: set[int]):
         s = await egress_pool.acquire(exclude=ex)
         if s is None:
             break
-        if _has_room(s.slot):
+        if _has_room(s.slot) and await egress_pool.try_lease(s.slot, _SLOT_CAP):
             _STICKY["slot"] = s.slot
             _take(s.slot)
             return s
         ex.add(s.slot)
     # 全部满载：退回任意可用槽位。宁可轻度超发，也不要因为"没余量"直接 429。
     s = await egress_pool.acquire(exclude=exclude)
-    if s is not None:
+    if s is not None and await egress_pool.try_lease(s.slot, _SLOT_CAP):
         _STICKY["slot"] = s.slot
         _take(s.slot)
-    return s
+        return s
+    return None
 
 
 #: 上游「当日额度耗尽」的报文特征。只有命中这些才算当天废掉，
@@ -697,6 +701,7 @@ async def _browser_generate(**kwargs) -> bytes:
             raise
         finally:
             _release(slot.slot)
+            await egress_pool.drop_lease(slot.slot)
         await egress_pool.note_success(slot.slot)
         return data
     raise last or browser_egress_client.BrowserEgressError(

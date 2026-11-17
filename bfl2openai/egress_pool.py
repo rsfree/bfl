@@ -537,6 +537,34 @@ async def note_rate_limited(slot: int, cooldown_s: int | None = None,
     return until
 
 
+async def try_lease(slot: int, cap: int = 1, ttl_s: int = 180) -> bool:
+    """跨 worker 的槽位并发租约。
+
+    为什么必须跨进程：进程内计数器在 6 个 gunicorn worker 之间各算各的，
+    实测 12 并发下有 4 个槽位被同时压了 2-3 个请求 —— 单 IP 超 3.5 发/分钟
+    就会被边缘限速。
+
+    用 HINCRBY 的返回值做原子判定（Redis 单线程，跨进程天然一致）；
+    计数归零不删 key，让 TTL 自己回收，进程被杀造成的泄漏最多持续 ttl_s。
+    """
+    b = _b()
+    key = f"{_PREFIX}:lease:{slot}"
+    v = await b.hincrby(key, "n", 1)
+    if v == 1:
+        await b.expire(key, ttl_s)
+    if v > cap:
+        await b.hincrby(key, "n", -1)
+        return False
+    return True
+
+
+async def drop_lease(slot: int) -> None:
+    try:
+        await _b().hincrby(f"{_PREFIX}:lease:{slot}", "n", -1)
+    except Exception:  # noqa: BLE001 - 释放失败交给 TTL 兜底
+        pass
+
+
 async def note_throttled(slot: int, cooldown_s: int | None = None) -> float:
     """短窗限流：只让出口歇一会儿，**不扣额度、不当成当天废掉**。
 

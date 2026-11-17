@@ -425,3 +425,19 @@ def test_success_resets_throttle_backoff(monkeypatch):
     asyncio.run(ep.note_success(1))
     rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
     assert rows[1].nthrottle == 0, "出图成功后退避计数要清零"
+
+
+def test_lease_is_global_not_per_process(monkeypatch):
+    """租约必须跨进程生效：12 并发下不能有槽位被压 2-3 个请求。"""
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "1")
+    monkeypatch.setattr(ep, "_probe_ip", _probe_by_slot({"1.1.1.1": [1]}))
+    asyncio.run(ep.scan())
+
+    async def grab():
+        return [await ep.try_lease(1, 1) for _ in range(3)]
+
+    got = asyncio.run(grab())
+    assert got == [True, False, False], f"同一槽位只该拿到 1 个租约，实际 {got}"
+    asyncio.run(ep.drop_lease(1))
+    assert asyncio.run(ep.try_lease(1, 1)) is True, "释放后应可再租"
