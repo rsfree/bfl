@@ -341,3 +341,49 @@ def test_daily_quota_vs_short_throttle(monkeypatch):
     rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
     burned = [r for r in rows.values() if r.used == r.quota]
     assert burned, "日额度耗尽必须标记为当天不可用"
+
+
+def test_concurrent_requests_spread_across_slots(monkeypatch):
+    """并发必须摊到不同 IP：单 IP 跑 2 个并发就可能被边缘限速。"""
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "6")
+    monkeypatch.setattr(server, "_STICKY", {"slot": 0})
+    monkeypatch.setattr(server, "_INFLIGHT", {})
+    monkeypatch.setattr(server, "_SLOT_CAP", 1)
+    monkeypatch.setattr(server, "_PREBIND", [])
+    monkeypatch.setattr(server, "_OFFSET", 0)
+
+    async def fake_probe(slot, timeout=12.0):
+        return f"10.0.0.{slot}"
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+
+    async def grab_many():
+        return [await server._next_slot(set()) for _ in range(4)]
+
+    picked = asyncio.run(grab_many())
+    slots = [s.slot for s in picked]
+    assert len(set(slots)) == 4, f"4 个并发应落在 4 个不同槽位，实际 {slots}"
+
+
+def test_prebind_order_differs_per_worker(monkeypatch):
+    """不同 worker 的预绑定起点必须错开，否则 6 个 worker 全压第一个 IP。"""
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "8")
+    monkeypatch.setattr(server, "_INFLIGHT", {})
+    monkeypatch.setattr(server, "_SLOT_CAP", 1)
+    monkeypatch.setattr(server, "_PREBIND", [1, 2, 3, 4])
+
+    async def fake_probe(slot, timeout=12.0):
+        return f"10.0.0.{slot}"
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+
+    picks = []
+    for off in range(4):
+        monkeypatch.setattr(server, "_STICKY", {"slot": 0})
+        monkeypatch.setattr(server, "_OFFSET", off)
+        picks.append(asyncio.run(server._next_slot(set())).slot)
+    assert len(set(picks)) == 4, f"4 个偏移应选中 4 个不同槽位，实际 {picks}"

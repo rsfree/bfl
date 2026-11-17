@@ -565,25 +565,69 @@ _PREBIND: list[int] = [int(x) for x in
                        if x.strip().isdigit()]
 
 
+#: 单槽位并发上限。实测单个 IP 只要约 3.5 发/分钟就会被 Vercel 边缘限速，
+#: 而一次生成约 20s ⇒ 一个 IP 同时只该跑 1 个请求。
+#: 并发要靠**摊到不同 IP** 拿到，不是靠一个 IP 硬扛。
+_SLOT_CAP = int(os.environ.get("BFL2OPENAI_SLOT_INFLIGHT", "1"))
+_INFLIGHT: dict[int, int] = {}
+
+#: 每个 worker 从预绑定列表的不同位置起扫。不这么做的话 6 个 worker 会全部
+#: 从第一个元素开始，集体压在同一 IP 上（实测 6 并发即触发边缘限速）。
+_OFFSET = (os.getpid() + int(os.environ.get("BFL2OPENAI_SLOT_OFFSET", "0"))) % 997
+
+
+def _take(n: int) -> None:
+    _INFLIGHT[n] = _INFLIGHT.get(n, 0) + 1
+
+
+def _release(n: int) -> None:
+    v = _INFLIGHT.get(n, 0) - 1
+    if v <= 0:
+        _INFLIGHT.pop(n, None)
+    else:
+        _INFLIGHT[n] = v
+
+
+def _has_room(n: int) -> bool:
+    return _INFLIGHT.get(n, 0) < _SLOT_CAP
+
+
 async def _next_slot(exclude: set[int]):
-    # 1) 当前黏住的槽位
+    # 1) 当前黏住的槽位（前提是还有并发余量）
     cur = _STICKY["slot"]
-    if cur and cur not in exclude:
+    if cur and cur not in exclude and _has_room(cur):
         s = await egress_pool.get_slot(cur)
         if s is not None and s.available():
+            _take(s.slot)
             return s
-    # 2) 预绑定槽位（启动时已经热好，优先吃掉这部分容量）
-    for n in _PREBIND:
-        if n in exclude:
+
+    # 2) 预绑定槽位：从本 worker 专属的偏移开始，避免惊群
+    order = _PREBIND[_OFFSET % len(_PREBIND):] + _PREBIND[:_OFFSET % len(_PREBIND)]         if _PREBIND else []
+    for n in order:
+        if n in exclude or not _has_room(n):
             continue
         s = await egress_pool.get_slot(n)
         if s is not None and s.available():
             _STICKY["slot"] = n
+            _take(s.slot)
             return s
-    # 3) 正常轮转
+
+    # 3) 正常轮转：先找还有并发余量的
+    ex = set(exclude)
+    for _ in range(8):
+        s = await egress_pool.acquire(exclude=ex)
+        if s is None:
+            break
+        if _has_room(s.slot):
+            _STICKY["slot"] = s.slot
+            _take(s.slot)
+            return s
+        ex.add(s.slot)
+    # 全部满载：退回任意可用槽位。宁可轻度超发，也不要因为"没余量"直接 429。
     s = await egress_pool.acquire(exclude=exclude)
     if s is not None:
         _STICKY["slot"] = s.slot
+        _take(s.slot)
     return s
 
 
@@ -651,6 +695,8 @@ async def _browser_generate(**kwargs) -> bytes:
                 continue
             await egress_pool.note_failure(slot.slot)
             raise
+        finally:
+            _release(slot.slot)
         await egress_pool.note_success(slot.slot)
         return data
     raise last or browser_egress_client.BrowserEgressError(
