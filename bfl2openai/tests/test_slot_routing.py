@@ -87,7 +87,9 @@ def test_429_rotates_to_another_slot(monkeypatch):
     async def fake_generate(proxy_slot=None, **kw):
         calls.append(proxy_slot)
         if len(calls) == 1:
-            raise bec.BrowserEgressError("browser egress 429: quota", 429)
+            raise bec.BrowserEgressError(
+            'browser egress 429: {"error":"You\'ve used today\'s 30 free '
+            'generations. Please come back tomorrow."}', 429)
         return b"PNG"
 
     monkeypatch.setattr(bec, "generate", fake_generate)
@@ -115,7 +117,9 @@ def test_all_slots_exhausted_maps_to_429(monkeypatch):
     asyncio.run(ep.scan())
 
     async def always_429(proxy_slot=None, **kw):
-        raise bec.BrowserEgressError("browser egress 429: quota", 429)
+        raise bec.BrowserEgressError(
+            'browser egress 429: {"error":"You\'ve used today\'s 30 free '
+            'generations. Please come back tomorrow."}', 429)
 
     monkeypatch.setattr(bec, "generate", always_429)
     with pytest.raises(bec.BrowserEgressError) as ei:
@@ -290,3 +294,50 @@ def test_prebind_slots_are_preferred(monkeypatch):
         picked.append(s.slot)
         asyncio.run(ep.note_success(s.slot))
     assert picked[0] in (7, 9), f"应优先选预绑定槽位，实际 {picked}"
+
+
+def test_daily_quota_vs_short_throttle(monkeypatch):
+    """只有报文里带「free generations」才算当日额度耗尽。"""
+    import asyncio
+
+    async def fake_probe(slot, timeout=12.0):
+        return {1: "1.1.1.1", 2: "2.2.2.2"}[slot]
+
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "2")
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+    monkeypatch.setattr(server, "_STICKY", {"slot": 0})
+
+    calls = []
+
+    async def throttle_then_ok(proxy_slot=None, **kw):
+        calls.append(proxy_slot)
+        if len(calls) == 1:
+            raise bec.BrowserEgressError("browser egress 429: slow down", 429)
+        return b"PNG"
+
+    monkeypatch.setattr(bec, "generate", throttle_then_ok)
+    assert asyncio.run(server._browser_generate(prompt="x")) == b"PNG"
+    rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
+    first = rows[calls[0]]
+    assert first.used == 0, "短窗限流不能烧额度"
+    assert first.nthrottle == 1
+
+    # 真额度耗尽：走 note_rate_limited，置 used=quota
+    monkeypatch.setattr(server, "_STICKY", {"slot": 0})
+    calls.clear()
+
+    async def quota(proxy_slot=None, **kw):
+        calls.append(proxy_slot)
+        raise bec.BrowserEgressError(
+            'browser egress 429: {"error":"You\'ve used today\'s 30 free '
+            'generations. Please come back tomorrow."}', 429)
+
+    monkeypatch.setattr(bec, "generate", quota)
+    try:
+        asyncio.run(server._browser_generate(prompt="x"))
+    except bec.BrowserEgressError:
+        pass
+    rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
+    burned = [r for r in rows.values() if r.used == r.quota]
+    assert burned, "日额度耗尽必须标记为当天不可用"

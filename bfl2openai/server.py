@@ -587,6 +587,16 @@ async def _next_slot(exclude: set[int]):
     return s
 
 
+#: 上游「当日额度耗尽」的报文特征。只有命中这些才算当天废掉，
+#: 其余 429 一律按短窗限流处理（歇 90s 再试）。
+_DAILY_QUOTA_HINTS = ("free generation", "come back tomorrow", "today's 30")
+
+
+def _is_daily_quota(exc) -> bool:
+    text = str(exc).lower()
+    return any(h in text for h in _DAILY_QUOTA_HINTS)
+
+
 async def _browser_generate(**kwargs) -> bytes:
     """经侧车生成，并**把成败记到出口 IP 头上**。
 
@@ -625,6 +635,13 @@ async def _browser_generate(**kwargs) -> bytes:
         except browser_egress_client.BrowserEgressError as exc:
             # 429（额度/限流）与 403（出口被拒）都是"这个 IP 今天别再用"，
             # 处置一致：标记冷却 + 换下一个槽位。区别只在计数口径。
+            if exc.status == 429 and not _is_daily_quota(exc):
+                # 短窗限流：歇一会儿还能用，不能按「当天废了」处理
+                await egress_pool.note_throttled(slot.slot)
+                log.warning("slot %03d ip=%s throttled (short window), rotating",
+                            slot.slot, slot.ip)
+                last = exc
+                continue
             if exc.status in (429, 403):
                 await egress_pool.note_rate_limited(
                     slot.slot, field=("n403" if exc.status == 403 else "n429"))

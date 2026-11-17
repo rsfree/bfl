@@ -368,6 +368,7 @@ class Slot:
     cool_until: float
     n429: int
     n403: int = 0
+    nthrottle: int = 0
     fail: int = 0
     soft_quota: int = 0
     last_used: float = 0.0
@@ -413,6 +414,7 @@ def _to_slot(n: int, d: dict[str, str], default_quota: int) -> Slot:
         cool_until=float(d.get("cool_until", 0) or 0),
         n429=int(d.get("n429", 0) or 0),
         n403=int(d.get("n403", 0) or 0),
+        nthrottle=int(d.get("nthrottle", 0) or 0),
         fail=int(d.get("fail", 0) or 0),
         soft_quota=int(d.get("soft_quota", 0) or 0),
         last_used=float(d.get("last_used", 0) or 0),
@@ -534,6 +536,23 @@ async def note_rate_limited(slot: int, cooldown_s: int | None = None,
     return until
 
 
+async def note_throttled(slot: int, cooldown_s: int | None = None) -> float:
+    """短窗限流：只让出口歇一会儿，**不扣额度、不当成当天废掉**。
+
+    实测 slot 584/724 在 20:35 回 429、21:32 就恢复正常出图 —— 57 分钟内
+    自愈，没有任何时区零点落在这个区间。把这种 429 记成"当日额度耗尽"
+    会让好 IP 被白白扔掉 10 分钟以上。
+    """
+    cd = int(os.environ.get("BFL2OPENAI_POOL_THROTTLE_COOLDOWN", "90")) \
+        if cooldown_s is None else cooldown_s
+    until = time.time() + cd
+    b = _b()
+    key = _slot_key(slot)
+    await b.hincrby(key, "nthrottle", 1)
+    await b.hset(key, mapping={"cool_until": int(until)})
+    return until
+
+
 async def note_failure(slot: int) -> int:
     """非 429 的失败：只记数，不扣额度（没有出图就是没消耗上游配额）。"""
     return await _b().hincrby(_slot_key(slot), "fail", 1)
@@ -572,7 +591,8 @@ async def snapshot() -> dict[str, Any]:
         "slot": s.slot, "ip": s.ip, "state": s.state, "prefix": s.seg,
         "used": s.used, "quota": s.quota, "remaining": s.remaining,
         "soft_quota": s.cap, "remaining_safe": s.remaining_safe,
-        "n429": s.n429, "n403": s.n403, "fail": s.fail,
+        "n429": s.n429, "n403": s.n403, "nthrottle": s.nthrottle,
+        "fail": s.fail,
         "cooling_s": max(0, int(s.cool_until - now)),
         "idle_s": int(now - s.last_used) if s.last_used else None,
         "available": s.available(now),

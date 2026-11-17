@@ -376,3 +376,21 @@ def test_scan_does_not_set_ttl_on_slot_keys(monkeypatch):
     ep._backend = Spy()
     asyncio.run(ep.scan())
     assert not [c for c in calls if "slot:" in c[0]], "槽位 key 不得设 TTL"
+
+
+def test_throttle_does_not_burn_quota(monkeypatch):
+    """短窗限流只冷却，不扣额度 —— 实测 429 后 57 分钟就自愈了。"""
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "1")
+    monkeypatch.setattr(ep, "_probe_ip", _probe_by_slot({"1.1.1.1": [1]}))
+    asyncio.run(ep.scan())
+    asyncio.run(ep.note_success(1))
+    asyncio.run(ep.note_throttled(1))
+
+    rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
+    s = rows[1]
+    assert s.used == 1, "限流不该扣额度"
+    assert s.nthrottle == 1
+    assert not s.available(), "冷却期内不可用"
+    snap = asyncio.run(ep.snapshot())
+    assert snap["used_today"] == 1
