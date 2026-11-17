@@ -558,12 +558,29 @@ async def _egress_mode_mw(request: Request, call_next):
 _STICKY: dict[str, int] = {"slot": 0}
 
 
+#: 与侧车同名的预绑定槽位：这些槽位在启动时已经被绑到页面上，优先用它们
+#: 能直接跳过 context 重建（每次约 2s）。两边必须完全一致，否则绑了用不上。
+_PREBIND: list[int] = [int(x) for x in
+                       os.environ.get("BFL2OPENAI_POOL_PREBIND", "").split(",")
+                       if x.strip().isdigit()]
+
+
 async def _next_slot(exclude: set[int]):
+    # 1) 当前黏住的槽位
     cur = _STICKY["slot"]
     if cur and cur not in exclude:
         s = await egress_pool.get_slot(cur)
         if s is not None and s.available():
             return s
+    # 2) 预绑定槽位（启动时已经热好，优先吃掉这部分容量）
+    for n in _PREBIND:
+        if n in exclude:
+            continue
+        s = await egress_pool.get_slot(n)
+        if s is not None and s.available():
+            _STICKY["slot"] = n
+            return s
+    # 3) 正常轮转
     s = await egress_pool.acquire(exclude=exclude)
     if s is not None:
         _STICKY["slot"] = s.slot

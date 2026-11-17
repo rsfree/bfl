@@ -269,3 +269,24 @@ def test_sticky_slot_reuses_until_exhausted(monkeypatch):
         asyncio.run(server._browser_generate(prompt="x"))
     assert calls[0] == calls[1], "前两次必须复用同一槽位"
     assert calls[0] != calls[2], "用满停手点后必须换槽"
+
+
+def test_prebind_slots_are_preferred(monkeypatch):
+    """预绑定槽位优先：它们在启动时已经热好，用它可跳过 2s 的 context 重建。"""
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "12")
+    monkeypatch.setattr(server, "_STICKY", {"slot": 0})
+    monkeypatch.setattr(server, "_PREBIND", [7, 9])
+
+    async def fake_probe(slot, timeout=12.0):
+        return f"10.0.0.{slot}"
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+
+    picked = []
+    for _ in range(4):
+        s = asyncio.run(server._next_slot(set()))
+        picked.append(s.slot)
+        asyncio.run(ep.note_success(s.slot))
+    assert picked[0] in (7, 9), f"应优先选预绑定槽位，实际 {picked}"

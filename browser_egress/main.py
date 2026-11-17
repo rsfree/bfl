@@ -73,6 +73,12 @@ POOL_USER_PREFIX = os.environ.get("BFL2OPENAI_POOL_USER_PREFIX", "poolclient")
 #: 槽位端口基数：slot n → 127.0.0.1:(base+n)。避开 1080（2088 那把桥）。
 POOL_BRIDGE_BASE_PORT = int(os.environ.get("BFL2OPENAI_POOL_BRIDGE_BASE", "11000"))
 PIN_ENABLED = bool(POOL_HOST and POOL_PASS)
+#: 预绑定槽位：启动完成前先把这些槽位绑到页面上，第一个真实请求就不用再
+#: 重建 context（一次重建 = 页面加载 + 静默期 ≈ 2s）。必须与 app 侧同名
+#: 变量一致 —— 只有两边都认同一批槽位，绑定才算数。
+PREBIND_SLOTS = [int(x) for x in
+                 os.environ.get("BFL2OPENAI_POOL_PREBIND", "").split(",")
+                 if x.strip().isdigit()]
 
 #: 全局并发上限。默认 20（8 页 → 每页 cap = ceil(20/8) = 3，见 acquire_entry）。
 #: 这是「池子总量」而非每页放开：单 IP 并发连接越多，越容易撞上游配额。
@@ -1329,6 +1335,33 @@ async def generate(req: GenReq):
         sem.release()
 
 
+async def _prebind_pages() -> None:
+    """把剩余预绑定槽位分配到空闲页面上（后台跑，不阻塞启动）。
+
+    只绑「当前没有槽位」的页面：已经有绑定的不要动，那是正在服务的窗口。
+    """
+    if not PIN_ENABLED or not PREBIND_SLOTS:
+        return
+    for slot in PREBIND_SLOTS[1:]:
+        try:
+            pool = _state.get("pool") or []
+            free = [e for e in pool
+                    if e.get("slot") is None and e.get("inflight", 0) == 0
+                    and not e.get("recycling")]
+            if not free:
+                return
+            entry = free[0]
+            entry["inflight"] = 1          # 占位，避免被并发请求抢走
+            try:
+                await _rebind(entry, slot)
+            finally:
+                entry["inflight"] = 0
+            print(f"[prebind] page#{entry['idx']} -> slot {slot:03d}", flush=True)
+        except Exception as exc:  # noqa: BLE001 - 预绑定失败不影响服务
+            print(f"[prebind] slot {slot:03d} failed: {type(exc).__name__}",
+                  flush=True)
+
+
 async def _prewarm_generate():
     """启动预热：页面加载后跑一发 dummy 生成，把 TLS/上游会话/页面 JS 全部
     热起来（实测冷启动首发生成 >300s，预热后首发即稳态 ~50s）。"""
@@ -1342,7 +1375,9 @@ async def _prewarm_generate():
         _Img.new("RGB", (256, 256), (128, 128, 128)).save(buf, "PNG")
         await generate(GenReq(image_b64=base64.b64encode(buf.getvalue()).decode(),
                               prompt="a plain gray square",
-                              aspect_ratio="1:1", resolution="1k", mode="i2i"))
+                              aspect_ratio="1:1", resolution="1k", mode="i2i",
+                              proxy_slot=PREBIND_SLOTS[0] if PREBIND_SLOTS else None))
+        await _prebind_pages()
         print("[prewarm] done", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[prewarm] failed: {type(exc).__name__}: {str(exc)[:100]}",

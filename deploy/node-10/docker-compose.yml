@@ -63,6 +63,9 @@ x-egress-env: &egress-env
   #: rebind 后等 Vercel 挑战通过的静默期（秒）。3s 是保守值，实测降到 1s
   #: 仍能过，直接省掉 2s 冷启动开销。
   BFL2OPENAI_POOL_REBIND_SETTLE: "${BFL2OPENAI_POOL_REBIND_SETTLE:-3.0}"
+  #: 预绑定槽位（逗号分隔）。侧车在启动时把页面绑到这些槽位，app 优先路由
+  #: 过去 —— 两边必须完全一致，否则绑了也用不上。
+  BFL2OPENAI_POOL_PREBIND: "${BFL2OPENAI_POOL_PREBIND:-}"
 
 services:
   redis:
@@ -117,6 +120,8 @@ services:
       BFL2OPENAI_POOL_SOFT_QUOTA: "${BFL2OPENAI_POOL_SOFT_QUOTA:-}"
       BFL2OPENAI_POOL_STRETCH: "${BFL2OPENAI_POOL_STRETCH:-0}"
       BFL2OPENAI_SLOT_ATTEMPTS: "${BFL2OPENAI_SLOT_ATTEMPTS:-3}"
+      BFL2OPENAI_POOL_PREBIND: "${BFL2OPENAI_POOL_PREBIND:-}"
+      BFL2OPENAI_POOL_REBIND_SETTLE: "${BFL2OPENAI_POOL_REBIND_SETTLE:-3.0}"
     env_file: ./.env                    # 凭证/回退代理/PUBLIC_BASE 注入容器环境
     depends_on:
       - redis
