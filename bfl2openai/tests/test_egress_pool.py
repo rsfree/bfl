@@ -139,6 +139,20 @@ def test_acquire_alternates_subnets(monkeypatch):
     assert len(set(segs)) == 2, "四个槽位两个段，应严格交替"
 
 
+def test_hset_always_uses_mapping_kwarg():
+    """redis-py 的 hset 第二个位置参数是 `key`，传 dict 会抛 DataError。
+
+    这条是生产事故的回归锁：内存后端接受 `hset(k, {...})`，单测全绿，
+    真实 Redis 上却直接炸掉整个扫描。这类"只在真后端暴露"的形状错误，
+    用源码断言守住比再造一个假 Redis 更直接。
+    """
+    import re
+    from pathlib import Path
+    src = Path(ep.__file__).read_text()
+    bad = re.findall(r"\.hset\([^)=]*?,\s*\{", src)
+    assert not bad, f"hset 必须用 mapping= 关键字：{bad}"
+
+
 def test_reaching_quota_puts_slot_in_rest(monkeypatch):
     """配额用尽 = 当日冷却：该槽位退出调度，面板标"额度用尽"。"""
     import asyncio

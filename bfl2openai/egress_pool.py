@@ -150,7 +150,12 @@ class _Memory:
         async with self.lock:
             return dict(self.h.get(key, {}))
 
-    async def hset(self, key: str, mapping: dict[str, Any]) -> None:
+    async def hset(self, key: str, mapping: dict[str, Any] | None = None,
+                    **kw: Any) -> None:
+        # 签名与 redis-py 对齐：mapping 是关键字参数。用位置参数传 dict 在
+        # 真实 Redis 上会变成 key，抛 DataError（生产踩过）。
+        if mapping is None:
+            mapping = kw
         async with self.lock:
             d = self.h.setdefault(key, {})
             for k, v in mapping.items():
@@ -230,6 +235,37 @@ async def scan(slots: Iterable[int] | None = None) -> dict[str, Any]:
     """
     if not configured():
         raise PoolNotConfigured("BFL2OPENAI_POOL_HOST / _PASS / _SLOTS 未配置")
+    b0 = _b()
+    st = await b0.hgetall(_meta_key()) or {}
+    # 扫描状态必须放 Redis：gunicorn 6 个 worker，进程内变量互相看不见，
+    # 面板会显示"没在扫"而实际正在扫（或反之）。
+    if st.get("scan_running") == "1" and (
+            time.time() - float(st.get("scan_started", 0) or 0) < 1800):
+        return {"running": True, "skipped": True}
+    await b0.hset(_meta_key(), mapping={
+        "scan_running": 1, "scan_started": int(time.time()), "scan_error": ""})
+    try:
+        return await _scan_impl(slots)
+    except BaseException as exc:  # noqa: BLE001 - 记录后再抛，面板才看得到原因
+        await b0.hset(_meta_key(),
+                      mapping={"scan_error": f"{type(exc).__name__}: {exc}"[:300]})
+        raise
+    finally:
+        await b0.hset(_meta_key(), mapping={
+            "scan_running": 0, "scan_finished": int(time.time())})
+
+
+async def scan_status() -> dict:
+    st = await _b().hgetall(_meta_key()) or {}
+    return {
+        "running": st.get("scan_running") == "1",
+        "started": int(float(st.get("scan_started", 0) or 0)),
+        "finished": int(float(st.get("scan_finished", 0) or 0)),
+        "error": st.get("scan_error", ""),
+    }
+
+
+async def _scan_impl(slots: Iterable[int] | None) -> dict[str, Any]:
     c = _cfg()
     want = list(slots) if slots is not None else list(range(1, c["slots"] + 1))
 
@@ -255,22 +291,22 @@ async def scan(slots: Iterable[int] | None = None) -> dict[str, Any]:
                 "last_used": cur.get("last_used", 0)}
         if not ip:
             err_count += 1
-            await b.hset(key, {"ip": cur.get("ip", ""), "state": STATE_ERROR,
-                               **keep})
+            await b.hset(key, mapping={
+                "ip": cur.get("ip", ""), "state": STATE_ERROR, **keep})
             continue
         if ip in seen:
             dup_count += 1
-            await b.hset(key, {"ip": ip, "state": STATE_DUP,
-                               "prefix": _prefix(ip),
-                               "dup_of": seen[ip], **keep})
+            await b.hset(key, mapping={
+                "ip": ip, "state": STATE_DUP, "prefix": _prefix(ip),
+                "dup_of": seen[ip], **keep})
         else:
             seen[ip] = n
-            await b.hset(key, {"ip": ip, "state": STATE_PRIMARY,
-                               "prefix": _prefix(ip),
-                               "dup_of": 0, **keep})
+            await b.hset(key, mapping={
+                "ip": ip, "state": STATE_PRIMARY, "prefix": _prefix(ip),
+                "dup_of": 0, **keep})
         await b.expire(key, _DAY_TTL_S)
 
-    await b.hset(_meta_key(), {
+    await b.hset(_meta_key(), mapping={
         "built_at": int(time.time()),
         "slots": len(want),
         "distinct_ips": len(seen),
@@ -411,7 +447,7 @@ async def note_success(slot: int) -> int:
     b = _b()
     key = _slot_key(slot)
     n = await b.hincrby(key, "used", 1)
-    await b.hset(key, {"last_used": time.time()})
+    await b.hset(key, mapping={"last_used": time.time()})
     return n
 
 
@@ -428,7 +464,7 @@ async def note_rate_limited(slot: int, cooldown_s: int | None = None) -> float:
     await b.hincrby(key, "n429", 1)
     d = await b.hgetall(key) or {}
     quota = int(d.get("quota", _cfg()["quota"]) or _cfg()["quota"])
-    await b.hset(key, {"used": quota, "cool_until": int(until)})
+    await b.hset(key, mapping={"used": quota, "cool_until": int(until)})
     return until
 
 
@@ -439,14 +475,14 @@ async def note_failure(slot: int) -> int:
 
 async def set_quota(slot: int, quota: int) -> None:
     """改硬额度。夹在 [0, MAX_DAILY_QUOTA]：上游上限是 30，配再大也拿不到图。"""
-    await _b().hset(_slot_key(slot),
-                    {"quota": max(0, min(int(quota), MAX_DAILY_QUOTA))})
+    await _b().hset(_slot_key(slot), mapping={
+        "quota": max(0, min(int(quota), MAX_DAILY_QUOTA))})
 
 
 async def set_soft_quota(slot: int, soft: int) -> None:
     """改停手点（≤ 硬额度）。等于额度即榨干，小于额度即留风控余量。"""
-    await _b().hset(_slot_key(slot),
-                    {"soft_quota": max(0, min(int(soft), MAX_DAILY_QUOTA))})
+    await _b().hset(_slot_key(slot), mapping={
+        "soft_quota": max(0, min(int(soft), MAX_DAILY_QUOTA))})
 
 
 async def reset_day() -> int:
@@ -454,8 +490,8 @@ async def reset_day() -> int:
     slots = await list_slots()
     b = _b()
     for s in slots:
-        await b.hset(_slot_key(s.slot), {"used": 0, "n429": 0, "fail": 0,
-                                         "cool_until": 0, "last_used": 0})
+        await b.hset(_slot_key(s.slot), mapping={
+            "used": 0, "n429": 0, "fail": 0, "cool_until": 0, "last_used": 0})
     return len(slots)
 
 

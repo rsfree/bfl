@@ -26,20 +26,14 @@ router = APIRouter(prefix="/panel", tags=["panel"])
 
 _TOKEN = os.environ.get("BFL2PANEL_TOKEN", "")
 
-#: 扫描是长任务：3000 个号段约 3 分钟，同步跑会被 nginx 的 300s 掐断。
-#: 改为后台执行，面板靠 snapshot 里的 scan 字段看进度。
-_scan_state: dict = {"running": False, "started": 0, "result": None, "error": None}
-
-
+#: 扫描是长任务：3000 个号段约 3-6 分钟，同步跑会被 nginx 的 300s 掐断。
+#: 改为后台执行；**进度状态存在 Redis**（egress_pool.scan_status），
+#: 因为 gunicorn 多 worker 下进程内变量互相看不见。
 async def _run_scan() -> None:
-    _scan_state.update(running=True, started=int(time.time()),
-                       result=None, error=None)
     try:
-        _scan_state["result"] = await egress_pool.scan()
+        await egress_pool.scan()
     except Exception as exc:  # noqa: BLE001 - 后台任务必须自己收尾
-        _scan_state["error"] = f"{type(exc).__name__}: {exc}"
-    finally:
-        _scan_state["running"] = False
+        print(f"[panel] scan failed: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _check(request: Request) -> None:
@@ -56,7 +50,7 @@ async def api_snapshot(request: Request):
     _check(request)
     snap = await egress_pool.snapshot()
     snap["now"] = int(time.time())
-    snap["scan"] = dict(_scan_state)
+    snap["scan"] = await egress_pool.scan_status()
     return JSONResponse(snap)
 
 
@@ -84,9 +78,9 @@ async def api_scan(request: Request):
     _check(request)
     if not egress_pool.configured():
         raise HTTPException(status_code=400, detail="pool not configured")
-    if _scan_state["running"]:
-        return {"ok": False, "running": True,
-                "started": _scan_state["started"]}
+    st = await egress_pool.scan_status()
+    if st["running"]:
+        return {"ok": False, "running": True, "started": st["started"]}
     asyncio.create_task(_run_scan())
     return {"ok": True, "running": True}
 
