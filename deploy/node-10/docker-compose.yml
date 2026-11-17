@@ -26,7 +26,7 @@ x-egress: &egress
     options:
       max-size: "50m"
       max-file: "2"
-  mem_limit: 3g                      # 上限，不是占用。实测 8 页 RSS 1.17G、满载峰值
+  mem_limit: 4g                      # 上限，不是占用。实测 8 页 RSS 1.17G、12 页约 1.9G
                                      # 1.56G ⇒ 3g 留一倍余量。三台 9G + app 4G +
                                      # redis 0.5G = 13.5G < 16G 物理，不超卖。
                                      # （原来写 5g：三台总和 15G 会逼近物理上限）
@@ -39,7 +39,7 @@ x-egress: &egress
     start_period: 180s                # 8 页加载 + 预热生成需要时间
 
 x-egress-env: &egress-env
-  BFL2OPENAI_EGRESS_PAGES: "8"               # 页面池大小（每页=独立出口 IP）
+  BFL2OPENAI_EGRESS_PAGES: "12"              # 页面池大小（每页=独立出口 IP）
   BFL2OPENAI_EGRESS_MAX_INFLIGHT: "20"       # 全局并发闸门（8 页 → 每页 cap 3）
   BFL2OPENAI_EGRESS_MAX_REQ_PER_CTX: "25"    # 单会话 25 次后换 IP/新 cookie
   BFL2OPENAI_EGRESS_POLL_TIMEOUT: "165"      # 必须 < 应用侧 180s，否则失败原因送不回
@@ -65,7 +65,11 @@ x-egress-env: &egress-env
   BFL2OPENAI_POOL_REBIND_SETTLE: "${BFL2OPENAI_POOL_REBIND_SETTLE:-3.0}"
   #: 预绑定槽位（逗号分隔）。侧车在启动时把页面绑到这些槽位，app 优先路由
   #: 过去 —— 两边必须完全一致，否则绑了也用不上。
-  BFL2OPENAI_POOL_PREBIND: "${BFL2OPENAI_POOL_PREBIND:-}"
+  #: 预绑定切片：每台侧车只绑 slot%3==本实例序号 的那 12 个，app 侧按同一
+  #: 规则做路由亲和。具体 offset 在各服务块里覆盖。
+  BFL2OPENAI_POOL_PREBIND_STRIDE: "${BFL2OPENAI_POOL_PREBIND_STRIDE:-3}"
+  BFL2OPENAI_POOL_PREBIND_FROM: "${BFL2OPENAI_POOL_PREBIND_FROM:-1}"
+  BFL2OPENAI_POOL_PREBIND_TO: "${BFL2OPENAI_POOL_PREBIND_TO:-36}"
 
 services:
   redis:
@@ -120,7 +124,7 @@ services:
       BFL2OPENAI_POOL_SOFT_QUOTA: "${BFL2OPENAI_POOL_SOFT_QUOTA:-}"
       BFL2OPENAI_POOL_STRETCH: "${BFL2OPENAI_POOL_STRETCH:-0}"
       BFL2OPENAI_SLOT_ATTEMPTS: "${BFL2OPENAI_SLOT_ATTEMPTS:-3}"
-      BFL2OPENAI_POOL_PREBIND: "${BFL2OPENAI_POOL_PREBIND:-}"
+      BFL2OPENAI_POOL_PREBIND: "${BFL2OPENAI_POOL_PREBIND:-1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36}"
       BFL2OPENAI_POOL_REBIND_SETTLE: "${BFL2OPENAI_POOL_REBIND_SETTLE:-3.0}"
     env_file: ./.env                    # 凭证/回退代理/PUBLIC_BASE 注入容器环境
     depends_on:
@@ -192,6 +196,7 @@ services:
       bfl_net:
         ipv4_address: 172.18.0.10       # 固定 IP：Docker 内嵌 DNS 会缓存旧 IP
     environment:
+      BFL2OPENAI_POOL_PREBIND_OFFSET: "0"
       <<: *egress-env
 
   bfl-browser-egress-2:
@@ -201,6 +206,7 @@ services:
       bfl_net:
         ipv4_address: 172.18.0.11       # 与 app 侧 BFL2OPENAI_BROWSER_EGRESS 对应
     environment:
+      BFL2OPENAI_POOL_PREBIND_OFFSET: "1"
       <<: *egress-env
 
   bfl-browser-egress-3:
@@ -210,6 +216,7 @@ services:
       bfl_net:
         ipv4_address: 172.18.0.12
     environment:
+      BFL2OPENAI_POOL_PREBIND_OFFSET: "2"
       <<: *egress-env
 
 # 复用已存在的项目网络：external 方式避免 compose 重建网络（重建会连带重启应用）。

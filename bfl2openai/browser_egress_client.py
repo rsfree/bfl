@@ -56,8 +56,12 @@ def configured() -> bool:
     return bool(_endpoints())
 
 
-def _order() -> list[str]:
-    """本次调用的实例尝试顺序：进程内交替，进程间相位随机。
+def _order(proxy_slot: int | None = None) -> list[str]:
+    """本次调用的实例尝试顺序。
+
+    给了 `proxy_slot` 就按 `slot % 实例数` 做**亲和**：该槽位被预绑定在
+    哪台侧车上，请求就去哪台，命中热页面（省掉 ~2s 的 context 重建）。
+    没给槽位时退回原来的进程内交替 + 进程间随机相位。
 
     冷却中的实例排到后面（不是直接剔除——全都冷却时总得试一个，
     直接失败会把"上游配额紧张"放大成"服务不可用"）。
@@ -66,9 +70,13 @@ def _order() -> list[str]:
     urls = _endpoints()
     if not urls:
         return []
-    start = (_SEED + _rr) % len(urls)
-    _rr += 1
-    order = [urls[(start + i) % len(urls)] for i in range(len(urls))]
+    if proxy_slot is not None:
+        head = proxy_slot % len(urls)
+        order = [urls[(head + i) % len(urls)] for i in range(len(urls))]
+    else:
+        start = (_SEED + _rr) % len(urls)
+        _rr += 1
+        order = [urls[(start + i) % len(urls)] for i in range(len(urls))]
     now = time.monotonic()
     return sorted(order, key=lambda u: _avoid_until.get(u, 0.0) > now)
 
@@ -133,7 +141,7 @@ async def generate(image_png: bytes, prompt: str, aspect_ratio: str,
         "proxy_slot": proxy_slot,
     }
 
-    order = _order()
+    order = _order(proxy_slot)
     last: BrowserEgressError | None = None
     for i, url in enumerate(order):
         final = i == len(order) - 1

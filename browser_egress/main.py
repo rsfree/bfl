@@ -76,9 +76,29 @@ PIN_ENABLED = bool(POOL_HOST and POOL_PASS)
 #: 预绑定槽位：启动完成前先把这些槽位绑到页面上，第一个真实请求就不用再
 #: 重建 context（一次重建 = 页面加载 + 静默期 ≈ 2s）。必须与 app 侧同名
 #: 变量一致 —— 只有两边都认同一批槽位，绑定才算数。
-PREBIND_SLOTS = [int(x) for x in
-                 os.environ.get("BFL2OPENAI_POOL_PREBIND", "").split(",")
-                 if x.strip().isdigit()]
+def _prebind_slots() -> list[int]:
+    """预绑定槽位表。
+
+    两种写法：
+    - `BFL2OPENAI_POOL_PREBIND=1,2,3` 显式列出
+    - `PREBIND_FROM/TO/STRIDE/OFFSET` 按步长取片：每台侧车只绑自己那一份
+      （slot % 实例数 == 本实例序号），app 侧按同一规则做路由亲和，
+      两边才对得上。
+    """
+    raw = os.environ.get("BFL2OPENAI_POOL_PREBIND", "")
+    explicit = [int(x) for x in raw.split(",") if x.strip().isdigit()]
+    if explicit:
+        return explicit
+    stride = int(os.environ.get("BFL2OPENAI_POOL_PREBIND_STRIDE", "0") or 0)
+    if stride <= 0:
+        return []
+    off = int(os.environ.get("BFL2OPENAI_POOL_PREBIND_OFFSET", "0") or 0)
+    lo = int(os.environ.get("BFL2OPENAI_POOL_PREBIND_FROM", "1") or 1)
+    hi = int(os.environ.get("BFL2OPENAI_POOL_PREBIND_TO", "0") or 0)
+    return [n for n in range(lo, hi + 1) if n % stride == off % stride]
+
+
+PREBIND_SLOTS = _prebind_slots()
 
 #: 全局并发上限。默认 20（8 页 → 每页 cap = ceil(20/8) = 3，见 acquire_entry）。
 #: 这是「池子总量」而非每页放开：单 IP 并发连接越多，越容易撞上游配额。
