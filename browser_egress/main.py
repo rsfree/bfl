@@ -1184,6 +1184,11 @@ async def generate(req: GenReq):
             if sub["status"] == 429:
                 return JSONResponse(status_code=429,
                                     content={"error": f"submit 429: {body}"})
+            # 403 = 这个出口被上游拒绝（IP 级或指纹级）。同样要原样上报：
+            # 上层据此换槽重试，折成 502 就失去了"换一个出口再试"的依据。
+            if sub["status"] == 403:
+                return JSONResponse(status_code=403,
+                                    content={"error": f"submit 403: {body}"})
             return JSONResponse(status_code=502,
                                content={"error": f"submit {sub['status']}: {body}"})
         entry["err_streak"] = 0

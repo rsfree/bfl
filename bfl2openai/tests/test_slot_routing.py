@@ -210,3 +210,34 @@ def test_legacy_header_forces_old_path(monkeypatch):
                     json={"prompt": "x", "response_format": "b64_json"})
     assert r.status_code == 200, r.text
     assert calls == [None], "legacy 强制不得注入槽位"
+
+
+def test_403_also_rotates(monkeypatch):
+    """403 与 429 同为"这个出口不可用"，必须换槽而不是直接抛错。"""
+    import asyncio
+
+    async def fake_probe(slot, timeout=12.0):
+        return {1: "1.1.1.1", 2: "2.2.2.2", 3: "3.3.3.3"}[slot]
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "3")
+    asyncio.run(ep.scan())
+
+    calls: list[int] = []
+
+    async def fake_generate(proxy_slot=None, **kw):
+        calls.append(proxy_slot)
+        if len(calls) < 3:
+            raise bec.BrowserEgressError("browser egress 403: Access denied", 403)
+        return b"PNG"
+
+    monkeypatch.setattr(bec, "generate", fake_generate)
+    out = asyncio.run(server._browser_generate(prompt="x"))
+    assert out == b"PNG"
+    assert len(calls) == 3 and len(set(calls)) == 3, "每个槽位各试一次"
+
+    rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
+    blocked = [rows[c] for c in calls[:2]]
+    assert all(b.used == b.quota for b in blocked), "被拒的出口应置为耗尽"
+    assert all(b.n429 == 0 for b in blocked), "403 不该记进 429 计数"
+    assert sum(b.n429 for b in blocked) == 0

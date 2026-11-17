@@ -132,7 +132,7 @@ input[type=number]{width:64px;border:1px solid var(--line);border-radius:5px;pad
   </div>
   <table><thead><tr>
     <th>槽位</th><th>出口 IP</th><th>状态</th><th>已用 / 软上限</th><th>安全余量</th>
-    <th>进度</th><th>硬额度</th><th>429</th><th>失败</th><th>空闲</th><th>改软上限</th>
+    <th>进度</th><th>硬额度</th><th>429 / 403</th><th>失败</th><th>空闲</th><th>改停手点</th>
   </tr></thead><tbody id="rows"></tbody></table>
 </main>
 <script>
@@ -157,7 +157,7 @@ function render(){
     <td>${r.remaining_safe}</td>
     <td><div class="bar"><i style="width:${pct(r.used,r.soft_quota)}%;background:${r.remaining_safe>0?"var(--ok)":"var(--bad)"}"></i></div></td>
     <td>${r.quota}</td>
-    <td>${r.n429||""}</td><td>${r.fail||""}</td>
+    <td>${r.n429||0} / ${r.n403||0}</td><td>${r.fail||""}</td>
     <td>${r.idle_s==null?"—":fmtCool(r.idle_s)}</td>
     <td><input type="number" min="0" value="${r.soft_quota}" id="q${r.slot}">
         <button onclick="setQ(${r.slot})">改</button></td>

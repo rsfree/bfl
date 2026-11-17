@@ -331,7 +331,8 @@ class Slot:
     quota: int
     cool_until: float
     n429: int
-    fail: int
+    n403: int = 0
+    fail: int = 0
     soft_quota: int = 0
     last_used: float = 0.0
     prefix: str = ""
@@ -372,6 +373,7 @@ def _to_slot(n: int, d: dict[str, str], default_quota: int) -> Slot:
         quota=int(d.get("quota", default_quota) or default_quota),
         cool_until=float(d.get("cool_until", 0) or 0),
         n429=int(d.get("n429", 0) or 0),
+        n403=int(d.get("n403", 0) or 0),
         fail=int(d.get("fail", 0) or 0),
         soft_quota=int(d.get("soft_quota", 0) or 0),
         last_used=float(d.get("last_used", 0) or 0),
@@ -447,7 +449,8 @@ async def note_success(slot: int) -> int:
     return n
 
 
-async def note_rate_limited(slot: int, cooldown_s: int | None = None) -> float:
+async def note_rate_limited(slot: int, cooldown_s: int | None = None,
+                            field: str = "n429") -> float:
     """撞 429：该 IP 立即标记冷却并置为额度耗尽。
 
     直接置 `used = quota` 而不是只设冷却，是因为 429 有两种来源（短窗口
@@ -457,7 +460,7 @@ async def note_rate_limited(slot: int, cooldown_s: int | None = None) -> float:
     until = time.time() + cd
     b = _b()
     key = _slot_key(slot)
-    await b.hincrby(key, "n429", 1)
+    await b.hincrby(key, field, 1)
     d = await b.hgetall(key) or {}
     quota = int(d.get("quota", _cfg()["quota"]) or _cfg()["quota"])
     await b.hset(key, mapping={"used": quota, "cool_until": int(until)})
@@ -501,7 +504,7 @@ async def snapshot() -> dict[str, Any]:
         "slot": s.slot, "ip": s.ip, "state": s.state, "prefix": s.seg,
         "used": s.used, "quota": s.quota, "remaining": s.remaining,
         "soft_quota": s.cap, "remaining_safe": s.remaining_safe,
-        "n429": s.n429, "fail": s.fail,
+        "n429": s.n429, "n403": s.n403, "fail": s.fail,
         "cooling_s": max(0, int(s.cool_until - now)),
         "idle_s": int(now - s.last_used) if s.last_used else None,
         "available": s.available(now),

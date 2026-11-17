@@ -587,10 +587,13 @@ async def _browser_generate(**kwargs) -> bytes:
             data = await browser_egress_client.generate(
                 proxy_slot=slot.slot, **kwargs)
         except browser_egress_client.BrowserEgressError as exc:
-            if exc.status == 429:
-                await egress_pool.note_rate_limited(slot.slot)
-                log.warning("slot %03d ip=%s hit 429, rotating (n=%d)",
-                            slot.slot, slot.ip, len(tried))
+            # 429（额度/限流）与 403（出口被拒）都是"这个 IP 今天别再用"，
+            # 处置一致：标记冷却 + 换下一个槽位。区别只在计数口径。
+            if exc.status in (429, 403):
+                await egress_pool.note_rate_limited(
+                    slot.slot, field=("n403" if exc.status == 403 else "n429"))
+                log.warning("slot %03d ip=%s hit %s, rotating (n=%d)",
+                            slot.slot, slot.ip, exc.status, len(tried))
                 last = exc
                 continue
             await egress_pool.note_failure(slot.slot)
