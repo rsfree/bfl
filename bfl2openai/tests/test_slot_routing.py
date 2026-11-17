@@ -143,3 +143,70 @@ def test_non_429_failure_does_not_consume_quota(monkeypatch):
     rows = asyncio.run(ep.list_slots())
     assert sum(r.used for r in rows) == 0, "没出图不该扣额度"
     assert sum(r.fail for r in rows) == 1
+
+
+def test_canary_header_forces_pool(monkeypatch):
+    """Global 关着时，带 X-Bfl-Egress: pool 的请求仍走槽位 —— 灰度验证用。"""
+    import asyncio
+    from fastapi.testclient import TestClient
+
+    async def fake_probe(slot, timeout=12.0):
+        return {1: "1.1.1.1", 2: "2.2.2.2"}[slot]
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+    # 全局开关关闭
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "0")
+    ep.reset_backend()
+
+    async def fake_probe2(slot, timeout=12.0):
+        return {1: "1.1.1.1", 2: "2.2.2.2"}[slot]
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe2)
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "2")
+    asyncio.run(ep.scan())
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "0")
+
+    calls: list[int | None] = []
+
+    async def fake_generate(proxy_slot=None, **kw):
+        calls.append(proxy_slot)
+        return b"PNG"
+
+    monkeypatch.setattr(bec, "generate", fake_generate)
+    monkeypatch.setattr(server, "_BROWSER_PRIMARY", True)
+    monkeypatch.setattr(bec, "configured", lambda: True)
+    monkeypatch.setattr(server, "API_KEY", "")
+
+    client = TestClient(server.app, headers={"X-Bfl-Egress": "pool"})
+    r = client.post("/v1/images/generations",
+                    json={"prompt": "x", "response_format": "b64_json"})
+    assert r.status_code == 200, r.text
+    assert calls and calls[0] is not None, "灰度请求必须带上槽位"
+
+
+def test_legacy_header_forces_old_path(monkeypatch):
+    import asyncio
+    from fastapi.testclient import TestClient
+
+    async def fake_probe(slot, timeout=12.0):
+        return {1: "1.1.1.1"}[slot]
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "1")
+    asyncio.run(ep.scan())
+
+    calls: list[int | None] = []
+
+    async def fake_generate(proxy_slot=None, **kw):
+        calls.append(proxy_slot)
+        return b"PNG"
+
+    monkeypatch.setattr(bec, "generate", fake_generate)
+    monkeypatch.setattr(server, "_BROWSER_PRIMARY", True)
+    monkeypatch.setattr(bec, "configured", lambda: True)
+    monkeypatch.setattr(server, "API_KEY", "")
+    client = TestClient(server.app, headers={"X-Bfl-Egress": "legacy"})
+    r = client.post("/v1/images/generations",
+                    json={"prompt": "x", "response_format": "b64_json"})
+    assert r.status_code == 200, r.text
+    assert calls == [None], "legacy 强制不得注入槽位"

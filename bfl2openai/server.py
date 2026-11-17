@@ -25,6 +25,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 import os
+from contextvars import ContextVar
 import re
 import time
 from typing import Literal
@@ -534,6 +535,21 @@ async def _idem_run(fp: str, produce) -> JSONResponse:
 #: 3 次仍失败说明池子整体耗尽，此时回 429 让客户端退避是正确的语义。
 _SLOT_ATTEMPTS = int(os.environ.get("BFL2OPENAI_SLOT_ATTEMPTS", "3"))
 
+#: 请求级出口开关（灰度用）。`X-Bfl-Egress: pool` 强制走槽位，`legacy`
+#: 强制走 2088。不带头时按环境变量决定 —— 这样可以在真实流量的同时验证
+#: 新链路，不必为了测试把全站切过去。
+_EGRESS_MODE: ContextVar[str] = ContextVar("bfl_egress_mode", default="")
+
+
+@app.middleware("http")
+async def _egress_mode_mw(request: Request, call_next):
+    tok = _EGRESS_MODE.set(
+        request.headers.get("x-bfl-egress", "").strip().lower())
+    try:
+        return await call_next(request)
+    finally:
+        _EGRESS_MODE.reset(tok)
+
 
 async def _browser_generate(**kwargs) -> bytes:
     """经侧车生成，并**把成败记到出口 IP 头上**。
@@ -548,7 +564,14 @@ async def _browser_generate(**kwargs) -> bytes:
     429 的处置是这里的关键：不重试同一槽位，而是**换槽**。同一个 IP 在
     429 之后短期内不会恢复，原地重试只会把上游的限流窗口越拖越长。
     """
-    if not await egress_pool.ready():
+    mode = _EGRESS_MODE.get()
+    if mode == "legacy":
+        use_pool = False
+    elif mode == "pool":
+        use_pool = await egress_pool.ready()
+    else:
+        use_pool = egress_pool.configured() and await egress_pool.ready()
+    if not use_pool:
         return await browser_egress_client.generate(**kwargs)
 
     tried: set[int] = set()

@@ -110,8 +110,6 @@ async def ready() -> bool:
     恒返回 None ⇒ 每个请求都被映射成 429，整站瞬间不可用。
     这是部署顺序错误，不是流量问题；入口必须拦住并回落到老路径。
     """
-    if not configured():
-        return False
     if _ready_cache["ok"]:
         return True
     now = time.time()
@@ -423,8 +421,6 @@ async def acquire(*, exclude: Iterable[int] = ()) -> Slot | None:
     代价：无。段级轮询不减少总调用量，只改变顺序 —— 除非只剩一个段还有
     额度，那时所有请求只能挤在该段，属容量不足而非策略问题。
     """
-    if not configured():
-        return None
     ex = set(exclude)
     now = time.time()
     cand = [s for s in await list_slots()
