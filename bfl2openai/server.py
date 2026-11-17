@@ -33,6 +33,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from . import browser_egress_client
+from . import egress_pool
 from . import payload
 from . import upstream
 from . import native
@@ -67,6 +68,10 @@ app = FastAPI(title="bfl2openai", version="0.2.0", lifespan=_lifespan)
 native.register(app)
 uploads.register(app)
 async_images.register(app)
+# 运维面：入口层 nginx 对 /panel 直接 404，只能走 SSH 隧道访问。
+from . import panel  # noqa: E402 - 必须在 app 建好之后注册
+
+app.include_router(panel.router)
 
 MODEL_ID = os.environ.get("BFL2OPENAI_MODEL", "flux-precise-edit")
 API_KEY = os.environ.get("BFL2OPENAI_API_KEY", "")  # optional; empty = auth disabled
@@ -187,7 +192,20 @@ _SAFE_ERRORS = {
     "upstream_timeout": "upstream timeout; retry later",
     "upstream_unavailable": "upstream temporarily unavailable",
     "upstream_rejected": "upstream rejected the request",
+    "invalid_request": "invalid or expired request token; submit a new job",
 }
+
+#: 429 响应的 Retry-After 秒数（OpenAI 语义：客户端据此退避）。
+#: 上游配额是「当天耗尽」，这里给 60s 而不是 3600 —— 出口池会换 IP/换页，
+#: 短期内确有恢复可能；给太大等于让客户端一小时内不再尝试。
+_RETRY_AFTER_S = "60"
+
+#: 429 语义兜底识别。显式 kind/status 之外，旧版 sidecar 会把上游 429 折叠进
+#: 502 的错误文本里（`submit 429: ...`），滚动发布期间必须靠文案兜住。
+#: 只参与「→ 429」的判定，绝不参与对外文案。
+_RATE_LIMIT_RE = re.compile(
+    r"(?:\bHTTP\s*429\b|\bsubmit\s*429\b|\brate[_ -]?limit"
+    r"|\bquota\b|\btoo many requests\b)", re.I)
 
 _SECRET_RE = re.compile(r"(?:socks5h?|https?|wss?)://[^@\s/]+@")
 #: CF 边缘 ray id（`sin1::mqx5x-1794…`）前缀是机房代码，等于暴露出口区域。
@@ -195,8 +213,10 @@ _RAY_RE = re.compile(r"\b[a-z]{3}\d{1,2}::[0-9A-Za-z_-]+")
 
 #: 上游固定文案 → 标准词。日志里保留原文没意义（都是已知分类），
 #: 而 `You've used today's 30 free generations` 这类句子会把额度规则写进日志。
+#: 正则必须吃到整句尾巴，否则脱敏后仍残留「明天再来」这条规则。
 _PHRASE_MAP = (
-    (re.compile(r"you'?ve used today'?s \d+ free generations", re.I),
+    (re.compile(r"you'?ve used today'?s \d+ free generations"
+                r"(?:[.!\s]*please come back tomorrow)?", re.I),
      "<quota_exhausted>"),
     (re.compile(r"\btoo many requests\b", re.I), "<rate_limited>"),
     (re.compile(r"\baccess denied\b", re.I), "<access_denied>"),
@@ -249,20 +269,30 @@ def wrap_upstream_error(exc: UpstreamError) -> JSONResponse:
         log.warning("moderation rejected: %s", _redact(exc.message, 300))
         return openai_error(451, _SAFE_ERRORS["content_policy_violation"],
                             "content_policy_violation")
-    status = 400 if exc.kind == "invalid_request_error" else 502
-    log.warning("upstream error kind=%s status=%s: %s",
-                exc.kind, status, _redact(exc.message))
-    if status == 400:
-        # invalid_request_error 基本都是本网关自己产生的参数校验文案
-        # （如 "at most 10 images"），对上上游原文无暴露风险，保留可纠正性。
-        return openai_error(400, _redact(exc.message, 200), _public_type(exc.kind))
+    # 上游配额 / 限流：对齐 OpenAI 语义回 429 + Retry-After，让客户端退避。
+    # 2026-11-17 之前这里一律 502，客户端把"额度耗尽"当"服务故障"持续重试，
+    # 一个下午放大出 718 次 504 + 242 次 502。
+    if exc.kind == "rate_limit" or (
+            exc.kind != "invalid_request_error"
+            and _RATE_LIMIT_RE.search(str(exc.message))):
+        log.warning("upstream rate limited: %s", _redact(exc.message, 400))
+        resp = openai_error(429, _SAFE_ERRORS["rate_limit"], "rate_limit_error")
+        resp.headers["Retry-After"] = _RETRY_AFTER_S
+        return resp
+    if exc.kind == "invalid_request_error":
+        # 严格脱敏：上游 token 失效原文含内部标识，只在服务端日志里留原生记录
+        log.warning("upstream invalid request: %s", _redact(exc.message, 400))
+        return openai_error(400, _SAFE_ERRORS["invalid_request"],
+                            "invalid_request_error")
+    log.warning("upstream error kind=%s status=502: %s",
+                exc.kind, _redact(exc.message))
     return openai_error(502, _SAFE_ERRORS["upstream_unavailable"],
                         _public_type(exc.kind))
 
 
 def wrap_browser_egress_error(
         exc: browser_egress_client.BrowserEgressError) -> JSONResponse:
-    """sidecar 失败 → 对客户端有意义的码。
+    """sidecar 失败 → 客户端有意义的码。
 
     历史行为：browser_egress_client 抛裸 RuntimeError，run_job 只捕
     UpstreamError / MPSError ⇒ 冒到 ASGI 层变 500 + 21 字节空体。客户端
@@ -277,12 +307,17 @@ def wrap_browser_egress_error(
     """
     log.warning("browser egress failure status=%s: %s",
                 exc.status, _redact(exc, 400))
+    # 429：上游匿名配额 / 边缘限流耗尽 → 客户端退避。
+    # 兼容滚动发布期的新旧版本混跑：旧 sidecar 会把上游 429 折叠成 502 的 body，
+    # 这里按文案兜底，否则 429 语义会重新丢回 502。
+    if exc.status == 429 or (exc.status == 502
+                             and _RATE_LIMIT_RE.search(str(exc))):
+        resp = openai_error(429, _SAFE_ERRORS["rate_limit"], "rate_limit_error")
+        resp.headers["Retry-After"] = _RETRY_AFTER_S
+        return resp
     if exc.status == 451:
         return openai_error(451, _SAFE_ERRORS["content_policy_violation"],
                             "content_policy_violation")
-    if exc.status == 429:
-        # 配额细节只进日志（含"免费额度"字样），不透给调用方
-        return openai_error(429, _SAFE_ERRORS["rate_limit"], "rate_limit_error")
     if "413" in str(exc) or "Request Entity Too Large" in str(exc):
         # 上游 body 上限：重试无用，必须让调用方缩图（此前笼统报 502，
         # 客户端会当成服务故障无限重试）。
@@ -495,6 +530,54 @@ async def _idem_run(fp: str, produce) -> JSONResponse:
     return resp
 
 
+#: 单个请求最多换几个槽位。429 说明该出口 IP 当天废了，换一个继续；
+#: 3 次仍失败说明池子整体耗尽，此时回 429 让客户端退避是正确的语义。
+_SLOT_ATTEMPTS = int(os.environ.get("BFL2OPENAI_SLOT_ATTEMPTS", "3"))
+
+
+async def _browser_generate(**kwargs) -> bytes:
+    """经侧车生成，并**把成败记到出口 IP 头上**。
+
+    未配置 2090 池时完全走原路径（2088 轮换），行为与历史一致 —— 这是
+    上线时的安全阀：env 不配就不改变任何现有行为。
+
+    配了 env 但**还没扫描**时同样走原路径：此时索引为空，按槽位调度会
+    把所有请求判成"池子耗尽"并回 429。宁可退回旧行为，也不能因为部署
+    顺序把整站打挂。
+
+    429 的处置是这里的关键：不重试同一槽位，而是**换槽**。同一个 IP 在
+    429 之后短期内不会恢复，原地重试只会把上游的限流窗口越拖越长。
+    """
+    if not await egress_pool.ready():
+        return await browser_egress_client.generate(**kwargs)
+
+    tried: set[int] = set()
+    last: browser_egress_client.BrowserEgressError | None = None
+    for _ in range(_SLOT_ATTEMPTS):
+        slot = await egress_pool.acquire(exclude=tried)
+        if slot is None:
+            # 全部槽位额度耗尽/冷却中：429 比 502 更接近真相
+            raise browser_egress_client.BrowserEgressError(
+                "all exit slots exhausted", 429)
+        tried.add(slot.slot)
+        try:
+            data = await browser_egress_client.generate(
+                proxy_slot=slot.slot, **kwargs)
+        except browser_egress_client.BrowserEgressError as exc:
+            if exc.status == 429:
+                await egress_pool.note_rate_limited(slot.slot)
+                log.warning("slot %03d ip=%s hit 429, rotating (n=%d)",
+                            slot.slot, slot.ip, len(tried))
+                last = exc
+                continue
+            await egress_pool.note_failure(slot.slot)
+            raise
+        await egress_pool.note_success(slot.slot)
+        return data
+    raise last or browser_egress_client.BrowserEgressError(
+        "all exit slots exhausted", 429)
+
+
 async def _run_job_impl(
     image_png: bytes | None,
     prompt: str,
@@ -572,7 +655,7 @@ async def _run_job_impl(
             # 名词覆盖极敏感，模糊指令下会把整幅重画成无关物体，却照样返回
             # 200 + 正常尺寸。那种"看起来成功、内容全错"的静默降级比直接报错
             # 危险得多（客户无法察觉）。失败就让错误上行。
-            browser_media = await browser_egress_client.generate(
+            browser_media = await _browser_generate(
                 image_png=fit_main or b"", prompt=prompt,
                 aspect_ratio=aspect_ratio, resolution=gen_resolution, mode=mode,
                 boxes_json=json.dumps(boxes) if boxes else None,
@@ -606,7 +689,7 @@ async def _run_job_impl(
                             "fallback token=%s… (resolution=%s main=%dB refs=%d)",
                             poll_token[:10], gen_resolution,
                             len(fit_main or b""), len(fit_refs))
-                browser_media = await browser_egress_client.generate(
+                browser_media = await _browser_generate(
                     image_png=fit_main or b"", prompt=prompt,
                     aspect_ratio=aspect_ratio, resolution=gen_resolution,
                     mode=mode,
@@ -665,6 +748,10 @@ async def _run_job_impl(
             if not data and first_err is not None:
                 raise first_err
     except UpstreamError as exc:
+        # ── 原生日志（唯一允许出现上游原文的位置）─────────────────────────
+        # 客户端侧一律只拿 _SAFE_ERRORS 固定文案；原文留在这里供事后归因。
+        # 不要为了"统一脱敏"把这条也改成 _redact：那是排查上游契约变更的
+        # 唯一线索。
         log.warning("run_job upstream error: %s", str(exc)[:300])
         if _MODERATION_DIAG and exc.kind == "content_policy":
             snippet = " ".join((prompt or "").split())[:100]
@@ -674,6 +761,7 @@ async def _run_job_impl(
                 len(reference_images or []), str(exc)[-80:])
         return wrap_upstream_error(exc)
     except browser_egress_client.BrowserEgressError as exc:
+        # 同上：原生日志只落服务端（含 sidecar 原文与出口状态码）。
         log.warning("run_job browser egress error (status=%s): %s",
                     exc.status, str(exc)[:300])
         return wrap_browser_egress_error(exc)

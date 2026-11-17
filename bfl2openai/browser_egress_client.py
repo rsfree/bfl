@@ -103,7 +103,8 @@ async def generate(image_png: bytes, prompt: str, aspect_ratio: str,
                    resolution: str, mode: str, boxes_json: str | None = None,
                    references_json: str | None = None,
                    refs: list[bytes] | None = None,
-                   ref_mode: str | None = None) -> bytes:
+                   ref_mode: str | None = None,
+                   proxy_slot: int | None = None) -> bytes:
     """经浏览器 sidecar 完成一次生成，返回图片字节。失败抛 BrowserEgressError。
 
     `ref_mode`：
@@ -127,6 +128,9 @@ async def generate(image_png: bytes, prompt: str, aspect_ratio: str,
         "references": references_json or "[]",
         "refs": [base64.b64encode(r).decode() for r in (refs or [])],
         "ref_mode": ref_mode,
+        # 2090 pin 模式：指定本次必须走哪个出口槽位。给了就必须钉死，
+        # 否则「这次成功算到哪个 IP 头上」会失真，配额就白记了。
+        "proxy_slot": proxy_slot,
     }
 
     order = _order()

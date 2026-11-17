@@ -47,6 +47,19 @@ x-egress-env: &egress-env
   BFL2OPENAI_EGRESS_TZ: "America/New_York"   # 须与出口地域一致（UTC 是机房特征）
   # 池代理凭证放 .env，不进版本库
   UPSTREAM_PROXY: "${UPSTREAM_PROXY:?UPSTREAM_PROXY 未在 .env 中配置}"
+  # ── 2090 pin 模式：账号=槽位 → 固定出口 IP ──────────────────────────
+  # 不配这三个变量就是历史行为（2088 逐连接轮换），可作为一键回滚开关。
+  # 槽位数 0 = 关闭。凭证只从 .env 注入，绝不写进本文件。
+  BFL2OPENAI_POOL_HOST: "${BFL2OPENAI_POOL_HOST:-}"
+  BFL2OPENAI_POOL_PORT: "${BFL2OPENAI_POOL_PORT:-2090}"
+  BFL2OPENAI_POOL_PASS: "${BFL2OPENAI_POOL_PASS:-}"
+  BFL2OPENAI_POOL_USER_PREFIX: "${BFL2OPENAI_POOL_USER_PREFIX:-poolclient}"
+  BFL2OPENAI_POOL_SLOTS: "${BFL2OPENAI_POOL_SLOTS:-3000}"
+  BFL2OPENAI_POOL_QUOTA: "${BFL2OPENAI_POOL_QUOTA:-30}"
+  BFL2OPENAI_POOL_SOFT_QUOTA: "${BFL2OPENAI_POOL_SOFT_QUOTA:-}"
+  #: 停手点留空 = 榨干（等于额度 30）。想留风控余量就配 20 这类小值，
+  #: 有效值恒 ≤ 额度，配超了会被夹住。
+  BFL2OPENAI_POOL_STRETCH: "${BFL2OPENAI_POOL_STRETCH:-0}"
 
 services:
   redis:
@@ -90,6 +103,17 @@ services:
       # 多实例：逗号分隔，客户端按进程内相位 + 轮询分发；传输失败/503/429 换实例。
       BFL2OPENAI_BROWSER_EGRESS: "http://172.18.0.10:8011,http://172.18.0.11:8011,http://172.18.0.12:8011"
       BFL2OPENAI_BROWSER_PRIMARY: "1"   # 跳过 curl_cffi（当前恒 403，白耗 2-3 分钟）
+      # 出口槽注册表（2090 pin 模式）。与 sidecar 侧同名变量一致；不配则整套
+      # 路由逻辑自动旁路（egress_pool.configured() 为假），行为与历史完全一致。
+      BFL2OPENAI_POOL_HOST: "${BFL2OPENAI_POOL_HOST:-}"
+      BFL2OPENAI_POOL_PORT: "${BFL2OPENAI_POOL_PORT:-2090}"
+      BFL2OPENAI_POOL_PASS: "${BFL2OPENAI_POOL_PASS:-}"
+      BFL2OPENAI_POOL_USER_PREFIX: "${BFL2OPENAI_POOL_USER_PREFIX:-poolclient}"
+      BFL2OPENAI_POOL_SLOTS: "${BFL2OPENAI_POOL_SLOTS:-3000}"
+      BFL2OPENAI_POOL_QUOTA: "${BFL2OPENAI_POOL_QUOTA:-30}"
+      BFL2OPENAI_POOL_SOFT_QUOTA: "${BFL2OPENAI_POOL_SOFT_QUOTA:-}"
+      BFL2OPENAI_POOL_STRETCH: "${BFL2OPENAI_POOL_STRETCH:-0}"
+      BFL2OPENAI_SLOT_ATTEMPTS: "${BFL2OPENAI_SLOT_ATTEMPTS:-3}"
     env_file: ./.env                    # 凭证/回退代理/PUBLIC_BASE 注入容器环境
     depends_on:
       - redis

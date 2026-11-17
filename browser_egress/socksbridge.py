@@ -7,12 +7,18 @@ Chromium 不支持 SOCKS5 用户名/密码认证，而池只提供认证版 sock
 """
 
 import asyncio
+import os
 import struct
 import sys
 
 LISTEN_PORT = int(sys.argv[1])
 UP_HOST, UP_PORT = sys.argv[2], int(sys.argv[3])
-UP_USER, UP_PASS = sys.argv[4].encode(), sys.argv[5].encode()
+# 优先 argv，其次环境变量。槽位桥用环境变量传凭据——argv 会出现在容器内
+# `ps` 的输出里，等于把池密码写在公开位置。
+UP_USER = (sys.argv[4] if len(sys.argv) > 4
+           else os.environ.get("SB_USER", "")).encode()
+UP_PASS = (sys.argv[5] if len(sys.argv) > 5
+           else os.environ.get("SB_PASS", "")).encode()
 
 
 async def pipe(reader, writer):

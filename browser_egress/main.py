@@ -24,6 +24,7 @@ import json
 import os
 import random
 import re
+import sys
 import time
 
 from fastapi import FastAPI, HTTPException
@@ -59,6 +60,19 @@ PAGES = int(os.environ.get("BFL2OPENAI_EGRESS_PAGES", "8"))
 #: 池代理（socks5://user:pass@host:port）：Chromium 直连=服务器 IP，已被上游
 #: 按 IP 限流（429）；真浏览器指纹 + 换出口 IP 才能过。
 PROXY_URL = os.environ.get("BFL2OPENAI_EGRESS_PROXY", "")
+
+# ── 2090 pin 模式：账号=槽位 → 固定出口 IP ───────────────────────────────
+# 为什么要它：2088 每连接换 IP，系统里没有任何地方知道「某个 IP 已经用掉
+# 28 次」，配额无法落账。2090 用 `poolclient-{n}` 把出口钉死，计数键才能
+# 定成 IP。Chromium 不支持带认证的 socks5，所以每个槽位起一个本地桥
+# （socksbridge 已存在），页面按槽位的桥端口建 context。
+POOL_HOST = os.environ.get("BFL2OPENAI_POOL_HOST", "")
+POOL_PORT = int(os.environ.get("BFL2OPENAI_POOL_PORT", "2090"))
+POOL_PASS = os.environ.get("BFL2OPENAI_POOL_PASS", "")
+POOL_USER_PREFIX = os.environ.get("BFL2OPENAI_POOL_USER_PREFIX", "poolclient")
+#: 槽位端口基数：slot n → 127.0.0.1:(base+n)。避开 1080（2088 那把桥）。
+POOL_BRIDGE_BASE_PORT = int(os.environ.get("BFL2OPENAI_POOL_BRIDGE_BASE", "11000"))
+PIN_ENABLED = bool(POOL_HOST and POOL_PASS)
 
 #: 全局并发上限。默认 20（8 页 → 每页 cap = ceil(20/8) = 3，见 acquire_entry）。
 #: 这是「池子总量」而非每页放开：单 IP 并发连接越多，越容易撞上游配额。
@@ -347,15 +361,135 @@ DEFUSE_JS = """
 """
 
 
-async def _new_page(browser, idx: int, version: str, gen: int = 0) -> dict:
-    prof = _build_profile(idx, version, gen)
+# ── 槽位本地桥 ──────────────────────────────────────────────────────────
+# 一个槽位 = 一条上游认证 socks5 = 一个固定出口 IP。Chromium 不会认证，
+# 所以每条槽位起一个本地无认证桥，页面按端口选桥。
+
+_BRIDGE: dict[int, asyncio.subprocess.Process] = {}
+_BRIDGE_LAST: dict[int, float] = {}
+_BRIDGE_LOCK = asyncio.Lock()
+#: 常驻桥上限。槽位可轮转到数百个，每换一个就常驻一个进程会把容器吃爆
+#: （588 个槽位 × 3 实例 ≈ 1,700 个进程）。页面并发上限只有 MAX_INFLIGHT，
+#: 32 条桥足够覆盖在飞的页面，其余按 LRU 淘汰。
+MAX_BRIDGES = int(os.environ.get("BFL2OPENAI_POOL_MAX_BRIDGES", "32"))
+
+
+def _bridge_port(slot: int) -> int:
+    return POOL_BRIDGE_BASE_PORT + slot
+
+
+def _evict_bridges_locked() -> None:
+    """淘汰最久未用的空闲桥。正在被页面占用的槽位不淘汰。"""
+    if len(_BRIDGE) <= MAX_BRIDGES:
+        return
+    busy = {e.get("slot") for e in (_state.get("pool") or [])}
+    idle = [(s, p) for s, p in _BRIDGE.items()
+            if s not in busy and p.returncode is None]
+    idle.sort(key=lambda kv: _BRIDGE_LAST.get(kv[0], 0.0))
+    for s, p in idle[:len(_BRIDGE) - MAX_BRIDGES]:
+        try:
+            p.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+        _BRIDGE.pop(s, None)
+        _BRIDGE_LAST.pop(s, None)
+
+
+async def _ensure_bridge(slot: int) -> int:
+    """保证该槽位的本地桥在跑，返回端口。
+
+    桥进程常驻：同一个槽位重建桥不会换出口 IP，只会丢连接，所以按需拉起、
+    不主动回收。
+    """
+    if not PIN_ENABLED:
+        raise RuntimeError("2090 pin 模式未配置（BFL2OPENAI_POOL_HOST/_PASS）")
+    port = _bridge_port(slot)
+    _BRIDGE_LAST[slot] = time.time()
+    async with _BRIDGE_LOCK:
+        proc = _BRIDGE.get(slot)
+        if proc is not None and proc.returncode is None:
+            return port
+        argv = [sys.executable, "/app/socksbridge.py", str(port),
+                POOL_HOST, str(POOL_PORT)]
+        # 凭据走环境变量：argv 会出现在容器内 ps 输出里，等于明文张贴密码。
+        env = dict(os.environ, SB_USER=f"{POOL_USER_PREFIX}-{slot:03d}",
+                   SB_PASS=POOL_PASS)
+        _BRIDGE[slot] = await asyncio.create_subprocess_exec(
+            *argv, env=env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL)
+        _evict_bridges_locked()
+    for _ in range(50):
+        try:
+            _, w = await asyncio.open_connection("127.0.0.1", port)
+            w.close()
+            return port
+        except Exception:  # noqa: BLE001 - 桥还没 listen，重试
+            await asyncio.sleep(0.1)
+    raise RuntimeError(f"slot {slot} 的本地桥未就绪（port {port}）")
+
+
+async def _rebind(entry: dict, slot: int) -> None:
+    """把某个页面原地切到指定槽位：换 context 就是换出口 IP。
+
+    原地改 entry 而不新建 dict —— 池子存的是同一个对象引用，换对象会让
+    其它协程手里的 entry 失配。
+    """
+    browser = _state.get("browser")
+    if browser is None or not browser.is_connected():
+        raise RuntimeError("browser not connected")
+    gen = int(entry.get("gen", 0)) + 1
+    prof = _build_profile(entry["idx"], entry.get("version", ""), gen)
+    port = await _ensure_bridge(slot)
     ctx = await browser.new_context(
+        locale="en-US", timezone_id=TZ_ID,
+        viewport={"width": prof["vw"], "height": prof["vh"]},
+        device_scale_factor=prof["dpr"], user_agent=prof["ua"],
+        proxy={"server": f"socks5://127.0.0.1:{port}"},
+    )
+    try:
+        await ctx.add_init_script(INIT_JS.replace("%PROFILE%", json.dumps(prof)))
+        pg = await ctx.new_page()
+        await pg.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+        try:
+            await pg.evaluate(DEFUSE_JS)
+        except Exception:  # noqa: BLE001
+            pass
+        cdp = await ctx.new_cdp_session(pg)
+    except BaseException:
+        # 新 context 建失败必须就地关掉，否则每失败一次泄漏一份渲染进程
+        try:
+            await ctx.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    old = entry.get("ctx")
+    entry.update({"ctx": ctx, "page": pg, "cdp": cdp, "profile": prof,
+                  "gen": gen, "slot": slot, "err_streak": 0,
+                  "cooldown_until": 0.0})
+    if old is not None:
+        try:
+            await old.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _new_page(browser, idx: int, version: str, gen: int = 0,
+                    slot: int | None = None) -> dict:
+    prof = _build_profile(idx, version, gen)
+    ctx_kwargs = dict(
         locale="en-US",
         timezone_id=TZ_ID,
         viewport={"width": prof["vw"], "height": prof["vh"]},
         device_scale_factor=prof["dpr"],
         user_agent=prof["ua"],
     )
+    if slot is not None:
+        # context 级 proxy 会覆盖 browser 级：这是把「一个页面钉到一个出口」
+        # 落地的唯一方式，Chromium 的认证由本地 socksbridge 兜掉。
+        port = await _ensure_bridge(slot)
+        ctx_kwargs["proxy"] = {"server": f"socks5://127.0.0.1:{port}"}
+    ctx = await browser.new_context(**ctx_kwargs)
     await ctx.add_init_script(
         INIT_JS.replace("%PROFILE%", json.dumps(prof)))
     pg = await ctx.new_page()
@@ -367,7 +501,7 @@ async def _new_page(browser, idx: int, version: str, gen: int = 0) -> dict:
         pass
     cdp = await ctx.new_cdp_session(pg)
     entry = {"idx": idx, "gen": gen, "ctx": ctx, "page": pg, "cdp": cdp,
-             "profile": prof,
+             "profile": prof, "version": version, "slot": slot,
              "inflight": 0, "submits": 0, "errors": 0, "err_streak": 0,
              "cooldown_until": 0.0, "recycled": 0,
              "eval_lock": asyncio.Lock()}
@@ -815,7 +949,11 @@ async def _maintain_pool():
             for e in list(pool):
                 if e.get("recycling") or e.get("inflight", 0) > 0:
                     continue
-                if e.get("want_recycle") or e["submits"] >= MAX_REQ_PER_CTX:
+                # pin 模式下「按次数换 context」由配额接管：换 context 会丢掉
+                # 已绑定的槽位（回到 2088 浏览器级代理），下一次请求又得重建，
+                # 纯属浪费。是否换 IP 交给注册表的 remaining 决定。
+                if e.get("want_recycle") or (
+                        not PIN_ENABLED and e["submits"] >= MAX_REQ_PER_CTX):
                     e["want_recycle"] = False
                     schedule_recycle(e)
         except Exception as exc:  # noqa: BLE001
@@ -859,6 +997,9 @@ class GenReq(BaseModel):
     #: 上游 model 字段（"flux-3-image" / 待确认的 klein 取值）。
     #: 留空不发，与历史行为一致。
     model: str | None = None
+    #: 指定出口槽位（2090 pin 模式）。调用方按注册表决定用哪个槽位；
+    #: 给了就必须钉死在该槽位，否则「成功算到哪个 IP 头上」会失真。
+    proxy_slot: int | None = None
 
 
 FP_JS = """
@@ -955,12 +1096,29 @@ async def generate(req: GenReq):
     entry: dict | None = None
     switched: set[int] = set()
     t_start = time.time()
+    want_slot = req.proxy_slot
     try:
         entry = await acquire_entry()
+        if want_slot is not None:
+            if not PIN_ENABLED:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "pin mode not configured on sidecar"})
+            if entry.get("slot") != want_slot:
+                # 页面当前不在目标槽位上：换 context。失败就直接拒绝，
+                # 不能退回旧槽位——否则这次成功会被记到错误的 IP 头上。
+                try:
+                    await _rebind(entry, want_slot)
+                except Exception as exc:  # noqa: BLE001
+                    return JSONResponse(
+                        status_code=503,
+                        content={"error": f"rebind slot {want_slot} failed: "
+                                          f"{type(exc).__name__}"})
         sub = None
         for attempt in range(3):
-            if entry["err_streak"] >= 3:
-                # 该页连续失败：冷却 + 后台换新会话，避免在同一坏出口反复撞墙
+            if entry["err_streak"] >= 3 and want_slot is None:
+                # 该页连续失败：冷却 + 后台换新会话，避免在同一坏出口反复撞墙。
+                # pin 模式下不换页：换了就脱离指定槽位，计数会算错 IP。
                 bad = entry
                 bad["cooldown_until"] = time.time() + min(
                     IP_COOLDOWN_S * 3, IP_COOLDOWN_MAX_S)
@@ -1000,6 +1158,10 @@ async def generate(req: GenReq):
             else:
                 print(f"[gen] 429 on exit ip, cooling page#{entry['idx']} "
                       f"{IP_COOLDOWN_S:.0f}s (try {attempt + 2})", flush=True)
+            if want_slot is not None:
+                # pin 模式：出口由调用方指定，不能私自换页（换了就是换 IP，
+                # 429 的归属和后续计数全乱）。直接把这个槽位的 429 抛回去。
+                break
             if attempt < 2:
                 _release(entry)
                 switched.add(id(entry))
@@ -1017,6 +1179,11 @@ async def generate(req: GenReq):
                 # 三个出口都 403 才算一次"上游在拒绝浏览器"（单个坏 IP 不算）
                 _breaker_on_block("403 access_denied (browser)")
                 entry["cooldown_until"] = time.time() + IP_COOLDOWN_S
+            # 429 必须原样上报。折叠成 502 会让上层把"配额耗尽、应当退避"误判成
+            # "服务故障、立即重试"，单小时能放大出数百次无效重试（2026-11-17 实测）。
+            if sub["status"] == 429:
+                return JSONResponse(status_code=429,
+                                    content={"error": f"submit 429: {body}"})
             return JSONResponse(status_code=502,
                                content={"error": f"submit {sub['status']}: {body}"})
         entry["err_streak"] = 0
@@ -1106,12 +1273,13 @@ async def generate(req: GenReq):
             med = await _eval(entry, MEDIA_JS, image_token, timeout=MEDIA_TIMEOUT_S)
         print(f"[gen] poll={t_ready - t_submit:.1f}s rounds={rounds} "
               f"media={time.time() - t_ready:.1f}s "
-              f"total={time.time() - t_start:.1f}s", flush=True)
+              f"total={time.time() - t_start:.1f}s slot={entry.get('slot')}",
+              flush=True)
         if med.get("status") != 200 or not med.get("b64"):
             return JSONResponse(status_code=502,
                                content={"error": f"media {med.get('status')}: "
                                                  f"{str(med.get('body'))[:150]}"})
-        return {"image_b64": med["b64"]}
+        return {"image_b64": med["b64"], "slot": entry.get("slot")}
     except Exception as exc:  # noqa: BLE001
         import traceback
         page_tag = entry["idx"] if entry is not None else -1

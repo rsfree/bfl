@@ -147,3 +147,71 @@ def test_redact_strips_credentials_and_ray_ids():
     assert "sin1::" not in out and "mqx5x" not in out
     assert "user:pw" not in out, "凭据必须清掉"
     assert "<ray>" in out and "<redacted>://" in out
+
+
+# -------------------------------------- 429 语义对齐（2026-11-17）
+# 事故背景：sidecar 把上游 429 折叠成 502，客户端把「额度耗尽、应当退避」
+# 读成「服务故障、立即重试」，14:41–17:30 放大出 718 次 504 + 242 次 502。
+# 修复后：sidecar 透传 429；应用层对旧版 sidecar 的折叠做文案兜底。
+
+
+def test_legacy_sidecar_502_is_remapped_to_429():
+    """滚动发布期旧 sidecar 仍会把 429 塞进 502 的 body，必须兜住。"""
+    exc = _err(502, '{"error":"submit 429: Too Many Requests"}')
+    resp = server.wrap_browser_egress_error(exc)
+    assert resp.status_code == 429, resp.body
+    assert resp.headers.get("Retry-After"), "429 必须带 Retry-After"
+
+
+def test_429_keeps_retry_after_and_no_upstream_text():
+    exc = _err(429, '{"error":"You\'ve used today\'s 30 free generations."}')
+    resp = server.wrap_browser_egress_error(exc)
+    assert resp.status_code == 429
+    assert resp.headers["Retry-After"].isdigit()
+    msg = __import__("json").loads(resp.body)["error"]["message"]
+    assert msg == server._SAFE_ERRORS["rate_limit"]
+    assert "free generations" not in msg
+
+
+def test_contract_error_is_not_mistaken_for_rate_limit():
+    """上游契约错误（composition）不能被误判成 429 —— 否则客户端会无脑重试。"""
+    exc = _err(502, '{"error":"submit 400: A composition must not include '
+                    'a canvas image."}')
+    assert server.wrap_browser_egress_error(exc).status_code == 502
+
+
+def test_upstream_direct_path_429_maps_to_429():
+    from bfl2openai.upstream import UpstreamError
+    resp = server.wrap_upstream_error(
+        UpstreamError('generate submit failed after 4 attempts: '
+                      'HTTP 429: {"error":"Too Many Requests"}'))
+    assert resp.status_code == 429, resp.body
+    assert resp.headers.get("Retry-After")
+    assert __import__("json").loads(resp.body)["error"]["type"] == "rate_limit_error"
+
+
+def test_upstream_explicit_rate_limit_kind_maps_to_429():
+    from bfl2openai.upstream import UpstreamError
+    resp = server.wrap_upstream_error(UpstreamError("whatever", "rate_limit"))
+    assert resp.status_code == 429
+
+
+def test_upstream_invalid_request_is_strictly_redacted():
+    """上游 token 失效原文含内部标识，只允许进日志。"""
+    from bfl2openai.upstream import UpstreamError
+    resp = server.wrap_upstream_error(
+        UpstreamError('{"error":"pollToken 8f3a2b1c invalid or expired"}',
+                      "invalid_request_error"))
+    assert resp.status_code == 400
+    body = resp.body.decode()
+    assert "8f3a2b1c" not in body
+    assert body.count("invalid or expired request token") == 1
+
+
+def test_phrase_map_swallows_quota_tail():
+    """脱敏不能只吃掉数字，「明天再来」这半句同样泄漏额度恢复周期。"""
+    out = server._redact("You've used today's 30 free generations. "
+                         "Please come back tomorrow.")
+    assert "<quota_exhausted>" in out
+    assert "come back tomorrow" not in out
+    assert "30" not in out
