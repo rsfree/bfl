@@ -152,7 +152,7 @@ function render(){
   el("rows").innerHTML=shown.map(r=>`<tr>
     <td>#${String(r.slot).padStart(3,"0")}</td>
     <td style="font-family:ui-monospace,monospace">${r.ip||"—"}<span class="mut" style="margin-left:6px">${r.prefix?r.prefix+".0/24":""}</span></td>
-    <td class="s-${r.exhausted?"exhausted":r.state}">${r.exhausted?"额度用尽":r.state==="primary"?"可用":r.state==="dup"?"碰撞":"失败"}</td>
+    <td class="s-${r.cooling_s>0?"exhausted":r.exhausted?"exhausted":r.state}">${r.cooling_s>0?"冷却 "+fmtCool(r.cooling_s):r.exhausted?"额度用尽":r.state==="primary"?"可用":r.state==="dup"?"碰撞":"失败"}</td>
     <td>${r.used} / ${r.soft_quota}</td>
     <td>${r.remaining_safe}</td>
     <td><div class="bar"><i style="width:${pct(r.used,r.soft_quota)}%;background:${r.remaining_safe>0?"var(--ok)":"var(--bad)"}"></i></div></td>

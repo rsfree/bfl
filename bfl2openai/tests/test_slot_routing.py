@@ -238,6 +238,7 @@ def test_403_also_rotates(monkeypatch):
 
     rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
     blocked = [rows[c] for c in calls[:2]]
-    assert all(b.used == b.quota for b in blocked), "被拒的出口应置为耗尽"
+    assert all(not b.available() for b in blocked), "被拒的出口必须退出调度"
+    assert all(b.n403 == 1 for b in blocked), "403 计入 n403"
     assert all(b.n429 == 0 for b in blocked), "403 不该记进 429 计数"
-    assert sum(b.n429 for b in blocked) == 0
+    assert all(b.used == 0 for b in blocked), "403 不消耗额度，今日用量要真实"

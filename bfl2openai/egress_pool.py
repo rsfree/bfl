@@ -451,19 +451,26 @@ async def note_success(slot: int) -> int:
 
 async def note_rate_limited(slot: int, cooldown_s: int | None = None,
                             field: str = "n429") -> float:
-    """撞 429：该 IP 立即标记冷却并置为额度耗尽。
+    """撞 429（额度耗尽）或 403（出口被拒）：标记冷却并退出调度。
 
     直接置 `used = quota` 而不是只设冷却，是因为 429 有两种来源（短窗口
     限流 / 当日额度耗尽），而两者的正确处置相同：**今天不要再碰这个 IP**。
     """
-    cd = DEFAULT_429_COOLDOWN_S if cooldown_s is None else cooldown_s
-    until = time.time() + cd
     b = _b()
     key = _slot_key(slot)
+    if field == "n403":
+        # 403 = 出口被拒，不是"额度用掉了"。绝不能置 used=quota：
+        # 那会把"被封"记成"已出图 30 张"，面板的今日用量直接失真。
+        cd = int(os.environ.get("BFL2OPENAI_POOL_403_COOLDOWN", "21600"))
+    else:
+        cd = DEFAULT_429_COOLDOWN_S if cooldown_s is None else cooldown_s
+    until = time.time() + cd
     await b.hincrby(key, field, 1)
-    d = await b.hgetall(key) or {}
-    quota = int(d.get("quota", _cfg()["quota"]) or _cfg()["quota"])
-    await b.hset(key, mapping={"used": quota, "cool_until": int(until)})
+    upd: dict[str, Any] = {"cool_until": int(until)}
+    if field != "n403":
+        d = await b.hgetall(key) or {}
+        upd["used"] = int(d.get("quota", _cfg()["quota"]) or _cfg()["quota"])
+    await b.hset(key, mapping=upd)
     return until
 
 

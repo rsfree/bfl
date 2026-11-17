@@ -277,3 +277,21 @@ def test_set_quota_is_clamped_to_upstream_max(monkeypatch):
     rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
     assert rows[1].quota == 12, "调小应生效"
     assert rows[1].remaining == 12
+
+
+def test_403_does_not_inflate_usage(monkeypatch):
+    """403 是"被封"不是"出图"，不能把 used 记成满额 —— 否则今日用量虚高。"""
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "2")
+    monkeypatch.setattr(ep, "_probe_ip", _probe_by_slot({"1.1.1.1": [1],
+                                                          "2.2.2.2": [2]}))
+    asyncio.run(ep.scan())
+    asyncio.run(ep.note_success(1))
+    asyncio.run(ep.note_rate_limited(1, field="n403"))
+
+    rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
+    assert rows[1].used == 1, "403 不该扣额度"
+    assert rows[1].n403 == 1
+    assert not rows[1].available(), "被封后必须退出调度"
+    snap = asyncio.run(ep.snapshot())
+    assert snap["used_today"] == 1, "今日用量只算真实出图"
