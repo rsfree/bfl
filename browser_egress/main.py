@@ -799,8 +799,13 @@ async def _rate_wait() -> None:
         await asyncio.sleep(delay)
 
 
-async def acquire_entry(exclude: set[int] | None = None) -> dict:
-    """挑一个健康且不处于 IP 冷却的页面；全忙则短暂排队（不失败）。"""
+async def acquire_entry(exclude: set[int] | None = None,
+                        prefer_slot: int | None = None) -> dict:
+    """挑一个健康且不处于 IP 冷却的页面；全忙则短暂排队（不失败）。
+
+    `prefer_slot`：优先返回**已经绑定在该槽位**的空闲页。窗口热起来的关键——
+    换 context 就要重过 Vercel 挑战（实测每次 5–10s），能复用就别重建。
+    """
     per_page_cap = max(2, (MAX_INFLIGHT + PAGES - 1) // PAGES)
     exclude = exclude or set()
     deadline = time.time() + 25.0
@@ -814,6 +819,10 @@ async def acquire_entry(exclude: set[int] | None = None) -> dict:
                  and e["cooldown_until"] <= now
                  and e["inflight"] < per_page_cap]
         if cands:
+            if prefer_slot is not None:
+                same = [e for e in cands if e.get("slot") == prefer_slot]
+                if same:
+                    cands = same
             entry = min(cands, key=lambda e: (e["inflight"], e["err_streak"]))
             _reserve(entry)
             return entry
@@ -1112,7 +1121,7 @@ async def generate(req: GenReq):
     t_start = time.time()
     want_slot = req.proxy_slot
     try:
-        entry = await acquire_entry()
+        entry = await acquire_entry(prefer_slot=want_slot)
         if want_slot is not None:
             if not PIN_ENABLED:
                 return JSONResponse(
