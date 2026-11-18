@@ -304,4 +304,12 @@ async def page(request: Request):
     # 页面壳不鉴权：照 workbuddy2api 的做法 —— 壳公开、数据要 key。
     # 前端拿到 401 后弹输入框，key 存 localStorage，之后请求带 Bearer。
     # 这样不需要浏览器 Basic 弹窗，也不用依赖入口层 nginx 挡。
-    return HTMLResponse(_PAGE)
+    #
+    # 🔴 必须 no-store：页面没有任何 Cache-Control/ETag/Last-Modified 时，
+    # 浏览器会按启发式规则长期缓存 HTML —— 改了前端逻辑后用户仍跑旧脚本
+    # （2026-11-18 16:30 实测：新版已上线，用户刷新仍是"密钥无效"）。
+    return HTMLResponse(_PAGE, headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
