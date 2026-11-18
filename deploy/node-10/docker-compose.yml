@@ -52,7 +52,12 @@ x-egress-env: &egress-env
                                              # ⇒ 容量瞬时降 1/3，池子不归零。整池重启的代价是
                                              # 该实例 40 秒零出口（14:13–14:15 全站 502 33 次）。
   BFL2OPENAI_EGRESS_MAX_INFLIGHT: "20"       # 全局并发闸门（9 页 → 每页 cap 2.2）
-  BFL2OPENAI_EGRESS_MAX_REQ_PER_CTX: "25"    # 单会话 25 次后换 IP/新 cookie
+  BFL2OPENAI_EGRESS_MAX_REQ_PER_CTX: "25"    # 单会话 25 次后换 IP/新 cookie（pin 模式下不生效）
+  BFL2OPENAI_EGRESS_RELOAD_EVERY: "20"       # 单页累计 20 次提交后原地 reload：不换 context、
+                                             # 不换 IP，只重载文档以清空 V8 堆。MEDIA_JS 每次
+                                             # 取图产生 3–4 倍图片体积的临时对象，GC 不还 OS。
+  BFL2OPENAI_EGRESS_DRAIN_BUDGET: "30"       # 分片重建前等这片的在途请求跑完（秒）。
+                                             # 不等待会抛 TargetClosedError（实测 4/5 次 502）。
   BFL2OPENAI_EGRESS_POLL_TIMEOUT: "165"      # 必须 < 应用侧 180s，否则失败原因送不回
   BFL2OPENAI_EGRESS_IP_COOLDOWN: "20"        # 403/429 后该页冷却秒数
   BFL2OPENAI_EGRESS_TZ: "America/New_York"   # 须与出口地域一致（UTC 是机房特征）

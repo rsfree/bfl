@@ -59,6 +59,7 @@ def _entry(idx, *, with_ctx=False):
         "idx": idx, "page": _FakePage(), "cooldown_until": 0.0,
         "inflight": 0, "submits": 0, "errors": 0, "recycled": 0,
         "gen": 0, "recycling": False, "want_recycle": False,
+        "eval_lock": asyncio.Lock(),
     }
     if with_ctx:
         e["ctx"] = _FakeCtx()
@@ -240,3 +241,126 @@ def test_pick_shard_rotates(side):
     seq = [side._pick_shard() for _ in range(side.SHARDS * 2)]
     assert seq[:side.SHARDS] == list(range(side.SHARDS))
     assert seq[side.SHARDS:] == list(range(side.SHARDS))
+
+
+# ── 优化1：重建前等在途请求结束 ─────────────────────────────────────
+
+class _FakePg:
+    def __init__(self):
+        self.goto_calls = 0
+        self.eval_calls = 0
+
+    async def goto(self, url, **kw):
+        self.goto_calls += 1
+
+    async def evaluate(self, js, *a):
+        self.eval_calls += 1
+        return 0
+
+
+def test_drain_waits_until_inflight_clears(side):
+    import time as _t
+
+    e = _entry(0)
+    e["inflight"] = 1
+
+    async def _run():
+        async def _clear():
+            await asyncio.sleep(0.6)
+            e["inflight"] = 0
+        t = asyncio.create_task(_clear())
+        t0 = _t.time()
+        left = await side._drain_shard([e], 5.0)
+        await t
+        return left, _t.time() - t0
+
+    left, dur = asyncio.run(_run())
+    assert left == 0, "在途请求跑完后不该报剩余"
+    assert dur >= 0.5, f"没有真的等待（{dur:.2f}s）"
+
+
+def test_drain_timeout_reports_leftover(side):
+    e = _entry(0)
+    e["inflight"] = 2
+    left = asyncio.run(side._drain_shard([e], 0.3))
+    assert left == 1, "超时应返回仍在途的页数"
+
+
+def test_drain_budget_shrinks_near_limit(side, monkeypatch):
+    monkeypatch.setattr(side, "_cgroup_mem", lambda: (99, 100))
+    assert side._drain_budget() == 0.0, "99% 水位不该再等"
+    monkeypatch.setattr(side, "_cgroup_mem", lambda: (97, 100))
+    assert side._drain_budget() <= 5.0
+    monkeypatch.setattr(side, "_cgroup_mem", lambda: (90, 100))
+    assert side._drain_budget() == side.DRAIN_BUDGET_S
+
+
+def test_restart_shard_teardown_happens_after_drain(side, monkeypatch):
+    """核心：teardown 必须在在途请求归零之后。"""
+    inflight_at_teardown = []
+
+    async def fake_launch(k):
+        return _FakePw(), _FakeBrowser(), [
+            _entry(i) for i in range(side.PAGES) if side._shard_of(i) == k]
+
+    monkeypatch.setattr(side, "_launch_shard", fake_launch)
+    orig = side._teardown_shard
+
+    async def spy(k):
+        inflight_at_teardown.append(busy["inflight"])
+        await orig(k)
+
+    monkeypatch.setattr(side, "_teardown_shard", spy)
+    _install_shards(side)
+    busy = _entry(0)
+    busy["inflight"] = 1
+    side._state["pool"] = [busy] + [_entry(i) for i in range(1, side.PAGES)]
+
+    async def _run():
+        async def _clear():
+            await asyncio.sleep(0.4)
+            busy["inflight"] = 0
+        t = asyncio.create_task(_clear())
+        await side._restart_shard(0, "mem 94% >= hard 92%")
+        await t
+
+    asyncio.run(_run())
+    # _restart_shard 与 _ensure_shard 都会调 teardown（后者是幂等清理），
+    # 关键是每一次调用时该片都已无在途请求
+    assert inflight_at_teardown, "teardown 没被调用"
+    assert all(x == 0 for x in inflight_at_teardown), \
+        f"teardown 时仍有在途请求 {inflight_at_teardown} —— 会抛 TargetClosedError"
+
+
+# ── 优化2：页面级 reload ──────────────────────────────────────────
+
+def test_reload_page_resets_submits(side):
+    e = _entry(0)
+    e["page"] = _FakePg()
+    e["submits"] = 20
+
+    asyncio.run(side._reload_page(e))
+
+    assert e["page"].goto_calls == 1, "没有重新加载页面"
+    assert e["submits"] == 0, "reload 后计数没清零"
+    assert e["reloading"] is False, "reloading 标记未复位"
+
+
+def test_reload_failure_retires_page(side):
+    class _BoomPg(_FakePg):
+        async def goto(self, url, **kw):
+            raise RuntimeError("goto aborted")
+
+    e = _entry(0)
+    e["page"] = _BoomPg()
+    retired = []
+
+    side_backup = side._retire
+    side._retire = lambda entry, reason: retired.append(reason)
+    try:
+        asyncio.run(side._reload_page(e))
+    finally:
+        side._retire = side_backup
+
+    assert retired and "reload" in retired[0], "reload 失败没交给 retire"
+    assert e["reloading"] is False

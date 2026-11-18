@@ -150,6 +150,17 @@ RECYCLE_BACKOFF_MAX_S = float(
 #: 约 150–200MB），所以片数不要贪多：3 片 ≈ +0.5G，配合 PAGES=9 用。
 SHARDS = max(1, int(os.environ.get("BFL2OPENAI_EGRESS_SHARDS", "3")))
 
+#: 分片重建时等在途请求跑完的预算（秒）。越接近内存上限预算越短，
+#: 见 _drain_budget()。
+DRAIN_BUDGET_S = float(
+    os.environ.get("BFL2OPENAI_EGRESS_DRAIN_BUDGET", "30"))
+
+#: 单页累计提交多少次后原地 reload（不换 context / 不换 IP）。
+#: 目的是释放 V8 堆：MEDIA_JS 每次取图产生 ArrayBuffer + 拼接字符串 +
+#: btoa 三份拷贝（约 3–4 倍图片体积），GC 回收后 RSS 也不归还 OS，
+#: 跑十几分钟就把 4G 限额顶到 92%。0 = 关闭。
+RELOAD_EVERY = int(os.environ.get("BFL2OPENAI_EGRESS_RELOAD_EVERY", "20"))
+
 app = FastAPI()
 _state: dict = {
     "pool": [], "lock": asyncio.Lock(), "recycle_lock": asyncio.Lock(),
@@ -896,6 +907,36 @@ def _retire(entry: dict, reason: str) -> None:
     schedule_recycle(entry)
 
 
+async def _reload_page(entry: dict) -> None:
+    """原地 reload 页面，把 JS 堆里的图片/字符串彻底释放。
+
+    不换 context、不换 IP、不动槽位绑定 —— 只把文档重载一遍，V8 堆随之清空。
+    比 recycle（换 context = 换 IP + 重新握手代理）便宜得多，也不影响出口。
+    """
+    if entry.get("reloading"):
+        return
+    entry["reloading"] = True
+    idx = entry["idx"]
+    try:
+        async with entry["eval_lock"]:
+            await _page_wake(entry)
+            await entry["page"].goto(PAGE_URL, wait_until="load",
+                                     timeout=60000)
+            try:
+                await entry["page"].evaluate(DEFUSE_JS)
+            except Exception:  # noqa: BLE001 - 清 canvas 失败不影响功能
+                pass
+            await _page_sleep(entry)
+        entry["submits"] = 0
+        print(f"[pool] page#{idx} reloaded (heap reset)", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[pool] page#{idx} reload failed: "
+              f"{type(exc).__name__}: {str(exc)[:80]}", flush=True)
+        _retire(entry, f"reload: {type(exc).__name__}")
+    finally:
+        entry["reloading"] = False
+
+
 def _reserve(entry: dict):
     entry["inflight"] += 1
     _state["total_inflight"] += 1
@@ -983,6 +1024,7 @@ async def acquire_entry(exclude: set[int] | None = None,
         cands = [e for e in pool
                  if id(e) not in exclude
                  and not e.get("recycling")
+                 and not e.get("reloading")
                  and _page_ok(e)
                  and e["cooldown_until"] <= now
                  and e["inflight"] < per_page_cap]
@@ -1105,6 +1147,39 @@ def _cgroup_mem() -> tuple[int, int] | None:
     return None
 
 
+async def _drain_shard(entries: list, budget_s: float) -> int:
+    """等这批页面的在途请求跑完，最多 budget_s 秒；返回超时仍 inflight 的数量。
+
+    🔴 2026-11-18 实测：不等待直接 teardown，在途请求会抛
+    `TargetClosedError: Page.evaluate: Target page, context or browser has
+    been closed` —— 18 分钟里 5 次 502 有 4 次是这么来的。这些页已经从池子
+    里摘掉，不会再接新请求，所以只要等在途的自然结束即可。
+    """
+    if not entries:
+        return 0
+    end = time.time() + max(0.0, budget_s)
+    while time.time() < end:
+        if not any(e.get("inflight", 0) > 0 for e in entries):
+            return 0
+        await asyncio.sleep(0.5)
+    return sum(1 for e in entries if e.get("inflight", 0) > 0)
+
+
+def _drain_budget() -> float:
+    """在途请求的等待预算：越逼近上限越短，避免为了"优雅"等出 OOM。"""
+    mem = _cgroup_mem()
+    if not mem or not mem[1]:
+        return DRAIN_BUDGET_S
+    ratio = mem[0] / mem[1]
+    if ratio >= 0.99:
+        return 0.0
+    if ratio >= 0.96:
+        return min(DRAIN_BUDGET_S, 5.0)
+    if ratio >= 0.94:
+        return min(DRAIN_BUDGET_S, 15.0)
+    return DRAIN_BUDGET_S
+
+
 async def _restart_shard(k: int, reason: str) -> None:
     """只重建第 k 片：其余分片照常服务，池子不归零。
 
@@ -1116,13 +1191,23 @@ async def _restart_shard(k: int, reason: str) -> None:
     now = time.time()
     for i in idxs:
         _state["shard_block"][i] = now + 900
+    detached: list = []
     try:
         print(f"[pool] RESTART shard#{k}: {reason}", flush=True)
-        # 与页面回收互斥：重建期间不要有别的协程在关同一片里的 ctx
+        async with _state["lock"]:
+            detached = [e for e in _state["pool"]
+                        if _shard_of(e["idx"]) == k]
+            _state["pool"] = [e for e in _state["pool"]
+                              if _shard_of(e["idx"]) != k]
+        # 摘牌后先等在途请求跑完，再关 browser（否则 TargetClosedError）
+        budget = _drain_budget()
+        left = await _drain_shard(detached, budget)
+        if left:
+            print(f"[pool] shard#{k} drain timeout ({budget:.0f}s): "
+                  f"{left} page(s) still inflight, forcing teardown",
+                  flush=True)
+        # 与页面回收互斥：关闭期间不要有别的协程在动这片的 ctx
         async with _state["recycle_lock"]:
-            async with _state["lock"]:
-                _state["pool"] = [e for e in _state["pool"]
-                                  if _shard_of(e["idx"]) != k]
             await _teardown_shard(k)
         await _ensure_shard(k)
     finally:
@@ -1170,6 +1255,18 @@ async def _maintain_pool():
         except Exception as exc:  # noqa: BLE001
             print(f"[maintain] error: {type(exc).__name__}: {str(exc)[:100]}",
                   flush=True)
+        # ---- 页面级 reload：释放 V8 堆里累积的图片/字符串 ---------------
+        try:
+            if RELOAD_EVERY > 0:
+                for e in list(_state["pool"]):
+                    if e.get("inflight", 0) > 0 or e.get("recycling") \
+                            or e.get("reloading"):
+                        continue
+                    if e.get("submits", 0) >= RELOAD_EVERY:
+                        asyncio.create_task(_reload_page(e))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[maintain] reload error: {type(exc).__name__}: "
+                  f"{str(exc)[:100]}", flush=True)
         # ---- 内存水位自保 ----------------------------------------------
         try:
             mem = _cgroup_mem()
@@ -1532,7 +1629,8 @@ async def _prebind_pages() -> None:
             pool = _state.get("pool") or []
             free = [e for e in pool
                     if e.get("slot") is None and e.get("inflight", 0) == 0
-                    and not e.get("recycling")]
+                    and not e.get("recycling")
+                    and not e.get("reloading")]
             if not free:
                 return
             entry = free[0]
