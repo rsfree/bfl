@@ -37,7 +37,7 @@ def test_page_renders(client):
     assert "出口池中台" in r.text
 
 
-def test_inline_script_parses_with_node(client, tmp_path):
+def test_inline_script_parses_with_node(client):
     '''面板整页 JS 必须能被 JS 引擎解析。
 
     真实事故（0.2.110）：`_PAGE` 是 Python 三引号字符串，源码里写的
@@ -46,9 +46,11 @@ def test_inline_script_parses_with_node(client, tmp_path):
     "加载中"）。所以校验必须针对**运行时**的 HTML，而不是 panel.py
     的源码文本。
     '''
+    import os
     import re
     import shutil
     import subprocess
+    import tempfile
 
     import pytest
 
@@ -57,10 +59,18 @@ def test_inline_script_parses_with_node(client, tmp_path):
         pytest.skip("node not available")
 
     js = re.findall(r"<script>(.*?)</script>", client.get("/panel").text, re.S)[-1]
-    f = tmp_path / "panel.js"
-    f.write_text(js)
-    r = subprocess.run([node, "--check", str(f)], capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
+    # 不用 pytest 的 tmp_path：本机沙箱 shim 对 mkdir 一律回 EEXIST
+    fd, path = tempfile.mkstemp(suffix=".js", prefix="panel_", dir="/tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(js)
+        r = subprocess.run([node, "--check", path], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def test_gate_hidden_rule_overrides_flex(client):

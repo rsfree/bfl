@@ -337,7 +337,10 @@ function renderReq(rows,src){
 function renderLogs(rows,src){
   const box=el("logBox");
   const atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-24;
-  box.innerHTML=rows.length?rows.map(e=>{
+  // 接口按新的在前返回（表格好用）；终端是反过来的：新的在底部，
+  // 自动滚动才有意义，否则每次都把视口钉在最旧的一屏。
+  const asc=rows.slice().reverse();
+  box.innerHTML=asc.length?asc.map(e=>{
     const cls=(e.level==="ERROR"||e.level==="CRITICAL")?" e"
       :(e.level==="WARNING"?" w":"");
     return `<span class="ln${cls}">${fmtLogTs(e.ts)} [${esc(e.level)}] `
