@@ -383,6 +383,9 @@ REF_BRANCH = os.environ.get("BFL2OPENAI_REF_BRANCH", "single")
 # 边界：只能兜住「请求到了、响应没回来」；SYN 阶段就丢的请求服务端根本
 # 收不到，那种只能靠客户端重试再打进来 —— 但那时重试也安全了。
 _IDEM_TTL_S = int(os.environ.get("BFL2OPENAI_IDEM_TTL_S") or 900)
+#: 451（内容审核拒绝）负缓存 TTL。同内容重提必然继续被拒，缓存下来
+#: 直接秒回，省掉一次 10–20s 的浏览器页面占用。0 = 关闭。
+_NEG_TTL_S = int(os.environ.get("BFL2OPENAI_NEG_TTL_S") or 1800)
 _IDEM_LOCK_TTL_S = int(os.environ.get("BFL2OPENAI_IDEM_LOCK_TTL_S") or 900)
 _IDEM_WAIT_S = float(os.environ.get("BFL2OPENAI_IDEM_WAIT_S") or 240)
 #: 结果超过此体积不落 Redis：缓存会挤占任务状态空间。
@@ -479,6 +482,7 @@ async def _idem_run(fp: str, produce) -> JSONResponse:
     `browser egress status=0` 计数为 0，证明上游根本没超时）。
     """
     done_key = f"idem_done:{fp}"
+    neg_key = f"idem_neg:{fp}"
     lock_key = f"idem:{fp}"
 
     # 两轮：第一轮可能是 follower，第二轮（接管）才有机会真正执行 produce。
@@ -490,11 +494,34 @@ async def _idem_run(fp: str, produce) -> JSONResponse:
             resp.headers["X-Bfl-Idempotent"] = "replay"
             return resp
 
+        # 负缓存：同指纹已被上游内容审核拒绝且还在 TTL 内 → 秒回 451。
+        # 放在抢锁之前，follower 也能命中（否则 leader 拒了，follower 会接管重跑）。
+        if _NEG_TTL_S > 0:
+            neg = await store.get(neg_key)
+            if neg is not None:
+                log.info("idem negative hit fp=%s", fp[:8])
+                resp = JSONResponse(neg.get("body") or {},
+                                    status_code=int(neg.get("status") or 451))
+                resp.headers["X-Bfl-Idempotent"] = "negative"
+                return resp
+
         if await store.set_nx(lock_key, {"ts": time.time()}, _IDEM_LOCK_TTL_S):
             hb = asyncio.create_task(_idem_heartbeat(lock_key))
             try:
                 resp = await produce()
                 raw = bytes(resp.body)
+                if resp.status_code == 451 and _NEG_TTL_S > 0:
+                    # 只缓存 451：内容审核是内容属性，同内容重提必然再拒；
+                    # 429/500/504 是环境状态，缓存会把瞬时故障固化成"永久失败"。
+                    try:
+                        await store.put(neg_key,
+                                        {"status": 451, "body": json.loads(raw)},
+                                        _NEG_TTL_S)
+                        log.info("idem negative cached fp=%s ttl=%d",
+                                 fp[:8], _NEG_TTL_S)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("idem negative cache skipped fp=%s: %s",
+                                    fp[:8], exc)
                 if resp.status_code == 200 and len(raw) <= _IDEM_MAX_CACHE_BYTES:
                     ttl = _IDEM_BIG_TTL_S if len(raw) > _IDEM_BIG_BYTES else _IDEM_TTL_S
                     try:
@@ -518,6 +545,14 @@ async def _idem_run(fp: str, produce) -> JSONResponse:
                 resp = JSONResponse(cached)
                 resp.headers["X-Bfl-Idempotent"] = "replay"
                 return resp
+            if _NEG_TTL_S > 0:
+                neg = await store.get(neg_key)
+                if neg is not None:
+                    log.info("idem negative-after-wait fp=%s", fp[:8])
+                    resp = JSONResponse(neg.get("body") or {},
+                                        status_code=int(neg.get("status") or 451))
+                    resp.headers["X-Bfl-Idempotent"] = "negative"
+                    return resp
             if not await _idem_lock_alive(lock_key):
                 break
         else:

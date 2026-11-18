@@ -79,6 +79,9 @@ x-egress-env: &egress-env
   #: 停手点留空 = 榨干（等于额度 30）。想留风控余量就配 20 这类小值，
   #: 有效值恒 ≤ 额度，配超了会被夹住。
   BFL2OPENAI_POOL_STRETCH: "${BFL2OPENAI_POOL_STRETCH:-0}"
+  #: 451（内容审核拒绝）负缓存秒数：同内容重提直接秒回，省浏览器页面时间。
+  #: 0 = 关闭。默认 30 分钟；若担心上游审核非确定性，可调到 300。
+  BFL2OPENAI_NEG_TTL_S: "${BFL2OPENAI_NEG_TTL_S:-1800}"
   #: rebind 后等 Vercel 挑战通过的静默期（秒）。3s 是保守值，实测降到 1s
   #: 仍能过，直接省掉 2s 冷启动开销。
   BFL2OPENAI_POOL_REBIND_SETTLE: "${BFL2OPENAI_POOL_REBIND_SETTLE:-3.0}"
