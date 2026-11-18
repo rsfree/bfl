@@ -629,6 +629,15 @@ async def note_429(slot: int, *, daily_hint: bool = False,
     b = _b()
     key = _slot_key(slot)
     d = await b.hgetall(key) or {}
+    # 换日：昨日的 429 计数不算数。
+    # `_to_slot` 已经把 used 做读时归零（跨日 ⇒ exhausted 自动消失），但
+    # `n429d` 如果不清，昨天被判死过两次的槽位今天第一次 429 就又判死
+    # （下面 seen_daily >= 1），比全新槽位更脆弱 —— 这会让"每天 08:00
+    # 自动重置"变成半重置：used 回来了，判定阈值却还带着昨天的伤。
+    if d.get("day") != _today():
+        await b.hset(key, mapping={"day": _today(), "n429": 0,
+                                   "n429d": 0, "nthrottle": 0})
+        d = await b.hgetall(key) or {}
     # 必须分开计数：`n429` 是面板口径的「所有 429」，而判定耗尽只该看
     # 「带今日额度文案的 429」次数（`n429d`）。混用一个计数器会让
     # 「先被频控打一次、随后真撞额度」这种序列在第一次就被判死。

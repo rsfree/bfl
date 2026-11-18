@@ -441,3 +441,44 @@ def test_lease_is_global_not_per_process(monkeypatch):
     assert got == [True, False, False], f"同一槽位只该拿到 1 个租约，实际 {got}"
     asyncio.run(ep.drop_lease(1))
     assert asyncio.run(ep.try_lease(1, 1)) is True, "释放后应可再租"
+
+
+def test_note_429_after_day_rollover_only_cools():
+    """换日后的第一次「日额度」429 只该冷却。
+
+    回归背景（2026-11-18）：`_to_slot` 已经把 used 做读时归零，所以
+    exhausted 会随换日自动消失。但 `n429d` 不清的话，昨天被判死两次的槽位
+    今天第一次 429 就又判死（seen_daily >= 1）—— "每天 08:00 自动重置"
+    就变成了半重置：used 回来了，判定阈值还带着昨天的伤。
+    """
+    import asyncio
+
+    async def _run():
+        b = ep._b()
+        key = ep._slot_key(1)
+        await b.hset(key, mapping={"day": "2000-01-01", "n429d": 2,
+                                   "n429": 5, "quota": 30,
+                                   "ip": "1.2.3.4", "state": "primary"})
+        res = await ep.note_429(1, daily_hint=True)
+        return res, await b.hgetall(key)
+
+    res, d = asyncio.run(_run())
+    assert res == "cooling", "换日后首次 429 就被判额度耗尽"
+    assert d.get("used") != "30", "不该置 used=quota"
+    assert d["n429d"] == "1", "n429d 应从换日后的 0 重新计数"
+    assert d["day"] == ep._today()
+
+
+def test_note_429_same_day_second_hint_still_exhausts():
+    """同一账本日内第二次「日额度」429 仍然要判死（不能被重置逻辑放水）。"""
+    import asyncio
+
+    async def _run():
+        b = ep._b()
+        key = ep._slot_key(2)
+        await b.hset(key, mapping={"day": ep._today(), "n429d": 1,
+                                   "n429": 1, "quota": 30,
+                                   "ip": "5.6.7.8", "state": "primary"})
+        return await ep.note_429(2, daily_hint=True)
+
+    assert asyncio.run(_run()) == "exhausted"
