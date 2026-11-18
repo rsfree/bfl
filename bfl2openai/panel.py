@@ -139,6 +139,7 @@ input[type=number]{width:64px;border:1px solid var(--line);border-radius:5px;pad
 const el=(id)=>document.getElementById(id);
 function pct(u,q){return q? Math.min(100,Math.round(u/q*100)):0}
 function fmtCool(s){return s>0? Math.floor(s/60)+"m"+String(s%60).padStart(2,"0")+"s":"—"}
+function fmtLeft(s){if(s<=0)return "即将换日";const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+"h "+m+"m":m+"m"}
 function card(label,v){return `<div class="card"><span class="mut">${label}</span><b>${v}</b></div>`}
 let DATA=null;
 const CAP=300;   // 槽位可达上千，一次全渲染会拖垮 DOM；默认只画前 300 行
@@ -170,8 +171,11 @@ async function load(){
   if(!r.ok){el("msg").textContent="读取失败 "+r.status;return}
   DATA=await r.json();
   const d=DATA;
-  el("sub").textContent=`${d.configured?"2090 pin 模式":"未配置"} · 槽位 ${d.slots} · 唯一 IP ${d.distinct_ips} · 软上限 ${d.soft_quota_per_ip}/IP${d.stretch?" · stretch 已开":""} · 构建于 ${d.built_at?new Date(d.built_at*1000).toLocaleString():"—"}`;
+  const rz=(d.reset&&d.reset.tz)||"UTC";
+  el("sub").textContent=`${d.configured?"2090 pin 模式":"未配置"} · 槽位 ${d.slots} · 唯一 IP ${d.distinct_ips} · 软上限 ${d.soft_quota_per_ip}/IP${d.stretch?" · stretch 已开":""} · 换日 ${rz} 00:00（北京 08:00）· 构建于 ${d.built_at?new Date(d.built_at*1000).toLocaleString():"—"}`;
   el("cards").innerHTML =
+    card("换日口径",`${rz} 00:00`)+
+    card("距下次换日",d.reset?fmtLeft(d.reset.next_at-d.now):"—")+
     card("可用槽位",`${d.usable}/${d.slots}`)+
     card("安全余量",`${d.capacity_left} 张`)+
     card("今日已用",`${d.used_today} 张`)+

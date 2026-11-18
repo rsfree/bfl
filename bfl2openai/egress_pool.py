@@ -27,7 +27,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Iterable
 from urllib.parse import quote
@@ -43,11 +43,37 @@ DEFAULT_QUOTA = int(os.environ.get("BFL2OPENAI_POOL_QUOTA", "30"))
 #: 单看状态码无法区分，只能给一个中等值：太短会反复撞墙，太长会白闲置。
 DEFAULT_429_COOLDOWN_S = int(os.environ.get("BFL2OPENAI_POOL_429_COOLDOWN", "600"))
 
+#: 候选随机度：在最老的 N 个段 / N 个槽位之间随机挑，而不是只挑"唯一最老"的那一个。
+#:
+#: 为什么必须随机：原实现严格取 last_used 唯一的全局最小值，而多个并发请求会
+#: 拿到**同一个**候选（`last_used` 要等生成完成才更新，约 20s 后才变），
+#: 于是全线挤在同一个 IP 上抢租约，抢不到的就报"无可用槽位"——
+#: 实测 234 个槽位空闲时仍在刷 429。摊开到 N 个候选后，并发请求自然落到不同 IP。
+POOL_SPREAD = max(1, int(os.environ.get("BFL2OPENAI_POOL_SPREAD", "8")))
+
+#: 同一出口两次提交的**最小间隔**（秒）。
+#:
+#: 上游除日额度外还有细粒度频控：实测单 IP 超过约 3.5 发/分钟就被边缘限速
+#: （即间隔 < 17s）。这里把间隔压在自己的调度层，主动不去撞阈值，
+#: 而不是撞了 429 再冷却——后者会浪费掉本可出图的额度。
+#: 0 = 关闭（退化为纯 LRU 轮询）。
+MIN_GAP_S = float(os.environ.get("BFL2OPENAI_POOL_MIN_GAP", "18"))
+
 #: 建映射时探测出口 IP 的并发度。探测只打 ipify，不消耗上游额度。
 SCAN_CONCURRENCY = int(os.environ.get("BFL2OPENAI_POOL_SCAN_CONCURRENCY", "16"))
 
-#: 上游按「天」计额度，但没公开重置时区。账本必须跟着换日，
-#: 否则第二天一开始所有槽位都还是昨天的用量（TTL 3 天到期才整批消失）。
+#: 上游按「天」计额度，换日时区未公开 —— **2026-11-18 已实测确定为 UTC 整点**。
+#:
+#: 实测方法：node-4 上用 `/opt/burn/reset_probe.sh` 每 6 分钟 pin 同一出口 IP
+#: 提交一次，记录 HTTP 码，共 103 条无缺口。结果：
+#:   - 11-18 07:54:01(+08) 仍 429「today's 30 free generations」，
+#:   - 11-18 08:00:01(+08) 首条 200（22 秒后写入 RESET_AT=08:00:23）。
+#: 边界被夹在 (07:54, 08:00] 这六分钟内，区间内唯一整点边界是 08:00 = UTC 00:00。
+#: 同批数据排除了北京零点（00:00:01 仍 429）与柏林零点（07:00:01 仍 429）；
+#: 美国各时区零点落在北京 12:00–18:00，与美国口径也不符。
+#:
+#: 结论：`DAILY_RESET_TZ` 保持 UTC（= 北京每日 08:00，北京无夏令时故全年恒定）。
+#: 改这个值前请重跑上述探针，不要凭印象调整。
 DAILY_RESET_TZ = os.environ.get("BFL2OPENAI_POOL_TZ", "UTC")
 
 _DAY_TTL_S = 3 * 24 * 3600
@@ -74,6 +100,22 @@ def _today() -> str:
     except Exception:  # noqa: BLE001 - 时区名写错不该把服务打挂
         tz = ZoneInfo("UTC")
     return datetime.now(tz).strftime("%Y-%m-%d")
+
+
+def next_reset_at(now: float | None = None) -> float:
+    """下一个换日时刻（epoch 秒）= DAILY_RESET_TZ 的下一个本地零点。
+
+    面板拿它做倒计时。时区名解析失败时回落 UTC —— 必须与 `_today()` 同一口径，
+    否则会出现「账本已换日、倒计时还在等」的错位，运维会据此误判。
+    """
+    try:
+        tz = ZoneInfo(DAILY_RESET_TZ)
+    except Exception:  # noqa: BLE001 - 与 _today() 保持一致，不抛
+        tz = ZoneInfo("UTC")
+    cur = datetime.fromtimestamp(time.time() if now is None else now, tz)
+    nxt = (cur + timedelta(days=1)).replace(hour=0, minute=0, second=0,
+                                            microsecond=0)
+    return nxt.timestamp()
 
 
 def _prefix(ip: str, octets: int = 3) -> str:
@@ -481,15 +523,38 @@ async def acquire(*, exclude: Iterable[int] = ()) -> Slot | None:
     for s in cand:
         by_seg.setdefault(s.seg, []).append(s)
     # 段级时间戳取组内最大值（最近一次用过），越小越该轮到它。
-    # 同年龄的段**随机**挑，不能按名字排 —— 否则会从字母序最小的段开始
-    # 逐个打过去，一头撞死在同一个坏 C 段里（实测 142.4.107.* 连续 18 次 403）。
-    seg_last = {seg: max(x.last_used for x in g) for seg, g in by_seg.items()}
-    oldest = min(seg_last.values())
-    ties = [seg for seg, ts in seg_last.items() if ts == oldest]
-    best_seg = random.choice(ties)
-    group = by_seg[best_seg]
-    floor = min(x.last_used for x in group)
-    return random.choice([x for x in group if x.last_used == floor])
+    #
+    # 注意：这里必须用**未过滤**的候选算段年龄。若先用最小间隔把刚用过的
+    # IP 剔掉再算，该段的 max 会退回旧值、被误判成"最久没用"，于是连着
+    # 两次压进同一个 /24 —— 那正是要避免的事。
+    seg_age = [(seg, max(x.last_used for x in g))
+               for seg, g in by_seg.items()]
+    # 同年龄的段随机，不能按名字排 —— 否则会从字母序最小的段开始逐个打过去，
+    # 一头撞死在同一个坏 C 段里（实测 142.4.107.* 连续 18 次 403）。
+    # 先 shuffle 再稳定排序：等值项保留随机顺序，等价于"同年龄随机取"。
+    random.shuffle(seg_age)
+    seg_age.sort(key=lambda kv: kv[1])
+
+    for seg, _ in seg_age:
+        group = by_seg[seg]
+        # 摊薄：跳过"段内所有 IP 都还没静默够"的段，换下一段。
+        if MIN_GAP_S > 0:
+            spaced = [x for x in group if now - x.last_used >= MIN_GAP_S]
+            if not spaced:
+                continue
+            group = spaced
+        # 段内摊薄：最老的前 N 个 IP 里随机，而不是固定取唯一最老的那个。
+        # 并发请求因此各落一个 IP，不再同时抢同一条租约（那正是"池里还有
+        # 两百多个空闲槽却报无槽可用"的成因）。
+        floor = sorted(group, key=lambda x: x.last_used)[:POOL_SPREAD]
+        return random.choice(floor)
+
+    # 所有段都还没过静默期：退化为最老段里最老的 IP。
+    # 宁可稍微密一点，也不能因为"间隔不足"就返回 None —— 那会把调度
+    # 问题伪装成容量耗尽。
+    group = by_seg[seg_age[0][0]]
+    floor = sorted(group, key=lambda x: x.last_used)[:POOL_SPREAD]
+    return random.choice(floor)
 
 
 async def note_success(slot: int) -> int:
@@ -505,7 +570,10 @@ async def note_success(slot: int) -> int:
         n = 1
     else:
         n = await b.hincrby(key, "used", 1)
-    await b.hset(key, mapping={"last_used": time.time(), "nthrottle": 0})
+    await b.hset(key, mapping={"last_used": time.time(), "nthrottle": 0,
+                               # 出过图就说明这个出口是好的：清掉"疑似日额度"
+                               # 的历史，否则明天之前的一次误判会连累后面的判定
+                               "n429d": 0})
     return n
 
 
@@ -535,6 +603,45 @@ async def note_rate_limited(slot: int, cooldown_s: int | None = None,
         upd["used"] = int(d.get("quota", _cfg()["quota"]) or _cfg()["quota"])
     await b.hset(key, mapping=upd)
     return until
+
+
+async def note_429(slot: int, *, daily_hint: bool = False,
+                   cooldown_s: int | None = None) -> str:
+    """记一次 429，返回处置结论：`"exhausted"`（当日额度耗尽）或 `"cooling"`（仅冷却）。
+
+    为什么不看文案就直接置满 —— 上游对**细粒度频控**复用同一句
+    "You've used today's 30 free generations" 文案，只靠 `_is_daily_quota()`
+    的文案匹配必然把"限流"判成"额度用完"。线上实测（2026-11-18 12:40）：
+    353 个被判耗尽的槽位里 **341 个只撞过一次 429**，而当天全站真实出图
+    约 4700 张（≈8 张/IP），不可能都真的打满 30 张 ⇒ 绝大多数是误杀。
+    被误杀的 IP 还有二十多张额度，却整天不参与调度，可用池从 588 掉到 234。
+
+    因此改成**二次确认**：文案命中 **且** 该 IP 已撞过一次，才置 used=quota；
+    首次一律只冷却（指数退避，120s 起）。代价是真耗尽时多一次被拒的提交
+    （429 不消耗额度），收益是把被误杀的额度收回来。
+    """
+    b = _b()
+    key = _slot_key(slot)
+    d = await b.hgetall(key) or {}
+    # 必须分开计数：`n429` 是面板口径的「所有 429」，而判定耗尽只该看
+    # 「带今日额度文案的 429」次数（`n429d`）。混用一个计数器会让
+    # 「先被频控打一次、随后真撞额度」这种序列在第一次就被判死。
+    seen_daily = int(d.get("n429d", 0) or 0)
+    await b.hincrby(key, "n429", 1)
+    if daily_hint:
+        await b.hincrby(key, "n429d", 1)
+    if daily_hint and seen_daily >= 1:
+        quota = int(d.get("quota", _cfg()["quota"]) or _cfg()["quota"])
+        cd = DEFAULT_429_COOLDOWN_S if cooldown_s is None else cooldown_s
+        await b.hset(key, mapping={
+            "cool_until": int(time.time() + cd),
+            # day 必须一起写，否则读侧会把这条"已耗尽"当成昨天的账归零
+            "day": _today(),
+            "used": quota,
+        })
+        return "exhausted"
+    await note_throttled(slot, cooldown_s)
+    return "cooling"
 
 
 async def try_lease(slot: int, cap: int = 1, ttl_s: int = 180) -> bool:
@@ -612,7 +719,8 @@ async def reset_day() -> int:
     b = _b()
     for s in slots:
         await b.hset(_slot_key(s.slot), mapping={
-            "day": _today(), "used": 0, "n429": 0, "fail": 0,
+            "day": _today(), "used": 0, "n429": 0, "n429d": 0,
+            "nthrottle": 0, "fail": 0,
             "cool_until": 0, "last_used": 0})
     return len(slots)
 
@@ -660,5 +768,11 @@ async def snapshot() -> dict[str, Any]:
         "quota_per_ip": _cfg()["quota"],
         "soft_quota_per_ip": _cfg()["soft_quota"],
         "stretch": _cfg()["stretch"],
+        # 换日口径：面板直接显示，运维不必再去翻代码或猜时区
+        "reset": {
+            "tz": DAILY_RESET_TZ,
+            "day": _today(),
+            "next_at": int(next_reset_at(now)),
+        },
         "rows": rows,
     }

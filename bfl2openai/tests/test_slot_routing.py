@@ -103,7 +103,10 @@ def test_429_rotates_to_another_slot(monkeypatch):
     rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
     failed = rows[calls[0]]
     ok = rows[calls[1]]
-    assert failed.used == failed.quota, "撞 429 的槽位应直接置为耗尽"
+    # 首次 429 只冷却、不扣额度：同一 IP 第二次仍是 429 才判定当日耗尽。
+    # 否则被细粒度频控打中的好 IP 会被整天枪毙（线上 341/353 属此情形）。
+    assert failed.used == 0, "首次 429 不得扣额度"
+    assert failed.cool_until > 0, "首次 429 必须进入冷却"
     assert ok.used == 1, "成功的槽位记 1 次"
 
 
@@ -125,9 +128,10 @@ def test_all_slots_exhausted_maps_to_429(monkeypatch):
     with pytest.raises(bec.BrowserEgressError) as ei:
         asyncio.run(server._browser_generate(prompt="x"))
     assert ei.value.status == 429
-    # 两个槽位都试过并全部置为耗尽
+    # 首次 429 一律只冷却：两个槽位都不应被扣掉额度，否则一次抖动就废掉整池
     rows = asyncio.run(ep.list_slots())
-    assert all(r.used == r.quota for r in rows)
+    assert all(r.cool_until > 0 for r in rows), "首次 429 应各自进入冷却"
+    assert all(r.used == 0 for r in rows), "没有一条该被直接判成额度耗尽"
 
 
 def test_non_429_failure_does_not_consume_quota(monkeypatch):
@@ -256,6 +260,10 @@ def test_sticky_slot_reuses_until_exhausted(monkeypatch):
     monkeypatch.setattr(server, "_STICKY", {"slot": 0})
     monkeypatch.delenv("BFL2OPENAI_POOL_QUOTA", raising=False)
     monkeypatch.setenv("BFL2OPENAI_POOL_SOFT_QUOTA", "2")
+    # 本用例只验"黏性复用"这一个语义：把最小间隔关掉，否则 instant 的假
+    # generate 会让第二次请求因间隔不足而换槽（那是 MIN_GAP_S 的职责，
+    # 由 test_min_gap_prefers_idle_slot 覆盖）。
+    monkeypatch.setattr(ep, "MIN_GAP_S", 0.0)
 
     async def fake_probe(slot, timeout=12.0):
         return {1: "1.1.1.1", 2: "2.2.2.2", 3: "3.3.3.3"}[slot]
@@ -323,7 +331,7 @@ def test_daily_quota_vs_short_throttle(monkeypatch):
     assert first.used == 0, "短窗限流不能烧额度"
     assert first.nthrottle == 1
 
-    # 真额度耗尽：走 note_rate_limited，置 used=quota
+    # 真额度耗尽：首次仍只冷却，**同一 IP 第二次**才置 used=quota
     monkeypatch.setattr(server, "_STICKY", {"slot": 0})
     calls.clear()
 
@@ -334,13 +342,21 @@ def test_daily_quota_vs_short_throttle(monkeypatch):
             'generations. Please come back tomorrow."}', 429)
 
     monkeypatch.setattr(bec, "generate", quota)
-    try:
-        asyncio.run(server._browser_generate(prompt="x"))
-    except bec.BrowserEgressError:
-        pass
-    rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
-    burned = [r for r in rows.values() if r.used == r.quota]
-    assert burned, "日额度耗尽必须标记为当天不可用"
+    for round_ in range(2):
+        # 清掉冷却，模拟冷却期满后同一 IP 再次被选中
+        for s in asyncio.run(ep.list_slots()):
+            asyncio.run(ep._b().hset(ep._slot_key(s.slot),
+                                     mapping={"cool_until": 0}))
+        try:
+            asyncio.run(server._browser_generate(prompt="x"))
+        except bec.BrowserEgressError:
+            pass
+        burned = [r for r in asyncio.run(ep.list_slots())
+                  if r.used == r.quota]
+        if round_ == 0:
+            assert not burned, "首次 429 不得直接把 IP 判死"
+        else:
+            assert burned, "第二次 429 必须判为当日耗尽"
 
 
 def test_concurrent_requests_spread_across_slots(monkeypatch):
@@ -387,3 +403,82 @@ def test_prebind_order_differs_per_worker(monkeypatch):
         monkeypatch.setattr(server, "_OFFSET", off)
         picks.append(asyncio.run(server._next_slot(set())).slot)
     assert len(set(picks)) == 4, f"4 个偏移应选中 4 个不同槽位，实际 {picks}"
+
+
+def test_second_429_exhausts_slot(monkeypatch):
+    """二次确认：同一 IP 连撞两次 429 才判当日耗尽，首次只冷却。
+
+    线上教训（2026-11-18）：353 个被判耗尽的槽位里 341 个只撞过一次 429，
+    而当天真实出图约 4700 张（≈8 张/IP）—— 不可能都真打满 30 张。
+    一次性置满把还有二十多张额度的 IP 整天枪毙，可用池从 588 掉到 234。
+    """
+    import asyncio
+
+    async def fake_probe(slot, timeout=12.0):
+        return {1: "1.1.1.1", 2: "2.2.2.2"}[slot]
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+
+    assert asyncio.run(ep.note_429(1, daily_hint=True)) == "cooling"
+    row = {s.slot: s for s in asyncio.run(ep.list_slots())}[1]
+    assert row.used == 0, "首次 429 不得扣额度"
+    assert row.cool_until > 0, "首次 429 必须进入冷却"
+
+    assert asyncio.run(ep.note_429(1, daily_hint=True)) == "exhausted"
+    row = {s.slot: s for s in asyncio.run(ep.list_slots())}[1]
+    assert row.used == row.quota, "第二次 429 才判定当日耗尽"
+
+
+def test_429_without_daily_hint_never_exhausts(monkeypatch):
+    """文案不含"今日额度"（纯细粒度频控）时，撞多少次都不许扣额度。"""
+    import asyncio
+
+    async def fake_probe(slot, timeout=12.0):
+        return {1: "1.1.1.1", 2: "2.2.2.2"}[slot]
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+
+    for _ in range(5):
+        assert asyncio.run(ep.note_429(1, daily_hint=False)) == "cooling"
+    row = {s.slot: s for s in asyncio.run(ep.list_slots())}[1]
+    assert row.used == 0, "纯频控不得消耗额度"
+
+
+def test_acquire_spreads_candidates(monkeypatch):
+    """摊薄：acquire() 必须在最老的一批候选里随机，不能每次都给同一个槽位。
+
+    原实现严格取 last_used 的全局最小值，而 last_used 要等生成完成（约 20s）
+    才更新 ⇒ 并发请求全都拿到同一候选，抢不到租约就报"无可用槽位"。
+    """
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "16")
+
+    async def fake_probe(slot, timeout=12.0):
+        return f"10.0.{slot}.1"          # 16 个互不相同的 /24
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+
+    picks = {asyncio.run(ep.acquire()).slot for _ in range(40)}
+    assert len(picks) > 1, f"acquire() 未随机化，40 次只返回 {picks}"
+
+
+def test_min_gap_prefers_idle_slot(monkeypatch):
+    """最小间隔：刚出过图的槽位要让位给静默更久的槽位。"""
+    import asyncio
+    import time
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "2")
+    monkeypatch.setattr(ep, "MIN_GAP_S", 18.0)
+
+    async def fake_probe(slot, timeout=12.0):
+        return {1: "10.1.1.1", 2: "10.2.2.2"}[slot]
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+
+    asyncio.run(ep._b().hset(ep._slot_key(1), mapping={"last_used": time.time()}))
+    asyncio.run(ep._b().hset(ep._slot_key(2),
+                             mapping={"last_used": time.time() - 600}))
+    assert asyncio.run(ep.acquire()).slot == 2, "应跳过刚用过的槽位"

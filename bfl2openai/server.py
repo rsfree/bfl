@@ -531,9 +531,14 @@ async def _idem_run(fp: str, produce) -> JSONResponse:
     return resp
 
 
-#: 单个请求最多换几个槽位。429 说明该出口 IP 当天废了，换一个继续；
-#: 3 次仍失败说明池子整体耗尽，此时回 429 让客户端退避是正确的语义。
-_SLOT_ATTEMPTS = int(os.environ.get("BFL2OPENAI_SLOT_ATTEMPTS", "3"))
+#: 单个请求最多换几个槽位。429 只说明**该出口**这次不行（可能是日额度，
+#: 也可能只是被细粒度频控打中），换一个继续。
+#:
+#: 原值 3 太浅：`acquire()` 在并发下会把多个请求指向同一批候选，抢不到
+#: 租约的请求 3 次就耗尽，于是**池里还有 234 个空闲槽**时依然给客户端回 429
+#: （2026-11-18 实测每分钟 8 次 "all exit slots exhausted"）。加深到 6 后，
+#: 只有真正无槽可换才会失败。
+_SLOT_ATTEMPTS = int(os.environ.get("BFL2OPENAI_SLOT_ATTEMPTS", "6"))
 
 #: 请求级出口开关（灰度用）。`X-Bfl-Egress: pool` 强制走槽位，`legacy`
 #: 强制走 2088。不带头时按环境变量决定 —— 这样可以在真实流量的同时验证
@@ -593,12 +598,25 @@ def _has_room(n: int) -> bool:
     return _INFLIGHT.get(n, 0) < _SLOT_CAP
 
 
+def _spaced(s, now: float | None = None) -> bool:
+    """该出口距上次成功是否已过最小间隔（摊薄细粒度频控用）。
+
+    只对**定点复用**（黏性槽位、预绑定槽位）生效：`acquire()` 内部已按同一
+    规则过滤，但 sticky 会绕过它、反复选中同一个 IP —— 那正是短窗限流的
+    直接成因（单 IP 超约 3.5 发/分钟即被边缘限速）。
+    """
+    gap = egress_pool.MIN_GAP_S
+    if gap <= 0:
+        return True
+    return (time.time() if now is None else now) - s.last_used >= gap
+
+
 async def _next_slot(exclude: set[int]):
     # 1) 当前黏住的槽位（前提是还有并发余量）
     cur = _STICKY["slot"]
     if cur and cur not in exclude and _has_room(cur):
         s = await egress_pool.get_slot(cur)
-        if s is not None and s.available() \
+        if s is not None and s.available() and _spaced(s) \
                 and await egress_pool.try_lease(s.slot, _SLOT_CAP):
             _take(s.slot)
             return s
@@ -609,7 +627,7 @@ async def _next_slot(exclude: set[int]):
         if n in exclude or not _has_room(n):
             continue
         s = await egress_pool.get_slot(n)
-        if s is not None and s.available() \
+        if s is not None and s.available() and _spaced(s) \
                 and await egress_pool.try_lease(s.slot, _SLOT_CAP):
             _STICKY["slot"] = n
             _take(s.slot)
@@ -673,7 +691,11 @@ async def _browser_generate(**kwargs) -> bytes:
     for _ in range(_SLOT_ATTEMPTS):
         slot = await _next_slot(tried)
         if slot is None:
-            # 全部槽位额度耗尽/冷却中：429 比 502 更接近真相
+            # 全部槽位额度耗尽/冷却中：429 比 502 更接近真相。
+            # 带上 tried/inflight，才能区分"池子真的空了"与"并发把候选抢光了"
+            # ——这两者在旧日志里长得一模一样。
+            log.warning("no slot available (tried=%d inflight=%d)",
+                        len(tried), len(_INFLIGHT))
             raise browser_egress_client.BrowserEgressError(
                 "all exit slots exhausted", 429)
         tried.add(slot.slot)
@@ -683,18 +705,21 @@ async def _browser_generate(**kwargs) -> bytes:
         except browser_egress_client.BrowserEgressError as exc:
             # 429（额度/限流）与 403（出口被拒）都是"这个 IP 今天别再用"，
             # 处置一致：标记冷却 + 换下一个槽位。区别只在计数口径。
-            if exc.status == 429 and not _is_daily_quota(exc):
-                # 短窗限流：歇一会儿还能用，不能按「当天废了」处理
-                await egress_pool.note_throttled(slot.slot)
-                log.warning("slot %03d ip=%s throttled (short window), rotating",
-                            slot.slot, slot.ip)
+            if exc.status == 429:
+                # 429 分级处置：首次只冷却、不扣额度；同一 IP 第二次仍是 429
+                # 且文案带「今日额度已用完」才判定当天耗尽。理由见
+                # `egress_pool.note_429` —— 一次性置满会把被细粒度频控打中的
+                # 好 IP 整天枪毙（线上 341/353 只撞过一次 429 就被判死）。
+                verdict = await egress_pool.note_429(
+                    slot.slot, daily_hint=_is_daily_quota(exc))
+                log.warning("slot %03d ip=%s 429 -> %s, rotating (n=%d)",
+                            slot.slot, slot.ip, verdict, len(tried))
                 last = exc
                 continue
-            if exc.status in (429, 403):
-                await egress_pool.note_rate_limited(
-                    slot.slot, field=("n403" if exc.status == 403 else "n429"))
-                log.warning("slot %03d ip=%s hit %s, rotating (n=%d)",
-                            slot.slot, slot.ip, exc.status, len(tried))
+            if exc.status == 403:
+                await egress_pool.note_rate_limited(slot.slot, field="n403")
+                log.warning("slot %03d ip=%s hit 403, rotating (n=%d)",
+                            slot.slot, slot.ip, len(tried))
                 last = exc
                 continue
             await egress_pool.note_failure(slot.slot)
@@ -704,6 +729,8 @@ async def _browser_generate(**kwargs) -> bytes:
             await egress_pool.drop_lease(slot.slot)
         await egress_pool.note_success(slot.slot)
         return data
+    log.warning("gave up after %d slots, last=%s", len(tried),
+                getattr(last, "status", None))
     raise last or browser_egress_client.BrowserEgressError(
         "all exit slots exhausted", 429)
 
