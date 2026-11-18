@@ -37,6 +37,41 @@ def test_page_renders(client):
     assert "出口池中台" in r.text
 
 
+def test_first_seen_refreshes_only_on_ip_change(client, monkeypatch):
+    """「新增 IP」标记的时间戳只在 IP 真的变了才刷新。
+
+    否则每次重扫都会把全部槽位标成新增，运维看不出哪些是真新号。
+    """
+    import asyncio
+
+    async def seed():
+        await ep._b().hset(ep._slot_key(1), mapping={"seen_at": 111})
+
+    asyncio.run(seed())
+    asyncio.run(ep.scan())                      # 同 IP 重扫
+
+    rows = client.get("/panel/api/snapshot").json()["rows"]
+    assert [r for r in rows if r["slot"] == 1][0]["first_seen"] == 111
+
+    async def changed(slot, timeout=12.0):      # 出口换了一批 IP
+        return {1: "9.9.9.9", 2: "9.9.9.9"}[slot]
+
+    monkeypatch.setattr(ep, "_probe_ip", changed)
+    asyncio.run(ep.scan())
+
+    rows = client.get("/panel/api/snapshot").json()["rows"]
+    row = [r for r in rows if r["slot"] == 1][0]
+    assert row["ip"] == "9.9.9.9"
+    assert row["first_seen"] > 111
+
+
+def test_pool_table_has_pagination_controls(client):
+    html = client.get("/panel").text
+    for marker in ('id="pginfo"', 'id="pgprev"', 'id="pgnext"',
+                   'id="psize"', 'id="newonly"'):
+        assert marker in html, marker
+
+
 def test_inline_script_parses_with_node(client):
     '''面板整页 JS 必须能被 JS 引擎解析。
 

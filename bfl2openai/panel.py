@@ -223,6 +223,9 @@ table.logs-tbl td{padding:6px 10px;border-bottom:1px solid #f3f3f3;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .st-2xx{color:var(--ok)}.st-3xx{color:var(--mut)}
 .st-4xx{color:var(--warn)}.st-5xx{color:var(--bad)}
+.tag-new{font-style:normal;font-size:11px;color:#fff;background:var(--ok);
+  border-radius:999px;padding:0 6px;margin-left:6px;vertical-align:1px}
+button:disabled{opacity:.45;cursor:not-allowed}
 </style></head><body>
 <header><h1>出口池中台</h1><span class="mut" id="sub">加载中…</span></header>
 <div id="gate" hidden>
@@ -239,8 +242,22 @@ table.logs-tbl td{padding:6px 10px;border-bottom:1px solid #f3f3f3;
   <div class="toolbar">
     <button onclick="scan()">重建映射</button>
     <button onclick="load()">刷新</button>
-    <input id="filter" placeholder="筛选 IP / 网段 / 槽位" oninput="render()"
+    <input id="filter" placeholder="筛选 IP / 网段 / 槽位" oninput="PAGE=1;render()"
            style="border:1px solid var(--line);border-radius:5px;padding:4px 8px;font-size:12px;width:200px">
+    <label class="mut" style="display:flex;align-items:center;gap:4px">
+      <input type="checkbox" id="newonly"
+             onchange="NEWONLY=this.checked;PAGE=1;render()"> 只看新增 IP
+    </label>
+    <select id="psize" onchange="PSIZE=Number(this.value);PAGE=1;render()"
+            style="border:1px solid var(--line);border-radius:5px;padding:4px 6px;font-size:12px">
+      <option value="50" selected>50 行/页</option>
+      <option value="100">100 行/页</option>
+      <option value="200">200 行/页</option>
+    </select>
+    <span class="grow"></span>
+    <button id="pgprev" onclick="setPage(PAGE-1)">上一页</button>
+    <span class="mut" id="pginfo"></span>
+    <button id="pgnext" onclick="setPage(PAGE+1)">下一页</button>
     <span class="mut" id="msg"></span>
   </div>
   <table><thead><tr>
@@ -403,16 +420,37 @@ function fmtCool(s){return s>0? Math.floor(s/60)+"m"+String(s%60).padStart(2,"0"
 function fmtLeft(s){if(s<=0)return "即将换日";const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+"h "+m+"m":m+"m"}
 function card(label,v){return `<div class="card"><span class="mut">${label}</span><b>${v}</b></div>`}
 let DATA=null;
-const CAP=300;   // 槽位可达上千，一次全渲染会拖垮 DOM；默认只画前 300 行
-function render(){
-  if(!DATA)return;
+let PAGE=1, PSIZE=50, NEWONLY=false;
+//: 「新增 IP」的时间窗：24h 内首次出现的 IP 打标
+const NEW_WINDOW=86400;
+function visibleRows(){
+  const now=DATA.now||Math.floor(Date.now()/1000);
   const q=(el("filter").value||"").trim().toLowerCase();
   let rows=DATA.rows;
+  if(NEWONLY) rows=rows.filter(r=>r.first_seen&&now-r.first_seen<NEW_WINDOW);
   if(q) rows=rows.filter(r=>(r.ip||"").includes(q)||(r.prefix||"").includes(q)
                              ||String(r.slot).includes(q));
-  const shown=rows.slice(0,CAP);
-  el("rows").innerHTML=shown.map(r=>`<tr>
-    <td>#${String(r.slot).padStart(3,"0")}</td>
+  return rows;
+}
+function setPage(p){
+  const pages=Math.max(1,Math.ceil(visibleRows().length/PSIZE));
+  PAGE=Math.min(Math.max(1,p),pages);
+  render();
+}
+function render(){
+  if(!DATA)return;
+  const now=DATA.now||Math.floor(Date.now()/1000);
+  const rows=visibleRows();
+  const pages=Math.max(1,Math.ceil(rows.length/PSIZE));
+  if(PAGE>pages)PAGE=pages;
+  const from=(PAGE-1)*PSIZE;
+  const shown=rows.slice(from,from+PSIZE);
+  // 分页后表格只画当前页，DOM 行数恒等于 PSIZE，槽位上千也不卡
+  el("rows").innerHTML=shown.map(r=>{
+    const isNew=r.first_seen&&now-r.first_seen<NEW_WINDOW;
+    const tag=isNew?`<i class="tag-new" title="首次出现 ${fmtCool(now-r.first_seen)}前">新增</i>`:"";
+    return `<tr>
+    <td>#${String(r.slot).padStart(3,"0")}${tag}</td>
     <td style="font-family:ui-monospace,monospace">${r.ip||"—"}<span class="mut" style="margin-left:6px">${r.prefix?r.prefix+".0/24":""}</span></td>
     <td class="s-${r.cooling_s>0?"exhausted":r.exhausted?"exhausted":r.state}">${r.cooling_s>0?"冷却 "+fmtCool(r.cooling_s):r.exhausted?"额度用尽":r.state==="primary"?"可用":r.state==="dup"?"碰撞":"失败"}</td>
     <td>${r.used} / ${r.soft_quota}</td>
@@ -423,9 +461,10 @@ function render(){
     <td>${r.idle_s==null?"—":fmtCool(r.idle_s)}</td>
     <td><input type="number" min="0" value="${r.soft_quota}" id="q${r.slot}">
         <button onclick="setQ(${r.slot})">改</button></td>
-  </tr>`).join("") + (rows.length>CAP
-    ? `<tr><td colspan="11" class="mut">另有 ${rows.length-CAP} 行未显示（用筛选框缩小范围）</td></tr>`
-    : "");
+  </tr>`}).join("")||'<tr><td colspan="11" class="mut">没有匹配的槽位</td></tr>';
+  el("pginfo").textContent=`第 ${PAGE}/${pages} 页 · 共 ${rows.length} 行`;
+  el("pgprev").disabled=PAGE<=1;
+  el("pgnext").disabled=PAGE>=pages;
 }
 async function load(){
   let r;

@@ -378,6 +378,12 @@ async def _scan_impl(slots: Iterable[int] | None) -> dict[str, Any]:
                 "quota": cur.get("quota", c["quota"]),
                 "soft_quota": cur.get("soft_quota", c["soft_quota"]),
                 "last_used": cur.get("last_used", 0)}
+        # 「新增 IP」的判定依据：只有 IP 真的变了才刷新 seen_at，
+        # 否则每次重扫都会把全部槽位标成新增，标记就没意义了。
+        cur_ip = cur.get("ip", "")
+        seen_at = int(float(cur.get("seen_at", 0) or 0))
+        if ip and ip != cur_ip:
+            seen_at = int(time.time())
         if not ip:
             err_count += 1
             await b.hset(key, mapping={
@@ -387,12 +393,12 @@ async def _scan_impl(slots: Iterable[int] | None) -> dict[str, Any]:
             dup_count += 1
             await b.hset(key, mapping={
                 "ip": ip, "state": STATE_DUP, "prefix": _prefix(ip),
-                "dup_of": seen[ip], **keep})
+                "dup_of": seen[ip], "seen_at": seen_at, **keep})
         else:
             seen[ip] = n
             await b.hset(key, mapping={
                 "ip": ip, "state": STATE_PRIMARY, "prefix": _prefix(ip),
-                "dup_of": 0, **keep})
+                "dup_of": 0, "seen_at": seen_at, **keep})
         # 不给槽位记录设 TTL：Redis 的 maxmemory-policy=volatile-ttl 会优先
         # 淘汰带过期时间的 key，实测 588 个槽位被清到 471。跨日重置由 day
         # 字段负责，这里不需要 TTL。
@@ -430,6 +436,8 @@ class Slot:
     soft_quota: int = 0
     last_used: float = 0.0
     prefix: str = ""
+    #: 这个 IP 第一次出现的时刻（扫描时发现 IP 变化才刷新）。面板「新增」用。
+    first_seen: float = 0.0
 
     @property
     def seg(self) -> str:
@@ -476,6 +484,7 @@ def _to_slot(n: int, d: dict[str, str], default_quota: int) -> Slot:
         soft_quota=int(d.get("soft_quota", 0) or 0),
         last_used=float(d.get("last_used", 0) or 0),
         prefix=d.get("prefix", ""),
+        first_seen=float(d.get("seen_at", 0) or 0),
     )
 
 
@@ -764,6 +773,7 @@ async def snapshot() -> dict[str, Any]:
         "soft_quota": s.cap, "remaining_safe": s.remaining_safe,
         "n429": s.n429, "n403": s.n403, "nthrottle": s.nthrottle,
         "fail": s.fail,
+        "first_seen": int(s.first_seen),
         "cooling_s": max(0, int(s.cool_until - now)),
         "idle_s": int(now - s.last_used) if s.last_used else None,
         "available": s.available(now),
