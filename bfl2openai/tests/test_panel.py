@@ -49,6 +49,42 @@ def test_gate_hidden_rule_overrides_flex(client):
     assert "#gate[hidden]{display:none}" in r.text
 
 
+def test_logs_endpoint_captures_and_filters(client, monkeypatch):
+    """运行日志：环形缓冲要能收、能按级别/关键字过滤，且要鉴权。"""
+    import logging
+
+    from bfl2openai import panel
+
+    monkeypatch.setattr(panel, "_PASS", "sk-bfl")
+    monkeypatch.setattr(panel, "_TOKEN", "")
+
+    logging.getLogger("bfl2openai.tests").warning("slot 777 429 -> cooling")
+    logging.getLogger("bfl2openai.tests").info("plain info line")
+
+    assert client.get("/panel/api/logs").status_code == 401
+
+    r = client.get("/panel/api/logs", auth=("x", "sk-bfl"))
+    assert r.status_code == 200
+    d = r.json()
+    assert isinstance(d["entries"], list) and d["entries"]
+    assert d["source"] in {"redis", "memory"}
+    assert {"ts", "level", "logger", "msg"} <= set(d["entries"][0])
+
+    warn = client.get("/panel/api/logs?level=WARNING", auth=("x", "sk-bfl")).json()
+    assert all(e["level"] in {"WARNING", "ERROR", "CRITICAL"} for e in warn["entries"])
+
+    hit = client.get("/panel/api/logs?q=777", auth=("x", "sk-bfl")).json()
+    assert hit["entries"] and all("777" in e["msg"] for e in hit["entries"])
+
+
+def test_logs_alias_available_for_public_entry(client, monkeypatch):
+    from bfl2openai import panel
+
+    monkeypatch.setattr(panel, "_PASS", "sk-bfl")
+    monkeypatch.setattr(panel, "_TOKEN", "")
+    assert client.get("/pq/logs", auth=("x", "sk-bfl")).status_code == 200
+
+
 def test_snapshot_returns_503_when_store_unavailable(client, monkeypatch):
     """状态库抖动时面板应快失败给 503，而不是 500 + traceback。"""
     from bfl2openai import egress_pool

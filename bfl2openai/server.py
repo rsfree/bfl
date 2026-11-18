@@ -42,6 +42,7 @@ from . import bridging
 from . import upscale as mps
 from . import uploads
 from . import async_images
+from . import logring
 from . import probe
 from . import store
 from .bridging import (
@@ -56,6 +57,8 @@ from .upstream import UpstreamError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("bfl2openai")
+#: 面板「运行日志」的数据源（内存环 + Redis 汇总，见 logring.py）
+logring.install()
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):

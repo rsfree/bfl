@@ -21,7 +21,7 @@ import time
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from . import egress_pool
+from . import egress_pool, logring
 
 router = APIRouter(prefix="/panel", tags=["panel"])
 
@@ -130,6 +130,22 @@ async def api_reset(request: Request):
     return {"ok": True, "reset": await egress_pool.reset_day()}
 
 
+@router.get("/api/logs")
+async def api_logs(request: Request, limit: int = 200, level: str = "", q: str = ""):
+    """运行日志。`level` 是最小级别（INFO/WARNING/ERROR），`q` 为包含匹配。
+
+    数据源是 logring：多 worker 经 Redis 汇总（source=redis），Redis 不可用
+    时降级为本进程内存环（source=memory，前端会标注只覆盖本 worker）。
+    """
+    _check(request)
+    try:
+        data = await asyncio.to_thread(logring.read, limit, level, q)
+    except Exception as exc:  # noqa: BLE001 - 面板不能因日志挂了而 500
+        print(f"[panel] logs failed: {type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(status_code=503, detail="log ring unavailable")
+    return JSONResponse(data)
+
+
 _PAGE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>出口池中台 · bfl</title>
@@ -171,6 +187,17 @@ input[type=number]{width:64px;border:1px solid var(--line);border-radius:5px;pad
 .gatebox button{width:100%;padding:9px;border:0;border-radius:6px;
   background:var(--fg);color:#fff;cursor:pointer;font-size:13px}
 .gatebox .err{color:var(--bad);margin:10px 0 0;min-height:16px}
+h2.sect{font-size:14px;margin:28px 0 10px;font-weight:600;display:flex;gap:10px;align-items:baseline}
+.logs{font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;background:#fafafa;
+  border:1px solid var(--line);border-radius:8px;max-height:420px;overflow:auto}
+.logrow{display:flex;gap:10px;padding:3px 10px;border-bottom:1px solid #f1f1f1;
+  white-space:pre-wrap;word-break:break-all}
+.logrow:last-child{border-bottom:0}
+.logts{color:var(--mut);flex:0 0 auto}
+.loglv{flex:0 0 62px;font-weight:600}
+.logmsg{flex:1}
+.lv-INFO{color:var(--ok)}.lv-WARNING{color:var(--warn)}
+.lv-ERROR,.lv-CRITICAL{color:var(--bad)}.lv-DEBUG{color:var(--mut)}
 </style></head><body>
 <header><h1>出口池中台</h1><span class="mut" id="sub">加载中…</span></header>
 <div id="gate" hidden>
@@ -195,6 +222,24 @@ input[type=number]{width:64px;border:1px solid var(--line);border-radius:5px;pad
     <th>槽位</th><th>出口 IP</th><th>状态</th><th>已用 / 软上限</th><th>安全余量</th>
     <th>进度</th><th>硬额度</th><th>429 / 403</th><th>失败</th><th>空闲</th><th>改停手点</th>
   </tr></thead><tbody id="rows"></tbody></table>
+
+  <h2 class="sect">运行日志 <span class="mut" id="logmeta">加载中…</span></h2>
+  <div class="toolbar">
+    <select id="loglevel" onchange="loadLogs()"
+            style="border:1px solid var(--line);border-radius:5px;padding:4px 8px;font-size:12px">
+      <option value="">全部级别</option>
+      <option value="INFO">INFO 及以上</option>
+      <option value="WARNING">WARNING 及以上</option>
+      <option value="ERROR">仅 ERROR</option>
+    </select>
+    <input id="logq" placeholder="搜索（槽位 / IP / 429 / 异常）" oninput="logDebounce()"
+           style="border:1px solid var(--line);border-radius:5px;padding:4px 8px;font-size:12px;width:240px">
+    <button onclick="loadLogs()">刷新日志</button>
+    <label class="mut" style="display:flex;align-items:center;gap:4px">
+      <input type="checkbox" id="logauto" checked> 5s 自动刷新
+    </label>
+  </div>
+  <div id="logbox" class="logs"><div class="logrow mut">加载中…</div></div>
 </main>
 <script>
 const el=(id)=>document.getElementById(id);
@@ -209,7 +254,33 @@ function doLogin(){
   KEY=v;
   try{localStorage.setItem(LS_KEY,v)}catch(e){}
   el("gateerr").textContent="验证中…";
-  load().then(()=>{if(DATA&&DATA.slots!==undefined)hideGate();else showGate("密钥无效")}).catch(()=>showGate("密钥无效"));
+  load().then(()=>{if(DATA&&DATA.slots!==undefined){hideGate();loadLogs().catch(()=>{})}
+                   else showGate("密钥无效")}).catch(()=>showGate("密钥无效"));
+}
+// ---------------- 运行日志 ----------------
+let logDebounceTimer=null;
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
+  c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]))}
+function fmtLogTs(ts){const d=new Date((ts||0)*1000);
+  return d.toLocaleTimeString("zh-CN",{hour12:false})}
+function logDebounce(){clearTimeout(logDebounceTimer);
+  logDebounceTimer=setTimeout(()=>{loadLogs().catch(()=>{})},300)}
+async function loadLogs(){
+  if(!KEY)return;
+  const lv=el("loglevel").value, kw=(el("logq").value||"").trim();
+  let r;
+  try{r=await api("/logs?limit=300&level="+encodeURIComponent(lv)
+                  +"&q="+encodeURIComponent(kw))}catch(e){return}
+  if(!r.ok){el("logmeta").textContent="日志读取失败 "+r.status;return}
+  const d=await r.json();
+  const rows=d.entries||[];
+  el("logmeta").textContent=rows.length+" 条 · "
+    +(d.source==="redis"?"全部 worker":"仅本 worker（Redis 不可用）");
+  el("logbox").innerHTML=rows.length?rows.map(e=>
+    `<div class="logrow"><span class="logts">${fmtLogTs(e.ts)}</span>`
+    +`<span class="loglv lv-${esc(e.level)}">${esc(e.level)}</span>`
+    +`<span class="logmsg"><span class="mut">${esc(e.logger)}</span> ${esc(e.msg)}</span></div>`
+  ).join(""):'<div class="logrow mut">暂无匹配日志</div>';
 }
 let API_BASE="/panel/api";
 function apiPath(p){return API_BASE+p}
@@ -304,7 +375,9 @@ async function scan(){
   const d=await r.json();
   if(!d.ok) el("msg").textContent="已有任务在跑，等待即可";
 }
-load().catch(()=>{});setInterval(()=>{load().catch(()=>{})},15000);
+load().then(()=>{if(KEY&&DATA)loadLogs().catch(()=>{})}).catch(()=>{});
+setInterval(()=>{load().catch(()=>{})},15000);
+setInterval(()=>{if(KEY&&el("logauto")&&el("logauto").checked)loadLogs().catch(()=>{})},5000);
 </script></body></html>"""
 
 
@@ -321,6 +394,7 @@ alt_router.add_api_route("/snapshot", api_snapshot, methods=["GET"])
 alt_router.add_api_route("/quota", api_quota, methods=["POST"])
 alt_router.add_api_route("/scan", api_scan, methods=["POST"])
 alt_router.add_api_route("/reset", api_reset, methods=["POST"])
+alt_router.add_api_route("/logs", api_logs, methods=["GET"])
 
 
 @router.get("", response_class=HTMLResponse)
