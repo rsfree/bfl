@@ -89,7 +89,7 @@ async def api_snapshot(request: Request):
     except Exception as exc:  # noqa: BLE001 - 面板必须自己收尾
         print(f"[panel] snapshot failed: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=503, detail="state store unavailable")
-    return JSONResponse(snap)
+    return JSONResponse(snap, headers={"cache-control": "no-store"})
 
 
 @router.post("/api/quota")
@@ -143,7 +143,7 @@ async def api_logs(request: Request, limit: int = 200, level: str = "", q: str =
     except Exception as exc:  # noqa: BLE001 - 面板不能因日志挂了而 500
         print(f"[panel] logs failed: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=503, detail="log ring unavailable")
-    return JSONResponse(data)
+    return JSONResponse(data, headers={"cache-control": "no-store"})
 
 
 @router.get("/api/request_logs")
@@ -156,7 +156,7 @@ async def api_request_logs(request: Request, limit: int = 100,
     except Exception as exc:  # noqa: BLE001
         print(f"[panel] request_logs failed: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=503, detail="request log unavailable")
-    return JSONResponse(data)
+    return JSONResponse(data, headers={"cache-control": "no-store"})
 
 
 _PAGE = """<!doctype html>
@@ -336,18 +336,17 @@ function renderReq(rows,src){
 }
 function renderLogs(rows,src){
   const box=el("logBox");
-  const atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-24;
-  // 接口按新的在前返回（表格好用）；终端是反过来的：新的在底部，
-  // 自动滚动才有意义，否则每次都把视口钉在最旧的一屏。
-  const asc=rows.slice().reverse();
-  box.innerHTML=asc.length?asc.map(e=>{
+  // 新的在最上面、视口钉在顶部：比"新的在底部 + 滚到底"稳，不会因为
+  // innerHTML 重置 scrollTop 而每 5s 跳回最旧一屏。
+  const atTop=box.scrollTop<=24;
+  box.innerHTML=rows.length?rows.map(e=>{
     const cls=(e.level==="ERROR"||e.level==="CRITICAL")?" e"
       :(e.level==="WARNING"?" w":"");
     return `<span class="ln${cls}">${fmtLogTs(e.ts)} [${esc(e.level)}] `
       +`${esc(e.logger)} ${esc(e.msg)}</span>`;
   }).join(""):'<span class="ln" style="color:var(--mut)">暂无匹配日志</span>';
-  // 只有原本就贴在底部才跟着滚：否则用户往上翻历史时会被强行拉回去
-  if(logPin&&atEnd)box.scrollTop=box.scrollHeight;
+  // 只有原本就停在顶部才跟着走：否则用户往下翻历史时会被强行拉回去
+  if(logPin&&atTop)box.scrollTop=0;
   el("logNote").textContent=rows.length+" 行 · "
     +(src==="redis"?"全部 worker":"仅本 worker");
 }
