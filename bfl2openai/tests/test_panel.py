@@ -49,6 +49,19 @@ def test_gate_hidden_rule_overrides_flex(client):
     assert "#gate[hidden]{display:none}" in r.text
 
 
+def test_snapshot_returns_503_when_store_unavailable(client, monkeypatch):
+    """状态库抖动时面板应快失败给 503，而不是 500 + traceback。"""
+    from bfl2openai import egress_pool
+
+    async def boom():
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(egress_pool, "snapshot", boom)
+    r = client.get("/panel/api/snapshot")
+    assert r.status_code == 503
+    assert r.json()["detail"] == "state store unavailable"
+
+
 def test_snapshot_reports_collision(client):
     r = client.get("/panel/api/snapshot")
     assert r.status_code == 200

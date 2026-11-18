@@ -257,7 +257,19 @@ def _b():
     url = os.environ.get("REDIS_URL", "")
     if url:
         from redis import asyncio as aioredis
-        _redis = aioredis.from_url(url, decode_responses=True)
+
+        # 显式超时 + 有限重试：redis-py 默认 socket_connect_timeout=None，
+        # 容器内 DNS（redis 这个服务名）偶发抖动时会一直等，实测面板
+        # /pq/snapshot 出现过 12s 挂起与 TimeoutError 500。宁可快失败。
+        kw = dict(decode_responses=True, socket_timeout=2.0,
+                  socket_connect_timeout=2.0, health_check_interval=15)
+        try:
+            from redis.asyncio.retry import Retry
+            from redis.backoff import ExponentialWithJitterBackoff
+            kw["retry"] = Retry(ExponentialWithJitterBackoff(base=0.05, cap=0.3), 1)
+        except Exception:  # noqa: BLE001 - 老版本 redis-py 没有 retry API
+            pass
+        _redis = aioredis.from_url(url, **kw)
         return _redis
     _backend = _Memory()
     return _backend

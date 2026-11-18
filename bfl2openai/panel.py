@@ -79,9 +79,16 @@ def _check(request: Request) -> None:
 @router.get("/api/snapshot")
 async def api_snapshot(request: Request):
     _check(request)
-    snap = await egress_pool.snapshot()
-    snap["now"] = int(time.time())
-    snap["scan"] = await egress_pool.scan_status()
+    #: 状态库（Redis）偶发抖动时快失败并给出可读原因：未捕获会变成
+    #: 500 + 整段 traceback，前端只能显示"读取失败 500"，运维看不出是
+    #: 状态库问题还是面板问题。
+    try:
+        snap = await egress_pool.snapshot()
+        snap["now"] = int(time.time())
+        snap["scan"] = await egress_pool.scan_status()
+    except Exception as exc:  # noqa: BLE001 - 面板必须自己收尾
+        print(f"[panel] snapshot failed: {type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(status_code=503, detail="state store unavailable")
     return JSONResponse(snap)
 
 
@@ -210,7 +217,20 @@ async function api(path,opt){
   opt=opt||{};
   opt.headers=Object.assign({},opt.headers||{});
   if(KEY)opt.headers["Authorization"]="Bearer "+KEY;
-  const r=await fetch(apiPath(path),opt);
+  // 后端偶发慢（状态库抖动）：12s 内必给出结果，否则前端会一直转圈，
+  // 看起来和"密钥验证不通过"没区别。
+  const ac=new AbortController();
+  const timer=setTimeout(()=>ac.abort(),12000);
+  let r;
+  try{
+    r=await fetch(apiPath(path),Object.assign({},opt,{signal:ac.signal}));
+  }catch(e){
+    clearTimeout(timer);
+    el("gateerr").textContent="后端超时，请重试";
+    el("msg").textContent="后端超时，请重试";
+    throw e;
+  }
+  clearTimeout(timer);
   // 入口 nginx 可能把 /panel/api/ 整条前缀挡成 404：自动换到 /pq/ 别名，
   // 否则前端只能看到"密钥无效"（实际是接口不可达）。
   if(r.status===404&&API_BASE==="/panel/api"){
