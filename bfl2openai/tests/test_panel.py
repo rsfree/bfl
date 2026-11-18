@@ -81,19 +81,22 @@ def test_token_guard_blocks_without_header(client, monkeypatch):
     assert ok.status_code == 200
 
 
-def test_panel_requires_basic_auth_when_password_set(client, monkeypatch):
-    """配了 BFL2PANEL_PASS 后，页面与 API 都必须要凭据，且 401 要带
-    WWW-Authenticate（否则浏览器不会弹窗）。"""
+def test_panel_page_is_public_but_api_requires_key(client, monkeypatch):
+    """照 workbuddy2api：页面壳公开（前端自己弹登录框），数据接口要 key。
+
+    401 **不能**带 WWW-Authenticate —— 带了浏览器会弹原生 Basic 弹窗，
+    把面板自己的登录框盖住。
+    """
     from bfl2openai import panel
 
     monkeypatch.setattr(panel, "_PASS", "sk-bfl")
     monkeypatch.setattr(panel, "_TOKEN", "")
 
-    r = client.get("/panel")
-    assert r.status_code == 401
-    assert r.headers.get("www-authenticate", "").lower().startswith("basic")
+    assert client.get("/panel").status_code == 200
 
-    assert client.get("/panel/api/snapshot").status_code == 401
+    r = client.get("/panel/api/snapshot")
+    assert r.status_code == 401
+    assert "www-authenticate" not in {k.lower() for k in r.headers}
 
 
 def test_panel_accepts_correct_password(client, monkeypatch):
@@ -114,7 +117,9 @@ def test_panel_rejects_wrong_password(client, monkeypatch):
     monkeypatch.setattr(panel, "_PASS", "sk-bfl")
     monkeypatch.setattr(panel, "_TOKEN", "")
 
-    assert client.get("/panel", auth=("any", "sk-wrong")).status_code == 401
+    # 页面壳是公开的，要验的是数据接口
+    assert client.get("/panel/api/snapshot",
+                      auth=("any", "sk-wrong")).status_code == 401
 
 
 def test_panel_bearer_token_still_works(client, monkeypatch):

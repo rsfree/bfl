@@ -57,6 +57,10 @@ def _check(request: Request) -> None:
     got = request.headers.get("authorization", "")
     if _TOKEN and hmac.compare_digest(got, f"Bearer {_TOKEN}"):
         return
+    # 面板前端把用户输入的密钥存 localStorage，请求统一发 Bearer
+    # （与 workbuddy2api 的 panel 同口径：壳公开、数据要 key）。
+    if _PASS and hmac.compare_digest(got, f"Bearer {_PASS}"):
+        return
     if _PASS and got[:6].lower() == "basic ":
         try:
             raw = base64.b64decode(got[6:].strip()).decode("utf-8", "replace")
@@ -65,9 +69,11 @@ def _check(request: Request) -> None:
         _user, _, pw = raw.partition(":")
         if pw and hmac.compare_digest(pw, _PASS):
             return
-    raise HTTPException(
-        status_code=401, detail="unauthorized",
-        headers={"WWW-Authenticate": 'Basic realm="bfl-panel"'})
+    # 🔴 401 不带 WWW-Authenticate：带了浏览器会弹原生 Basic 弹窗，
+    # 把面板自己的登录框盖住（实测会卡在"输入完又弹一次"）。前端拿 401
+    # 后自己弹输入框，密钥存 localStorage 走 Bearer —— 与 workbuddy2api 同。
+    # curl 用 `-u 任意:密码` 仍可（-u 直接发 Basic 头，不依赖 challenge）。
+    raise HTTPException(status_code=401, detail="unauthorized")
 
 
 @router.get("/api/snapshot")
@@ -144,8 +150,27 @@ button{border:1px solid var(--line);background:#fff;border-radius:6px;padding:5p
 button:hover{background:var(--chip)}
 input[type=number]{width:64px;border:1px solid var(--line);border-radius:5px;padding:3px 6px}
 .toolbar{display:flex;gap:10px;align-items:center;margin-bottom:12px}
+#gate{position:fixed;inset:0;background:rgba(255,255,255,.97);display:flex;
+  align-items:center;justify-content:center;z-index:9}
+.gatebox{background:#fff;border:1px solid var(--line);border-radius:10px;
+  padding:24px;width:300px;text-align:center}
+.gatebox h3{margin:0 0 6px;font-size:15px;font-weight:500}
+.gatebox input{width:100%;box-sizing:border-box;padding:8px 10px;
+  border:1px solid var(--line);border-radius:6px;margin:14px 0;font-size:14px}
+.gatebox button{width:100%;padding:9px;border:0;border-radius:6px;
+  background:var(--fg);color:#fff;cursor:pointer;font-size:13px}
+.gatebox .err{color:var(--bad);margin:10px 0 0;min-height:16px}
 </style></head><body>
 <header><h1>出口池中台</h1><span class="mut" id="sub">加载中…</span></header>
+<div id="gate" hidden>
+  <div class="gatebox">
+    <h3>出口池中台</h3>
+    <p class="mut" style="margin:0">请输入面板密钥</p>
+    <input id="keyin" type="password" placeholder="sk-..." autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()">
+    <button onclick="doLogin()">进入</button>
+    <p class="err" id="gateerr"></p>
+  </div>
+</div>
 <main>
   <div class="cards" id="cards"></div>
   <div class="toolbar">
@@ -162,6 +187,27 @@ input[type=number]{width:64px;border:1px solid var(--line);border-radius:5px;pad
 </main>
 <script>
 const el=(id)=>document.getElementById(id);
+const LS_KEY="bfl.panel.key";
+let KEY="";
+try{KEY=localStorage.getItem(LS_KEY)||""}catch(e){}
+function showGate(msg){el("gate").hidden=false;if(msg)el("gateerr").textContent=msg;setTimeout(()=>el("keyin").focus(),50)}
+function hideGate(){el("gate").hidden=true;el("gateerr").textContent=""}
+function doLogin(){
+  const v=(el("keyin").value||"").trim();
+  if(!v){el("gateerr").textContent="请输入密钥";return}
+  KEY=v;
+  try{localStorage.setItem(LS_KEY,v)}catch(e){}
+  el("gateerr").textContent="验证中…";
+  load().then(()=>{if(DATA&&DATA.slots!==undefined)hideGate();else showGate("密钥无效")}).catch(()=>showGate("密钥无效"));
+}
+async function api(path,opt){
+  opt=opt||{};
+  opt.headers=Object.assign({},opt.headers||{});
+  if(KEY)opt.headers["Authorization"]="Bearer "+KEY;
+  const r=await fetch(path,opt);
+  if(r.status===401){showGate(KEY?"密钥无效，请重试":"请输入面板密钥");throw new Error("unauthorized")}
+  return r;
+}
 function pct(u,q){return q? Math.min(100,Math.round(u/q*100)):0}
 function fmtCool(s){return s>0? Math.floor(s/60)+"m"+String(s%60).padStart(2,"0")+"s":"—"}
 function fmtLeft(s){if(s<=0)return "即将换日";const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+"h "+m+"m":m+"m"}
@@ -192,7 +238,8 @@ function render(){
     : "");
 }
 async function load(){
-  const r=await fetch("/panel/api/snapshot");
+  let r;
+  try{r=await api("/panel/api/snapshot")}catch(e){return}
   if(!r.ok){el("msg").textContent="读取失败 "+r.status;return}
   DATA=await r.json();
   const d=DATA;
@@ -213,23 +260,25 @@ async function load(){
 }
 async function setQ(slot){
   const soft=Number(el("q"+slot).value);
-  const r=await fetch("/panel/api/quota",{method:"POST",headers:{"content-type":"application/json"},
+  const r=await api("/panel/api/quota",{method:"POST",headers:{"content-type":"application/json"},
     body:JSON.stringify({slot,soft})});
   el("msg").textContent=r.ok?`槽位 ${slot} 软上限已改为 ${soft}`:"修改失败";
   load();
 }
 async function scan(){
   el("msg").textContent="已在后台开始探测，约需 2-3 分钟…";
-  const r=await fetch("/panel/api/scan",{method:"POST"});
+  const r=await api("/panel/api/scan",{method:"POST"});
   if(!r.ok){el("msg").textContent="重建失败 "+r.status;return}
   const d=await r.json();
   if(!d.ok) el("msg").textContent="已有任务在跑，等待即可";
 }
-load();setInterval(load,15000);
+load().catch(()=>{});setInterval(()=>{load().catch(()=>{})},15000);
 </script></body></html>"""
 
 
 @router.get("", response_class=HTMLResponse)
 async def page(request: Request):
-    _check(request)
+    # 页面壳不鉴权：照 workbuddy2api 的做法 —— 壳公开、数据要 key。
+    # 前端拿到 401 后弹输入框，key 存 localStorage，之后请求带 Bearer。
+    # 这样不需要浏览器 Basic 弹窗，也不用依赖入口层 nginx 挡。
     return HTMLResponse(_PAGE)
