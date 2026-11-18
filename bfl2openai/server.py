@@ -73,6 +73,8 @@ async_images.register(app)
 from . import panel  # noqa: E402 - 必须在 app 建好之后注册
 
 app.include_router(panel.router)
+# 别名前缀：入口 nginx 只拦 /panel/api/，/pq/ 可直达应用
+app.include_router(panel.alt_router)
 
 MODEL_ID = os.environ.get("BFL2OPENAI_MODEL", "flux-precise-edit")
 API_KEY = os.environ.get("BFL2OPENAI_API_KEY", "")  # optional; empty = auth disabled

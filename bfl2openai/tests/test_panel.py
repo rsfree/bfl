@@ -131,3 +131,20 @@ def test_panel_bearer_token_still_works(client, monkeypatch):
 
     r = client.get("/panel", headers={"Authorization": "Bearer tok123"})
     assert r.status_code == 200
+
+
+def test_panel_alias_routes_available_for_public_entry(client, monkeypatch):
+    """入口 nginx 把 /panel/api/ 拦成 404 时，前端回退到 /pq/ 别名。
+
+    回归背景（2026-11-18 16:20）：公网面板输入正确密钥仍提示"密钥无效"，
+    实际是 `/panel/api/snapshot` 被 nginx 404 了，前端把 404 当成了鉴权失败。
+    """
+    from bfl2openai import panel
+
+    monkeypatch.setattr(panel, "_PASS", "sk-bfl")
+    monkeypatch.setattr(panel, "_TOKEN", "")
+
+    assert client.get("/pq/snapshot").status_code == 401
+    r = client.get("/pq/snapshot", headers={"Authorization": "Bearer sk-bfl"})
+    assert r.status_code == 200
+    assert "slots" in r.json()

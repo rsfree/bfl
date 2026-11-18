@@ -200,11 +200,19 @@ function doLogin(){
   el("gateerr").textContent="验证中…";
   load().then(()=>{if(DATA&&DATA.slots!==undefined)hideGate();else showGate("密钥无效")}).catch(()=>showGate("密钥无效"));
 }
+let API_BASE="/panel/api";
+function apiPath(p){return API_BASE+p}
 async function api(path,opt){
   opt=opt||{};
   opt.headers=Object.assign({},opt.headers||{});
   if(KEY)opt.headers["Authorization"]="Bearer "+KEY;
-  const r=await fetch(path,opt);
+  const r=await fetch(apiPath(path),opt);
+  // 入口 nginx 可能把 /panel/api/ 整条前缀挡成 404：自动换到 /pq/ 别名，
+  // 否则前端只能看到"密钥无效"（实际是接口不可达）。
+  if(r.status===404&&API_BASE==="/panel/api"){
+    API_BASE="/pq";
+    return api(path,opt);
+  }
   if(r.status===401){showGate(KEY?"密钥无效，请重试":"请输入面板密钥");throw new Error("unauthorized")}
   return r;
 }
@@ -239,7 +247,7 @@ function render(){
 }
 async function load(){
   let r;
-  try{r=await api("/panel/api/snapshot")}catch(e){return}
+  try{r=await api("/snapshot")}catch(e){return}
   if(!r.ok){el("msg").textContent="读取失败 "+r.status;return}
   DATA=await r.json();
   const d=DATA;
@@ -260,20 +268,35 @@ async function load(){
 }
 async function setQ(slot){
   const soft=Number(el("q"+slot).value);
-  const r=await api("/panel/api/quota",{method:"POST",headers:{"content-type":"application/json"},
+  const r=await api("/quota",{method:"POST",headers:{"content-type":"application/json"},
     body:JSON.stringify({slot,soft})});
   el("msg").textContent=r.ok?`槽位 ${slot} 软上限已改为 ${soft}`:"修改失败";
   load();
 }
 async function scan(){
   el("msg").textContent="已在后台开始探测，约需 2-3 分钟…";
-  const r=await api("/panel/api/scan",{method:"POST"});
+  const r=await api("/scan",{method:"POST"});
   if(!r.ok){el("msg").textContent="重建失败 "+r.status;return}
   const d=await r.json();
   if(!d.ok) el("msg").textContent="已有任务在跑，等待即可";
 }
 load().catch(()=>{});setInterval(()=>{load().catch(()=>{})},15000);
 </script></body></html>"""
+
+
+#: 入口 nginx 对 `/panel/api/` 做了 `return 404`（历史遗留的"别暴露运维面"），
+#: 但它拦的是整条前缀，面板前端因此拉不到数据（表现为"密钥无效"）。
+#: 这里把同一批 handler 再挂一份到 `/pq/` —— 实测 `/xyzabc` 这类路径都能正常
+#: 转发到应用，说明 nginx 只对 `/panel/api/` 特判。前端首次请求 404 时自动
+#: 回退到这套别名，公网与隧道都能用。
+#:
+#: 🔴 这只是让服务先可用；正解仍是把 nginx 那条 `location ^~ /panel/api/`
+#: 删掉（不是换成鉴权，是不要再拦），鉴权由 _check() 负责。
+alt_router = APIRouter(prefix="/pq", tags=["panel"])
+alt_router.add_api_route("/snapshot", api_snapshot, methods=["GET"])
+alt_router.add_api_route("/quota", api_quota, methods=["POST"])
+alt_router.add_api_route("/scan", api_scan, methods=["POST"])
+alt_router.add_api_route("/reset", api_reset, methods=["POST"])
 
 
 @router.get("", response_class=HTMLResponse)
