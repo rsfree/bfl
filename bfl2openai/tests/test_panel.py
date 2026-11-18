@@ -37,6 +37,32 @@ def test_page_renders(client):
     assert "出口池中台" in r.text
 
 
+def test_inline_script_parses_with_node(client, tmp_path):
+    '''面板整页 JS 必须能被 JS 引擎解析。
+
+    真实事故（0.2.110）：`_PAGE` 是 Python 三引号字符串，源码里写的
+    反斜杠 + 引号在运行时被吃掉反斜杠，esc() 的对象字面量变成两个引号
+    连写 —— 整段 JS 语法错误，页面只剩静态壳（数据为空、日志区永远
+    "加载中"）。所以校验必须针对**运行时**的 HTML，而不是 panel.py
+    的源码文本。
+    '''
+    import re
+    import shutil
+    import subprocess
+
+    import pytest
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+
+    js = re.findall(r"<script>(.*?)</script>", client.get("/panel").text, re.S)[-1]
+    f = tmp_path / "panel.js"
+    f.write_text(js)
+    r = subprocess.run([node, "--check", str(f)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
 def test_gate_hidden_rule_overrides_flex(client):
     """#gate 自带 display:flex，必须显式给 [hidden] 补 display:none。
 

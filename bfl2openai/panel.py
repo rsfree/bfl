@@ -313,7 +313,7 @@ function doLogin(){
 // ---------------- 运行观测：请求记录 + 运行日志 ----------------
 let logDebounceTimer=null, logLv="", reqSt="", logPin=true;
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
-  c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]))}
+  c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 function fmtLogTs(ts){const d=new Date((ts||0)*1000);
   return d.toLocaleTimeString("zh-CN",{hour12:false})}
 function logDebounce(){clearTimeout(logDebounceTimer);
