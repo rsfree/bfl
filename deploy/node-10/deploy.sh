@@ -52,7 +52,7 @@ echo "==> 4/6 更新镜像 tag 并拉取"
 run "cd $DIR && sed -i 's/^BFL_IMAGE_TAG=.*/BFL_IMAGE_TAG=$TAG/' .env && docker compose pull -q 2>&1 | tail -3"
 
 if [ "$STRATEGY" = "rolling" ]; then
-  echo "==> 5/6 滚动重建 sidecar（一次一台，等 pages_ready>=$PAGES，上限 ${READY_TIMEOUT}s/台）"
+  echo "==> 5/6 滚动重建 sidecar（一次一台，等 pages_ready >= ${PAGES}，上限 ${READY_TIMEOUT}s/台）"
   ssh "$JUMP" "ssh $HOST bash -s" <<EOF
 set -u
 cd $DIR
@@ -81,8 +81,10 @@ else
   run "cd $DIR && docker compose up -d --no-deps bfl-browser-egress bfl-browser-egress-2 bfl-browser-egress-3 2>&1 | tail -4"
 fi
 
-echo "==> 6/6 重建主服务并健康检查"
-run "cd $DIR && docker compose up -d --no-deps bfl2openai 2>&1 | tail -2"
+echo "==> 6/6 重建主服务与探针并健康检查"
+# bfl-probe 与 app 同镜像（命令不同），漏了它会长期停在旧版本：2026-11-18
+# 实测部署完 app 已 0.2.99 而 probe 还是 0.2.98。
+run "cd $DIR && docker compose up -d --no-deps bfl2openai bfl-probe 2>&1 | tail -3"
 for _ in $(seq 1 40); do
   ok=$(run "docker ps --filter name=bfl2openai --format '{{.Status}}' | grep -c healthy || true" | tail -1)
   [ "${ok:-0}" = "1" ] && break
