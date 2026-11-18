@@ -79,3 +79,50 @@ def test_token_guard_blocks_without_header(client, monkeypatch):
     ok = client.get("/panel/api/snapshot",
                     headers={"authorization": "Bearer s3cret"})
     assert ok.status_code == 200
+
+
+def test_panel_requires_basic_auth_when_password_set(client, monkeypatch):
+    """配了 BFL2PANEL_PASS 后，页面与 API 都必须要凭据，且 401 要带
+    WWW-Authenticate（否则浏览器不会弹窗）。"""
+    from bfl2openai import panel
+
+    monkeypatch.setattr(panel, "_PASS", "sk-bfl")
+    monkeypatch.setattr(panel, "_TOKEN", "")
+
+    r = client.get("/panel")
+    assert r.status_code == 401
+    assert r.headers.get("www-authenticate", "").lower().startswith("basic")
+
+    assert client.get("/panel/api/snapshot").status_code == 401
+
+
+def test_panel_accepts_correct_password(client, monkeypatch):
+    from bfl2openai import panel
+
+    monkeypatch.setattr(panel, "_PASS", "sk-bfl")
+    monkeypatch.setattr(panel, "_TOKEN", "")
+
+    # 用户名不校验，只看密码
+    assert client.get("/panel", auth=("any", "sk-bfl")).status_code == 200
+    assert client.get("/panel/api/snapshot",
+                      auth=("any", "sk-bfl")).status_code == 200
+
+
+def test_panel_rejects_wrong_password(client, monkeypatch):
+    from bfl2openai import panel
+
+    monkeypatch.setattr(panel, "_PASS", "sk-bfl")
+    monkeypatch.setattr(panel, "_TOKEN", "")
+
+    assert client.get("/panel", auth=("any", "sk-wrong")).status_code == 401
+
+
+def test_panel_bearer_token_still_works(client, monkeypatch):
+    """脚本/curl 的 Bearer 通道不能被 Basic Auth 挤掉。"""
+    from bfl2openai import panel
+
+    monkeypatch.setattr(panel, "_PASS", "sk-bfl")
+    monkeypatch.setattr(panel, "_TOKEN", "tok123")
+
+    r = client.get("/panel", headers={"Authorization": "Bearer tok123"})
+    assert r.status_code == 200

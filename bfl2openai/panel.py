@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import os
 import time
@@ -25,6 +26,10 @@ from . import egress_pool
 router = APIRouter(prefix="/panel", tags=["panel"])
 
 _TOKEN = os.environ.get("BFL2PANEL_TOKEN", "")
+#: 浏览器密码（HTTP Basic）。命名沿用「sk- + 二级域名」约定：
+#: bfl.1task.cn -> sk-bfl。与 _TOKEN 分工：token 给脚本/curl 走 Bearer，
+#: pass 给浏览器弹窗。两者任一命中即放行。
+_PASS = os.environ.get("BFL2PANEL_PASS", "")
 
 #: 扫描是长任务：3000 个号段约 3-6 分钟，同步跑会被 nginx 的 300s 掐断。
 #: 改为后台执行；**进度状态存在 Redis**（egress_pool.scan_status），
@@ -37,12 +42,32 @@ async def _run_scan() -> None:
 
 
 def _check(request: Request) -> None:
-    if not _TOKEN:
+    """面板鉴权。命中任一即放行：
+
+    1) 两个凭据都没配 —— 维持历史做法（依赖入口 nginx 404 + SSH 隧道）
+    2) `Authorization: Bearer <BFL2PANEL_TOKEN>` —— 脚本 / curl
+    3) `Authorization: Basic`，密码 == `BFL2PANEL_PASS` —— 浏览器弹窗
+       （用户名不校验：弹窗只让用户关心密码）
+
+    未命中时 401 必须带 `WWW-Authenticate: Basic`，否则浏览器不会弹窗，
+    只会显示一段 JSON —— 这是让面板「能用密码打开」的关键。
+    """
+    if not _TOKEN and not _PASS:
         return
     got = request.headers.get("authorization", "")
-    want = f"Bearer {_TOKEN}"
-    if not hmac.compare_digest(got, want):
-        raise HTTPException(status_code=401, detail="unauthorized")
+    if _TOKEN and hmac.compare_digest(got, f"Bearer {_TOKEN}"):
+        return
+    if _PASS and got[:6].lower() == "basic ":
+        try:
+            raw = base64.b64decode(got[6:].strip()).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - 非法 base64 视为未带凭据
+            raw = ""
+        _user, _, pw = raw.partition(":")
+        if pw and hmac.compare_digest(pw, _PASS):
+            return
+    raise HTTPException(
+        status_code=401, detail="unauthorized",
+        headers={"WWW-Authenticate": 'Basic realm="bfl-panel"'})
 
 
 @router.get("/api/snapshot")

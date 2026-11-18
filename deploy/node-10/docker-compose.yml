@@ -114,6 +114,9 @@ services:
       - "127.0.0.1:39100:8000"           # 仅回环；公网入口走 bfl.1task.cn（nginx）
     environment:
       REDIS_URL: redis://redis:6379/0   # 跨 worker 状态外置（见 store.py）
+      # 面板浏览器密码（HTTP Basic，用户名不校验）。值只放服务器 .env，
+      # 不入库；留空则退回「nginx 404 + SSH 隧道」的老办法。
+      BFL2PANEL_PASS: "${BFL2PANEL_PASS:-}"
       # 2026-11-17：3 -> 6。实测（18:30）：3 worker 每进程 RSS ~640MB（site-packages
       # 仅 102MB，其余是 PIL/base64 处理大图后的分配器高水位，不归还 OS），
       # 单容器 1.86GB；同时在途只有 3~4 个请求、容器 CPU 12% —— 说明卡的是上游
