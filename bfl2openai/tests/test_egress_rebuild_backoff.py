@@ -364,3 +364,38 @@ def test_reload_failure_retires_page(side):
 
     assert retired and "reload" in retired[0], "reload 失败没交给 retire"
     assert e["reloading"] is False
+
+
+# ── 页面 JS 错误分级处置 ────────────────────────────────────────────
+
+def test_page_eval_error_classification(side):
+    assert side._page_eval_error(RuntimeError("Error: Page.evaluate: Event"))
+    assert side._page_eval_error(RuntimeError("Page.evaluate: TypeError: x"))
+    # 超时是慢不是坏，不该换页
+    assert not side._page_eval_error(RuntimeError("Timeout 30000ms exceeded"))
+    # 页面真死由 _page_dead 负责，不走这条
+    assert not side._page_eval_error(
+        RuntimeError("Target page, context or browser has been closed"))
+
+
+def test_eval_error_cools_first_then_retires(side, monkeypatch):
+    retired = []
+    monkeypatch.setattr(side, "_retire", lambda e, r: retired.append(r))
+    e = _entry(0)
+    exc = RuntimeError("Error: Page.evaluate: Event")
+
+    side._handle_page_exc(e, exc, "submit")
+    assert retired == [], "第一次 JS 错误就摘牌 —— 一轮风暴会把整池 retire"
+    assert e["eval_fails"] == 1
+    assert e["cooldown_until"] > 0, "没有冷却该页"
+
+    side._handle_page_exc(e, exc, "submit")
+    assert len(retired) == 1, "连续第二次应当摘牌"
+
+
+def test_page_dead_retires_immediately(side, monkeypatch):
+    retired = []
+    monkeypatch.setattr(side, "_retire", lambda e, r: retired.append(r))
+    e = _entry(0)
+    side._handle_page_exc(e, RuntimeError("Target closed"), "poll")
+    assert len(retired) == 1, "页面真死应立刻摘牌，不该冷却等待"

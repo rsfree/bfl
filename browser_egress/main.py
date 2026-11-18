@@ -899,6 +899,42 @@ def _page_ok(entry: dict) -> bool:
         return False
 
 
+#: Playwright 报的「页面内 JS 执行异常」。2026-11-18 实测：上游页面里的
+#: posthog-recorder.js 抛 `Page.evaluate: Event`，2 分钟内 34 次 500。
+#: 这类错误不代表页面死了（通道是好的），换一页大概率成功。
+_PAGE_EVAL_RE = re.compile(r"page\.evaluate:", re.I)
+
+
+def _page_eval_error(exc: BaseException) -> bool:
+    """页面内 JS 抛错（Event / TypeError 等），而非 Playwright 通道断开。
+
+    排除 timeout：超时属于「慢」而非「坏」，重试只会再等一个超时。
+    """
+    text = str(exc)
+    if "timeout" in text.lower():
+        return False
+    return bool(_PAGE_EVAL_RE.search(text))
+
+
+def _handle_page_exc(entry: dict, exc: BaseException, phase: str) -> None:
+    """页面级异常的统一处置。
+
+    真死（TargetClosed / crashed）⇒ 立即摘牌重建。
+    JS 抛错 ⇒ 先冷却该页一次、换页重试；连续第二次才摘牌。
+    🔴 不这样分级的话，一次上游脚本风暴会把 9 页全 retire 掉，
+    池子归零 —— 比直接返回 500 更糟。
+    """
+    if _page_dead(exc) or entry.get("eval_fails", 0) + 1 >= 2:
+        _retire(entry, f"{phase}: {type(exc).__name__}")
+        return
+    entry["eval_fails"] = entry.get("eval_fails", 0) + 1
+    entry["cooldown_until"] = time.time() + IP_COOLDOWN_S
+    entry["errors"] += 1
+    print(f"[gen] page#{entry['idx']} {phase} JS error "
+          f"({type(exc).__name__}), cooling {IP_COOLDOWN_S:.0f}s "
+          f"and switching", flush=True)
+
+
 def _retire(entry: dict, reason: str) -> None:
     """摘掉一个废页：立刻长期冷却 + 后台重建，池子不缩水。"""
     entry["cooldown_until"] = time.time() + 3600
@@ -913,9 +949,6 @@ async def _reload_page(entry: dict) -> None:
     不换 context、不换 IP、不动槽位绑定 —— 只把文档重载一遍，V8 堆随之清空。
     比 recycle（换 context = 换 IP + 重新握手代理）便宜得多，也不影响出口。
     """
-    if entry.get("reloading"):
-        return
-    entry["reloading"] = True
     idx = entry["idx"]
     try:
         async with entry["eval_lock"]:
@@ -1263,6 +1296,10 @@ async def _maintain_pool():
                             or e.get("reloading"):
                         continue
                     if e.get("submits", 0) >= RELOAD_EVERY:
+                        # 必须先同步摘牌再 create_task：协程要等下一个
+                        # 事件循环 tick 才执行，这个窗口足够另一笔请求选
+                        # 中该页（schedule_recycle 的注释有同样警告）。
+                        e["reloading"] = True
                         asyncio.create_task(_reload_page(e))
         except Exception as exc:  # noqa: BLE001
             print(f"[maintain] reload error: {type(exc).__name__}: "
@@ -1447,10 +1484,10 @@ async def generate(req: GenReq):
                     "refMode": req.ref_mode, "model": req.model,
                 }, timeout=90)
             except Exception as exc:  # noqa: BLE001
-                if not _page_dead(exc):
+                if not _page_dead(exc) and not _page_eval_error(exc):
                     raise
                 _release(entry)
-                _retire(entry, f"submit: {type(exc).__name__}")
+                _handle_page_exc(entry, exc, "submit")
                 if attempt >= 2:
                     raise
                 switched.add(id(entry))
@@ -1458,6 +1495,8 @@ async def generate(req: GenReq):
                 continue
             status = sub.get("status")
             if status not in (403, 429):
+                if status == 200:
+                    entry["eval_fails"] = 0
                 break
             # 403/429 都是「这个出口 IP 不可用」：冷却 + 换页（独立 context
             # = 新连接 = 新出口 IP）重试，不该让客户为此失败。
@@ -1529,11 +1568,11 @@ async def generate(req: GenReq):
             try:
                 st = await _eval(entry, STATUS_JS, token, timeout=30)
             except Exception as exc:  # noqa: BLE001
-                if not _page_dead(exc):
+                if not _page_dead(exc) and not _page_eval_error(exc):
                     raise
                 # 任务已经提交到上游：换一页继续轮询即可，丢任务才是最坏结果
                 _release(entry)
-                _retire(entry, f"poll: {type(exc).__name__}")
+                _handle_page_exc(entry, exc, "poll")
                 switched.add(id(entry))
                 entry = await acquire_entry(exclude=switched)
                 continue
@@ -1584,10 +1623,10 @@ async def generate(req: GenReq):
         try:
             med = await _eval(entry, MEDIA_JS, image_token, timeout=MEDIA_TIMEOUT_S)
         except Exception as exc:  # noqa: BLE001
-            if not _page_dead(exc):
+            if not _page_dead(exc) and not _page_eval_error(exc):
                 raise
             _release(entry)
-            _retire(entry, f"media: {type(exc).__name__}")
+            _handle_page_exc(entry, exc, "media")
             switched.add(id(entry))
             entry = await acquire_entry(exclude=switched)
             med = await _eval(entry, MEDIA_JS, image_token, timeout=MEDIA_TIMEOUT_S)
