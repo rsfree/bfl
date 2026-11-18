@@ -49,7 +49,10 @@ DEFAULT_429_COOLDOWN_S = int(os.environ.get("BFL2OPENAI_POOL_429_COOLDOWN", "600
 #: 拿到**同一个**候选（`last_used` 要等生成完成才更新，约 20s 后才变），
 #: 于是全线挤在同一个 IP 上抢租约，抢不到的就报"无可用槽位"——
 #: 实测 234 个槽位空闲时仍在刷 429。摊开到 N 个候选后，并发请求自然落到不同 IP。
-POOL_SPREAD = max(1, int(os.environ.get("BFL2OPENAI_POOL_SPREAD", "8")))
+#:
+#: 32 而不是 8：最大段 `38.6.213.0/24` 独占 220 个 IP，取最老的 8 个仍会被
+#: 20 并发一次抢空；32 个候选足以覆盖实际并发（MAX_INFLIGHT=20）。
+POOL_SPREAD = max(1, int(os.environ.get("BFL2OPENAI_POOL_SPREAD", "32")))
 
 #: 同一出口两次提交的**最小间隔**（秒）。
 #:
@@ -501,60 +504,63 @@ async def get_slot(n: int) -> Slot | None:
     return _to_slot(n, d, _cfg()["quota"]) if d else None
 
 
-async def acquire(*, exclude: Iterable[int] = ()) -> Slot | None:
-    """取下一个槽位：**按 /24 分段的轮询（两级 LRU）**。
+async def acquire_many(limit: int = 1, *, exclude: Iterable[int] = ()) -> list[Slot]:
+    """按调度优先级返回**至多 limit 个候选**（一次快照，供调用方逐个试租约）。
 
-    为什么不是普通轮询：实测池子 525 个唯一 IP 只分布在 31 个 /24，其中
-    `38.6.213.0/24` 独占 220 个。单纯按 IP 轮询会让相邻请求频繁落在同一个
-    C 段，在风控看来「换 IP 但没换身份」。先选**最久没用的段**，再在段内
-    选最久没用的 IP，才能把相邻请求分散到不同网段。
+    为什么要批量：`list_slots()` 要扫 588 个 key，而并发时每个请求都要
+    反复取槽。原实现一次只给一个候选，抢不到租约就得再扫一遍 ——
+    20 并发下实测 14 个请求取不到槽（此时池里还有 233 个可用）。
+    一次快照给出 N 个候选，调用方本地逐个试租约，扫描次数降一个数量级。
 
-    代价：无。段级轮询不减少总调用量，只改变顺序 —— 除非只剩一个段还有
-    额度，那时所有请求只能挤在该段，属容量不足而非策略问题。
+    顺序：段按"最久没用"排序（/24 隔离优先），段内在最老的 POOL_SPREAD 个
+    IP 里随机（摊薄并发），并跳过"段内 IP 都还没静默够"的段。
     """
     ex = set(exclude)
     now = time.time()
     cand = [s for s in await list_slots()
             if s.available(now) and s.slot not in ex]
     if not cand:
-        return None
+        return []
 
     by_seg: dict[str, list[Slot]] = {}
     for s in cand:
         by_seg.setdefault(s.seg, []).append(s)
-    # 段级时间戳取组内最大值（最近一次用过），越小越该轮到它。
-    #
-    # 注意：这里必须用**未过滤**的候选算段年龄。若先用最小间隔把刚用过的
-    # IP 剔掉再算，该段的 max 会退回旧值、被误判成"最久没用"，于是连着
-    # 两次压进同一个 /24 —— 那正是要避免的事。
+    # 段年龄必须用**未过滤**的候选算：若先用最小间隔把刚用过的 IP 剔掉再算，
+    # 该段的 max 会退回旧值、被误判成"最久没用"，于是连着两次压进同一个 /24。
     seg_age = [(seg, max(x.last_used for x in g))
                for seg, g in by_seg.items()]
-    # 同年龄的段随机，不能按名字排 —— 否则会从字母序最小的段开始逐个打过去，
-    # 一头撞死在同一个坏 C 段里（实测 142.4.107.* 连续 18 次 403）。
-    # 先 shuffle 再稳定排序：等值项保留随机顺序，等价于"同年龄随机取"。
+    # 先 shuffle 再稳定排序：等值段保留随机顺序，等价于"同年龄随机取"。
     random.shuffle(seg_age)
     seg_age.sort(key=lambda kv: kv[1])
 
+    out: list[Slot] = []
     for seg, _ in seg_age:
-        group = by_seg[seg]
-        # 摊薄：跳过"段内所有 IP 都还没静默够"的段，换下一段。
+        group = sorted(by_seg[seg], key=lambda x: x.last_used)
         if MIN_GAP_S > 0:
-            spaced = [x for x in group if now - x.last_used >= MIN_GAP_S]
-            if not spaced:
-                continue
-            group = spaced
-        # 段内摊薄：最老的前 N 个 IP 里随机，而不是固定取唯一最老的那个。
-        # 并发请求因此各落一个 IP，不再同时抢同一条租约（那正是"池里还有
-        # 两百多个空闲槽却报无槽可用"的成因）。
-        floor = sorted(group, key=lambda x: x.last_used)[:POOL_SPREAD]
-        return random.choice(floor)
+            group = [x for x in group if now - x.last_used >= MIN_GAP_S]
+        if not group:
+            continue
+        head = group[:POOL_SPREAD]
+        random.shuffle(head)      # 段内摊薄，别让并发全落在同一个 IP
+        out.extend(head)
+        if len(out) >= limit:
+            return out[:limit]
 
-    # 所有段都还没过静默期：退化为最老段里最老的 IP。
-    # 宁可稍微密一点，也不能因为"间隔不足"就返回 None —— 那会把调度
-    # 问题伪装成容量耗尽。
-    group = by_seg[seg_age[0][0]]
-    floor = sorted(group, key=lambda x: x.last_used)[:POOL_SPREAD]
-    return random.choice(floor)
+    if not out:
+        # 所有段都还没过静默期：退化为最老段里最老的若干 IP。
+        # 宁可密一点，也不能因为"间隔不足"就返回空 —— 那会把调度问题
+        # 伪装成容量耗尽。
+        group = sorted(by_seg[seg_age[0][0]], key=lambda x: x.last_used)
+        head = group[:POOL_SPREAD]
+        random.shuffle(head)
+        out = head
+    return out[:limit]
+
+
+async def acquire(*, exclude: Iterable[int] = ()) -> Slot | None:
+    """取下一个槽位：`acquire_many(1)` 的兼容入口。"""
+    got = await acquire_many(1, exclude=exclude)
+    return got[0] if got else None
 
 
 async def note_success(slot: int) -> int:

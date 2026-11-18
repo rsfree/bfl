@@ -633,23 +633,20 @@ async def _next_slot(exclude: set[int]):
             _take(s.slot)
             return s
 
-    # 3) 正常轮转：先找还有并发余量的
+    # 3) 正常轮转：一次快照取一批候选，本地逐个试租约。
+    #    原实现一次只给一个候选、抢不到就再全量扫一遍 588 个 key，
+    #    20 并发下实测 14 个请求拿不到槽（池里其实还有 233 个可用）。
     ex = set(exclude)
-    for _ in range(8):
-        s = await egress_pool.acquire(exclude=ex)
-        if s is None:
+    for _ in range(2):
+        cands = await egress_pool.acquire_many(12, exclude=ex)
+        if not cands:
             break
-        if _has_room(s.slot) and await egress_pool.try_lease(s.slot, _SLOT_CAP):
-            _STICKY["slot"] = s.slot
-            _take(s.slot)
-            return s
-        ex.add(s.slot)
-    # 全部满载：退回任意可用槽位。宁可轻度超发，也不要因为"没余量"直接 429。
-    s = await egress_pool.acquire(exclude=exclude)
-    if s is not None and await egress_pool.try_lease(s.slot, _SLOT_CAP):
-        _STICKY["slot"] = s.slot
-        _take(s.slot)
-        return s
+        for s in cands:
+            if _has_room(s.slot) and await egress_pool.try_lease(s.slot, _SLOT_CAP):
+                _STICKY["slot"] = s.slot
+                _take(s.slot)
+                return s
+            ex.add(s.slot)
     return None
 
 
