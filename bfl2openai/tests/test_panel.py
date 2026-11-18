@@ -37,6 +37,18 @@ def test_page_renders(client):
     assert "出口池中台" in r.text
 
 
+def test_gate_hidden_rule_overrides_flex(client):
+    """#gate 自带 display:flex，必须显式给 [hidden] 补 display:none。
+
+    真实事故（0.2.107）：hideGate() 只设 `hidden` 属性，而 UA 样式的
+    display:none 优先级低于作者样式 `#gate{display:flex}` ⇒ 登录成功后
+    遮罩层永不消失。数据其实已经加载成功，用户看到的却是登录框一直
+    停在"验证中/请输入面板密钥"，被误判成"密钥验证不通过"。
+    """
+    r = client.get("/panel")
+    assert "#gate[hidden]{display:none}" in r.text
+
+
 def test_snapshot_reports_collision(client):
     r = client.get("/panel/api/snapshot")
     assert r.status_code == 200

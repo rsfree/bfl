@@ -152,6 +152,10 @@ input[type=number]{width:64px;border:1px solid var(--line);border-radius:5px;pad
 .toolbar{display:flex;gap:10px;align-items:center;margin-bottom:12px}
 #gate{position:fixed;inset:0;background:rgba(255,255,255,.97);display:flex;
   align-items:center;justify-content:center;z-index:9}
+/* 🔴 hidden 属性默认的 display:none 是 UA 样式，优先级低于上面的 #gate{display:flex}，
+   结果 hideGate() 设了 hidden 也关不掉遮罩 —— 登录成功后仍停在登录框，
+   用户看到的就是"密钥验证不通过"。必须显式压过。 */
+#gate[hidden]{display:none}
 .gatebox{background:#fff;border:1px solid var(--line);border-radius:10px;
   padding:24px;width:300px;text-align:center}
 .gatebox h3{margin:0 0 6px;font-size:15px;font-weight:500}
