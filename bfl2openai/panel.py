@@ -21,7 +21,7 @@ import time
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from . import egress_pool, logring
+from . import egress_pool, logring, reqlog
 
 router = APIRouter(prefix="/panel", tags=["panel"])
 
@@ -146,6 +146,19 @@ async def api_logs(request: Request, limit: int = 200, level: str = "", q: str =
     return JSONResponse(data)
 
 
+@router.get("/api/request_logs")
+async def api_request_logs(request: Request, limit: int = 100,
+                           status: str = "", q: str = ""):
+    """请求记录。`status`="error"（4xx/5xx）| "slow"（>=3s）；`q` 匹配方法/路径/IP。"""
+    _check(request)
+    try:
+        data = await asyncio.to_thread(reqlog.read, limit, status, q)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[panel] request_logs failed: {type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(status_code=503, detail="request log unavailable")
+    return JSONResponse(data)
+
+
 _PAGE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>出口池中台 · bfl</title>
@@ -187,17 +200,29 @@ input[type=number]{width:64px;border:1px solid var(--line);border-radius:5px;pad
 .gatebox button{width:100%;padding:9px;border:0;border-radius:6px;
   background:var(--fg);color:#fff;cursor:pointer;font-size:13px}
 .gatebox .err{color:var(--bad);margin:10px 0 0;min-height:16px}
-h2.sect{font-size:14px;margin:28px 0 10px;font-weight:600;display:flex;gap:10px;align-items:baseline}
-.logs{font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;background:#fafafa;
-  border:1px solid var(--line);border-radius:8px;max-height:420px;overflow:auto}
-.logrow{display:flex;gap:10px;padding:3px 10px;border-bottom:1px solid #f1f1f1;
-  white-space:pre-wrap;word-break:break-all}
-.logrow:last-child{border-bottom:0}
-.logts{color:var(--mut);flex:0 0 auto}
-.loglv{flex:0 0 62px;font-weight:600}
-.logmsg{flex:1}
-.lv-INFO{color:var(--ok)}.lv-WARNING{color:var(--warn)}
-.lv-ERROR,.lv-CRITICAL{color:var(--bad)}.lv-DEBUG{color:var(--mut)}
+h2.sect{font-size:14px;margin:28px 0 10px;font-weight:600}
+.box{border:1px solid var(--line);border-radius:10px;margin-top:16px;overflow:hidden}
+.box>header{display:flex;align-items:center;gap:10px;padding:11px 14px;
+  border-bottom:1px solid var(--line);background:#fcfcfc;flex-wrap:wrap}
+.box>header h3{font-size:13px;margin:0;font-weight:600}
+.grow{flex:1}
+.chips{display:flex;gap:6px}
+button.xs{padding:2px 10px;font-size:12px;border-radius:999px}
+button.xs.chip.on{background:var(--fg);color:#fff;border-color:var(--fg)}
+.note{font-size:12px;color:var(--mut)}
+#logBox{margin:0;padding:10px 12px;font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;
+  background:#fafafa;max-height:380px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+#logBox .ln{display:block}
+#logBox .ln.w{color:var(--warn)}
+#logBox .ln.e{color:var(--bad)}
+.tbl-wrap{max-height:380px;overflow:auto}
+table.logs-tbl{width:100%;border-collapse:collapse;font-size:12px}
+table.logs-tbl th{position:sticky;top:0;background:#fcfcfc;text-align:left;
+  padding:8px 10px;border-bottom:1px solid var(--line);font-weight:500;color:var(--mut)}
+table.logs-tbl td{padding:6px 10px;border-bottom:1px solid #f3f3f3;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.st-2xx{color:var(--ok)}.st-3xx{color:var(--mut)}
+.st-4xx{color:var(--warn)}.st-5xx{color:var(--bad)}
 </style></head><body>
 <header><h1>出口池中台</h1><span class="mut" id="sub">加载中…</span></header>
 <div id="gate" hidden>
@@ -223,23 +248,51 @@ h2.sect{font-size:14px;margin:28px 0 10px;font-weight:600;display:flex;gap:10px;
     <th>进度</th><th>硬额度</th><th>429 / 403</th><th>失败</th><th>空闲</th><th>改停手点</th>
   </tr></thead><tbody id="rows"></tbody></table>
 
-  <h2 class="sect">运行日志 <span class="mut" id="logmeta">加载中…</span></h2>
+  <h2 class="sect">运行观测</h2>
   <div class="toolbar">
-    <select id="loglevel" onchange="loadLogs()"
-            style="border:1px solid var(--line);border-radius:5px;padding:4px 8px;font-size:12px">
-      <option value="">全部级别</option>
-      <option value="INFO">INFO 及以上</option>
-      <option value="WARNING">WARNING 及以上</option>
-      <option value="ERROR">仅 ERROR</option>
-    </select>
-    <input id="logq" placeholder="搜索（槽位 / IP / 429 / 异常）" oninput="logDebounce()"
+    <input id="logq" placeholder="搜索路径 / IP / 关键字" oninput="logDebounce()"
            style="border:1px solid var(--line);border-radius:5px;padding:4px 8px;font-size:12px;width:240px">
-    <button onclick="loadLogs()">刷新日志</button>
+    <button onclick="loadLogs()">刷新</button>
     <label class="mut" style="display:flex;align-items:center;gap:4px">
       <input type="checkbox" id="logauto" checked> 5s 自动刷新
     </label>
+    <span class="mut" id="logmeta"></span>
   </div>
-  <div id="logbox" class="logs"><div class="logrow mut">加载中…</div></div>
+
+  <div class="box">
+    <header>
+      <h3>请求记录</h3>
+      <span class="grow"></span>
+      <span class="chips" id="reqChips">
+        <button class="xs chip on" data-st="">全部</button>
+        <button class="xs chip" data-st="error">错误 4xx/5xx</button>
+        <button class="xs chip" data-st="slow">慢 &gt;3s</button>
+      </span>
+      <span class="note" id="reqNote">最近 100 条</span>
+    </header>
+    <div class="tbl-wrap">
+      <table class="logs-tbl">
+        <thead><tr><th>时间</th><th>方法</th><th>路径</th><th>状态</th><th>耗时</th><th>客户端</th></tr></thead>
+        <tbody id="reqBody"><tr><td colspan="6" class="mut">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="box">
+    <header>
+      <h3>运行日志</h3>
+      <span class="grow"></span>
+      <span class="chips" id="logChips">
+        <button class="xs chip on" data-lv="">全部</button>
+        <button class="xs chip" data-lv="INFO">INFO</button>
+        <button class="xs chip" data-lv="WARNING">警告</button>
+        <button class="xs chip" data-lv="ERROR">错误</button>
+      </span>
+      <span class="note" id="logNote">最近 300 行</span>
+      <button class="xs" id="btnLogPin">自动滚动：开</button>
+    </header>
+    <pre id="logBox"><span class="ln">加载中…</span></pre>
+  </div>
 </main>
 <script>
 const el=(id)=>document.getElementById(id);
@@ -257,30 +310,57 @@ function doLogin(){
   load().then(()=>{if(DATA&&DATA.slots!==undefined){hideGate();loadLogs().catch(()=>{})}
                    else showGate("密钥无效")}).catch(()=>showGate("密钥无效"));
 }
-// ---------------- 运行日志 ----------------
-let logDebounceTimer=null;
+// ---------------- 运行观测：请求记录 + 运行日志 ----------------
+let logDebounceTimer=null, logLv="", reqSt="", logPin=true;
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]))}
 function fmtLogTs(ts){const d=new Date((ts||0)*1000);
   return d.toLocaleTimeString("zh-CN",{hour12:false})}
 function logDebounce(){clearTimeout(logDebounceTimer);
   logDebounceTimer=setTimeout(()=>{loadLogs().catch(()=>{})},300)}
+function pickChips(wrapId,btn,key){
+  document.querySelectorAll("#"+wrapId+" .chip").forEach(x=>x.classList.toggle("on",x===btn));
+  if(key==="lv")logLv=btn.dataset.lv; else reqSt=btn.dataset.st;
+  loadLogs().catch(()=>{});
+}
+function renderReq(rows,src){
+  el("reqNote").textContent=rows.length+" 条 · "
+    +(src==="redis"?"全部 worker":"仅本 worker");
+  el("reqBody").innerHTML=rows.length?rows.map(e=>{
+    const s=Number(e.status||0);
+    const cls=s>=500?"st-5xx":s>=400?"st-4xx":s>=300?"st-3xx":"st-2xx";
+    return `<tr><td>${fmtLogTs(e.ts)}</td><td>${esc(e.method)}</td>`
+      +`<td>${esc(e.path)}</td><td class="${cls}">${s}</td>`
+      +`<td>${Number(e.ms||0)}ms</td><td>${esc(e.ip||"—")}</td></tr>`;
+  }).join(""):'<tr><td colspan="6" class="mut">暂无记录</td></tr>';
+}
+function renderLogs(rows,src){
+  const box=el("logBox");
+  const atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-24;
+  box.innerHTML=rows.length?rows.map(e=>{
+    const cls=(e.level==="ERROR"||e.level==="CRITICAL")?" e"
+      :(e.level==="WARNING"?" w":"");
+    return `<span class="ln${cls}">${fmtLogTs(e.ts)} [${esc(e.level)}] `
+      +`${esc(e.logger)} ${esc(e.msg)}</span>`;
+  }).join(""):'<span class="ln" style="color:var(--mut)">暂无匹配日志</span>';
+  // 只有原本就贴在底部才跟着滚：否则用户往上翻历史时会被强行拉回去
+  if(logPin&&atEnd)box.scrollTop=box.scrollHeight;
+  el("logNote").textContent=rows.length+" 行 · "
+    +(src==="redis"?"全部 worker":"仅本 worker");
+}
 async function loadLogs(){
   if(!KEY)return;
-  const lv=el("loglevel").value, kw=(el("logq").value||"").trim();
-  let r;
-  try{r=await api("/logs?limit=300&level="+encodeURIComponent(lv)
-                  +"&q="+encodeURIComponent(kw))}catch(e){return}
-  if(!r.ok){el("logmeta").textContent="日志读取失败 "+r.status;return}
-  const d=await r.json();
-  const rows=d.entries||[];
-  el("logmeta").textContent=rows.length+" 条 · "
-    +(d.source==="redis"?"全部 worker":"仅本 worker（Redis 不可用）");
-  el("logbox").innerHTML=rows.length?rows.map(e=>
-    `<div class="logrow"><span class="logts">${fmtLogTs(e.ts)}</span>`
-    +`<span class="loglv lv-${esc(e.level)}">${esc(e.level)}</span>`
-    +`<span class="logmsg"><span class="mut">${esc(e.logger)}</span> ${esc(e.msg)}</span></div>`
-  ).join(""):'<div class="logrow mut">暂无匹配日志</div>';
+  const kw=(el("logq").value||"").trim();
+  const q="&q="+encodeURIComponent(kw);
+  const [lr,rr]=await Promise.all([
+    api("/logs?limit=300"+q+(logLv?"&level="+encodeURIComponent(logLv):"")).catch(()=>null),
+    api("/request_logs?limit=100"+q+(reqSt?"&status="+encodeURIComponent(reqSt):"")).catch(()=>null),
+  ]);
+  if(lr&&lr.ok){const d=await lr.json();renderLogs(d.entries||[],d.source)}
+  else el("logNote").textContent="日志读取失败"+(lr?" "+lr.status:"");
+  if(rr&&rr.ok){const d=await rr.json();renderReq(d.entries||[],d.source)}
+  else el("reqNote").textContent="记录读取失败"+(rr?" "+rr.status:"");
+  el("logmeta").textContent="";
 }
 let API_BASE="/panel/api";
 function apiPath(p){return API_BASE+p}
@@ -375,6 +455,12 @@ async function scan(){
   const d=await r.json();
   if(!d.ok) el("msg").textContent="已有任务在跑，等待即可";
 }
+document.querySelectorAll("#logChips .chip").forEach(b=>
+  b.onclick=()=>pickChips("logChips",b,"lv"));
+document.querySelectorAll("#reqChips .chip").forEach(b=>
+  b.onclick=()=>pickChips("reqChips",b,"st"));
+el("btnLogPin").onclick=()=>{logPin=!logPin;
+  el("btnLogPin").textContent="自动滚动："+(logPin?"开":"关")};
 load().then(()=>{if(KEY&&DATA)loadLogs().catch(()=>{})}).catch(()=>{});
 setInterval(()=>{load().catch(()=>{})},15000);
 setInterval(()=>{if(KEY&&el("logauto")&&el("logauto").checked)loadLogs().catch(()=>{})},5000);
@@ -395,6 +481,7 @@ alt_router.add_api_route("/quota", api_quota, methods=["POST"])
 alt_router.add_api_route("/scan", api_scan, methods=["POST"])
 alt_router.add_api_route("/reset", api_reset, methods=["POST"])
 alt_router.add_api_route("/logs", api_logs, methods=["GET"])
+alt_router.add_api_route("/request_logs", api_request_logs, methods=["GET"])
 
 
 @router.get("", response_class=HTMLResponse)

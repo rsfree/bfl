@@ -77,6 +77,42 @@ def test_logs_endpoint_captures_and_filters(client, monkeypatch):
     assert hit["entries"] and all("777" in e["msg"] for e in hit["entries"])
 
 
+def test_request_logs_records_business_calls_only(client, monkeypatch):
+    """请求记录：记业务路径，跳过面板自身轮询；支持错误过滤。"""
+    from bfl2openai import panel
+
+    monkeypatch.setattr(panel, "_PASS", "sk-bfl")
+    monkeypatch.setattr(panel, "_TOKEN", "")
+
+    client.get("/v1/definitely-not-a-route")          # 404，业务路径 → 记
+    client.get("/panel/api/snapshot", auth=("x", "sk-bfl"))  # 运维面 → 不记
+
+    r = client.get("/panel/api/request_logs", auth=("x", "sk-bfl"))
+    assert r.status_code == 200
+    d = r.json()
+    paths = [e["path"] for e in d["entries"]]
+    assert "/v1/definitely-not-a-route" in paths
+    assert not any(p.startswith("/panel") for p in paths)
+    row = [e for e in d["entries"] if e["path"] == "/v1/definitely-not-a-route"][0]
+    assert row["status"] == 404 and row["method"] == "GET" and "ms" in row
+
+    err = client.get("/panel/api/request_logs?status=error",
+                     auth=("x", "sk-bfl")).json()
+    assert all(int(e["status"]) >= 400 for e in err["entries"])
+
+    miss = client.get("/panel/api/request_logs?q=nothing-matches-xyz",
+                      auth=("x", "sk-bfl")).json()
+    assert miss["entries"] == []
+
+
+def test_request_logs_alias(client, monkeypatch):
+    from bfl2openai import panel
+
+    monkeypatch.setattr(panel, "_PASS", "sk-bfl")
+    monkeypatch.setattr(panel, "_TOKEN", "")
+    assert client.get("/pq/request_logs", auth=("x", "sk-bfl")).status_code == 200
+
+
 def test_logs_alias_available_for_public_entry(client, monkeypatch):
     from bfl2openai import panel
 

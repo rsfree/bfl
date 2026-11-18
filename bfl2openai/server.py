@@ -44,6 +44,7 @@ from . import uploads
 from . import async_images
 from . import logring
 from . import probe
+from . import reqlog
 from . import store
 from .bridging import (
     image_to_png,
@@ -69,6 +70,8 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="bfl2openai", version="0.2.0", lifespan=_lifespan)
+#: 面板「请求记录」：只测耗时/状态，不消费请求体（见 reqlog.py）
+reqlog.install(app)
 native.register(app)
 uploads.register(app)
 async_images.register(app)
