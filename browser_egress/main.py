@@ -134,10 +134,21 @@ EXIT_IP_SAMPLE_S = float(os.environ.get("BFL2OPENAI_EGRESS_IP_SAMPLE", "60"))
 MEM_SOFT_RATIO = float(os.environ.get("BFL2OPENAI_EGRESS_MEM_SOFT", "0.80"))
 MEM_HARD_RATIO = float(os.environ.get("BFL2OPENAI_EGRESS_MEM_HARD", "0.92"))
 
+#: 页面重建失败后的退避：30s → 60s → 120s → 240s → 300s 封顶。
+#: 2026-11-18 生产实测：上游限流时 12 个槽位每 15 秒各重试一次整页重载，
+#: 30 分钟打了 129 次，把 8 核的 chromium 打满（load 22.9、队列 39）。
+#: 退避只作用于「重建失败」这条路径，正常换 IP 的回收节奏不受影响。
+RECYCLE_BACKOFF_BASE_S = float(
+    os.environ.get("BFL2OPENAI_EGRESS_REBUILD_BACKOFF", "30"))
+RECYCLE_BACKOFF_MAX_S = float(
+    os.environ.get("BFL2OPENAI_EGRESS_REBUILD_BACKOFF_MAX", "300"))
+
 app = FastAPI()
 _state: dict = {
     "pool": [], "lock": asyncio.Lock(), "recycle_lock": asyncio.Lock(),
     "browser": None, "pw": None, "sem": None, "total_inflight": 0,
+    #: idx -> (连续失败次数, 下次允许重建的 epoch)。见 _backoff_fail()。
+    "refill_backoff": {},
     # 限速与出口 IP 观测（2026-11-16 增加，不影响原有字段语义）
     "rps_lock": asyncio.Lock(), "rps_next": 0.0,
     "exit_ip": None, "exit_ip_local": None,
@@ -660,6 +671,36 @@ async def ensure_pool():
         return pages
 
 
+def _backoff_wait(idx: int) -> float:
+    """该槽位还要等多少秒才能再尝试重建；0 表示可立即重建。"""
+    _fails, next_at = _state["refill_backoff"].get(idx, (0, 0.0))
+    return max(0.0, next_at - time.time())
+
+
+def _backoff_fails(idx: int) -> int:
+    return _state["refill_backoff"].get(idx, (0, 0.0))[0]
+
+
+def _backoff_fail(idx: int) -> float:
+    """记一次重建失败，返回本次退避秒数（30s 起，翻倍，300s 封顶）。
+
+    🔴 2026-11-18 事故根因之一：_fill_pool_gap 每 15 秒补一页，补不上就把
+    坏页摘出池子、下个 tick 再补 —— 12 个槽位在 30 分钟内触发 129 次整页
+    重载（每次 = 一个 Chromium 页面完整执行 SPA），8 核被吃干净。上游限流
+    持续时这不是恢复，是自激。退避把重试压到分钟级：池子仍然自愈，只是
+    不再用 CPU 换重试次数。
+    """
+    fails = _backoff_fails(idx) + 1
+    delay = min(RECYCLE_BACKOFF_MAX_S,
+                RECYCLE_BACKOFF_BASE_S * (2 ** (fails - 1)))
+    _state["refill_backoff"][idx] = (fails, time.time() + delay)
+    return delay
+
+
+def _backoff_ok(idx: int) -> None:
+    _state["refill_backoff"].pop(idx, None)
+
+
 def schedule_recycle(entry: dict) -> None:
     """同步摘牌 + 后台回收。摘牌必须发生在 create_task 之前：协程要等到
     下一个事件循环 tick 才真正开始执行，这个窗口足够另一笔请求选中该页
@@ -686,6 +727,21 @@ async def recycle_entry(entry: dict, *, premarked: bool = False):
                 return
             idx = entry["idx"]
             version = browser.version
+            wait = _backoff_wait(idx)
+            if wait > 0:
+                # 退避期内不重建：把这个废页真正摘出池子，到期后由
+                # _fill_pool_gap 补回。若只 return 不摘，它会带着
+                # want_recycle 每 15 秒被重排一次 —— 正是本次风暴的形态。
+                try:
+                    await entry["ctx"].close()
+                except Exception:  # noqa: BLE001
+                    pass
+                _state["pool"] = [e for e in (_state.get("pool") or [])
+                                  if e is not entry]
+                print(f"[pool] page#{idx} recycle deferred "
+                      f"({wait:.0f}s left, fails={_backoff_fails(idx)})",
+                      flush=True)
+                return
             try:
                 await entry["ctx"].close()
             except Exception:  # noqa: BLE001
@@ -698,11 +754,15 @@ async def recycle_entry(entry: dict, *, premarked: bool = False):
                 # 回收失败（Page.goto ERR_ABORTED / Target crashed）：把坏页
                 # 摘出池子，否则闭页会一直占位，等全部 closed 后
                 # acquire_entry 兜底拿到空列表（2026-11-05 生产实测）。
+                delay = _backoff_fail(idx)
                 print(f"[pool] page#{idx} recycle failed: "
-                      f"{type(exc).__name__}: {exc}", flush=True)
+                      f"{type(exc).__name__}: {exc} "
+                      f"(delay {delay:.0f}s, fails={_backoff_fails(idx)})",
+                      flush=True)
                 _state["pool"] = [e for e in (_state.get("pool") or [])
                                   if e is not entry and not e["page"].is_closed()]
                 return
+            _backoff_ok(idx)
             fresh["recycled"] = entry["recycled"] + 1
             pool = _state["pool"]
             for i, e in enumerate(pool):
@@ -913,16 +973,23 @@ async def _fill_pool_gap() -> None:
     async with _state["lock"]:
         pool = _state["pool"]
         have = {e["idx"] for e in pool if _page_ok(e)}
-        missing = [i for i in range(PAGES) if i not in have]
+        # 退避中的槽位不算缺口：不过滤的话 _fill_pool_gap 每个 tick 都会
+        # 挑中同一个失败槽位重试（15s 一次），退避形同虚设。
+        missing = [i for i in range(PAGES)
+                   if i not in have and _backoff_wait(i) <= 0]
         if not missing:
             return
         idx = missing[0]
         try:
             fresh = await _new_page(browser, idx, browser.version)
         except Exception as exc:  # noqa: BLE001
+            delay = _backoff_fail(idx)
             print(f"[pool] refill#{idx} failed: "
-                  f"{type(exc).__name__}: {str(exc)[:120]}", flush=True)
+                  f"{type(exc).__name__}: {str(exc)[:120]} "
+                  f"(delay {delay:.0f}s, fails={_backoff_fails(idx)})",
+                  flush=True)
             return
+        _backoff_ok(idx)
         _state["pool"] = [e for e in pool if e["idx"] != idx] + [fresh]
         print(f"[pool] page#{idx} refilled "
               f"({len(_state['pool'])}/{PAGES})", flush=True)

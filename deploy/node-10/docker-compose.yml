@@ -26,11 +26,16 @@ x-egress: &egress
     options:
       max-size: "50m"
       max-file: "2"
-  mem_limit: 4g                      # 上限，不是占用。实测 8 页 RSS 1.17G、12 页约 1.9G
-                                     # 1.56G ⇒ 3g 留一倍余量。三台 9G + app 4G +
-                                     # redis 0.5G = 13.5G < 16G 物理，不超卖。
-                                     # （原来写 5g：三台总和 15G 会逼近物理上限）
-  cpus: 6
+  mem_limit: 4g                      # 上限，不是占用。2026-11-18 实测 12 页 RSS
+                                     # 2.4–2.8G（chromium 多进程合计），留 1.2G 余量。
+                                     # 🔴 三台 4g + app 5g = 17G > 15.6G 物理，原来那行
+                                     # "9G+4G+0.5G=13.5G 不超卖"从页面数改成 12 起就失效。
+                                     # 实际合计约 9G 打不满；真同时暴涨先撞 cgroup 限额
+                                     # （容器 OOMKilled），不会拖垮宿主机。
+  cpus: 6                            # 这不是"预留"，是单台上限。稳态一台只用 0.1–0.3 核，
+                                     # 只有冷启动预热 12 页时才逼近 6 核。三台同时预热 =
+                                     # 18 核抢 8 核（2026-11-18 事故形态，load 22.9），
+                                     # 所以重建必须走 deploy.sh 的滚动模式，一次一台。
   healthcheck:
     test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8011/healthz"]
     interval: 30s

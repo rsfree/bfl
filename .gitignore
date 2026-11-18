@@ -38,3 +38,7 @@ saved_images/
 
 # 本地验证产物（参考图/输出图，可复现，不入库）
 .verify/
+
+# Python 虚拟环境与构建元数据（本地跑测试用）
+.venv/
+*.egg-info/
