@@ -365,7 +365,12 @@ async function loadLogs(){
   el("logmeta").textContent="";
 }
 let API_BASE="/panel/api";
-function apiPath(p){return API_BASE+p}
+function apiPath(p){
+  // 破浏览器启发式缓存：/pq/* 早期响应没有 Cache-Control，缓存条目一旦
+  // 生成就会一直复用，轮询读到的是十几分钟前的 JSON。每次请求带时间戳
+  // 最稳（服务端已加 no-store，这里兜住历史缓存）。
+  return API_BASE+p+(p.indexOf("?")>=0?"&":"?")+"_="+Date.now();
+}
 async function api(path,opt){
   opt=opt||{};
   opt.headers=Object.assign({},opt.headers||{});
