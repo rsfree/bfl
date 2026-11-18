@@ -293,6 +293,23 @@ def _meta_key() -> str:
 
 # --------------------------------------------------------------- 建映射
 
+#: 扫描专用线程池。
+#: 不能用 asyncio.to_thread：它走事件循环的默认执行器（max_workers 约等于
+#: CPU+4，本机 8 核≈12），SCAN_CONCURRENCY 调到 48 也只会有 12 个探测真正
+#: 并行 —— 实测 12000 个槽位扫了 20 分钟还没扫完。探测是纯 I/O，线程数按
+#: 并发上限给足才有意义。
+_PROBE_EX = None
+
+
+def _probe_executor():
+    global _PROBE_EX
+    if _PROBE_EX is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _PROBE_EX = ThreadPoolExecutor(
+            max_workers=max(8, SCAN_CONCURRENCY), thread_name_prefix="probe")
+    return _PROBE_EX
+
+
 async def _probe_ip(slot: int, *, timeout: float = 12.0) -> str | None:
     """经该槽位取一次出口 IP。失败返回 None。
 
@@ -300,11 +317,12 @@ async def _probe_ip(slot: int, *, timeout: float = 12.0) -> str | None:
     """
     from curl_cffi import requests as creq
 
+    proxies = {"https": slot_proxy_url(slot), "http": slot_proxy_url(slot)}
     try:
-        r = await asyncio.to_thread(
-            creq.get, "https://api.ipify.org",
-            proxies={"https": slot_proxy_url(slot), "http": slot_proxy_url(slot)},
-            timeout=timeout)
+        loop = asyncio.get_running_loop()
+        r = await loop.run_in_executor(
+            _probe_executor(),
+            lambda: creq.get("https://api.ipify.org", proxies=proxies, timeout=timeout))
         if r.status_code == 200:
             ip = (r.text or "").strip()
             return ip if ip and len(ip) <= 45 else None
