@@ -41,11 +41,17 @@ x-egress: &egress
     interval: 30s
     timeout: 10s
     retries: 3
-    start_period: 180s                # 8 页加载 + 预热生成需要时间
+    start_period: 180s                # 9 页分 3 片加载 + 预热生成需要时间
 
 x-egress-env: &egress-env
-  BFL2OPENAI_EGRESS_PAGES: "12"              # 页面池大小（每页=独立出口 IP）
-  BFL2OPENAI_EGRESS_MAX_INFLIGHT: "20"       # 全局并发闸门（8 页 → 每页 cap 3）
+  BFL2OPENAI_EGRESS_PAGES: "9"               # 页面池大小（每页=独立出口 IP）。
+                                             # 12→9：分片后每片多一份 Chromium 固定开销
+                                             # （主进程+zygote+gpu ≈150–200MB），12 页 × 3 片
+                                             # 会把 4G 限额推到 ~86%，必须回到安全水位。
+  BFL2OPENAI_EGRESS_SHARDS: "3"              # 每 3 页一个独立 Chromium。内存到水位只重建一片
+                                             # ⇒ 容量瞬时降 1/3，池子不归零。整池重启的代价是
+                                             # 该实例 40 秒零出口（14:13–14:15 全站 502 33 次）。
+  BFL2OPENAI_EGRESS_MAX_INFLIGHT: "20"       # 全局并发闸门（9 页 → 每页 cap 2.2）
   BFL2OPENAI_EGRESS_MAX_REQ_PER_CTX: "25"    # 单会话 25 次后换 IP/新 cookie
   BFL2OPENAI_EGRESS_POLL_TIMEOUT: "165"      # 必须 < 应用侧 180s，否则失败原因送不回
   BFL2OPENAI_EGRESS_IP_COOLDOWN: "20"        # 403/429 后该页冷却秒数

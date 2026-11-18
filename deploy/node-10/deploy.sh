@@ -29,7 +29,7 @@ DIR=/opt/bfl/deploy/node-10
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 STRATEGY=${STRATEGY:-rolling}
 READY_TIMEOUT=${READY_TIMEOUT:-480}
-PAGES=${PAGES:-12}
+PAGES=${PAGES:-9}      # 与 compose 的 BFL2OPENAI_EGRESS_PAGES 一致
 
 remote() { ssh "$JUMP" "ssh $HOST bash -s"; }
 run() { remote <<EOF

@@ -143,12 +143,25 @@ RECYCLE_BACKOFF_BASE_S = float(
 RECYCLE_BACKOFF_MAX_S = float(
     os.environ.get("BFL2OPENAI_EGRESS_REBUILD_BACKOFF_MAX", "300"))
 
+#: 把 PAGES 切成几片，每片一个独立 pw+Chromium。
+#: 2026-11-18 实测：内存到 92% 时整池重启 = 该实例 40 秒零出口；三台同时
+#: 撞线（14:13–14:15）导致全站 502 33 次。分片后只重建一片，容量瞬时降
+#: 1/SHARDS，池子不归零。每片多一份 browser 固定开销（主进程+zygote+gpu
+#: 约 150–200MB），所以片数不要贪多：3 片 ≈ +0.5G，配合 PAGES=9 用。
+SHARDS = max(1, int(os.environ.get("BFL2OPENAI_EGRESS_SHARDS", "3")))
+
 app = FastAPI()
 _state: dict = {
     "pool": [], "lock": asyncio.Lock(), "recycle_lock": asyncio.Lock(),
     "browser": None, "pw": None, "sem": None, "total_inflight": 0,
     #: idx -> (连续失败次数, 下次允许重建的 epoch)。见 _backoff_fail()。
     "refill_backoff": {},
+    #: 分片：每片 {"pw","browser"}，下标即分片号。见 _ensure_shard()。
+    "shards": [],
+    "shard_locks": [asyncio.Lock() for _ in range(SHARDS)],
+    #: idx -> 解禁时间戳；所属分片重建期间用它挡住 _fill_pool_gap 抢建。
+    "shard_block": {},
+    "shard_cursor": 0,
     # 限速与出口 IP 观测（2026-11-16 增加，不影响原有字段语义）
     "rps_lock": asyncio.Lock(), "rps_next": 0.0,
     "exit_ip": None, "exit_ip_local": None,
@@ -472,8 +485,8 @@ async def _rebind(entry: dict, slot: int) -> None:
     原地改 entry 而不新建 dict —— 池子存的是同一个对象引用，换对象会让
     其它协程手里的 entry 失配。
     """
-    browser = _state.get("browser")
-    if browser is None or not browser.is_connected():
+    browser = _browser_for(entry["idx"])
+    if browser is None:
         raise RuntimeError("browser not connected")
     gen = int(entry.get("gen", 0)) + 1
     prof = _build_profile(entry["idx"], entry.get("version", ""), gen)
@@ -587,21 +600,21 @@ async def _eval(entry: dict, script: str, arg=None, timeout: float = 90):
             await _page_sleep(entry)
 
 
-async def _teardown_browser() -> None:
-    """彻底关掉当前 Chromium 与 Playwright 驱动，把内存还给内核。
+async def _teardown_shard(k: int) -> None:
+    """关掉第 k 片的 pw + Chromium，把这一片的内存还给内核。
 
-    🔴 重建池子**必须**先走这里。旧实现只把 `_state` 里的引用换掉、不关实例：
-    每轮「页面全崩 → ensure_pool」都会再拉起一整个 Chromium（主进程 + zygote
-    + utility + gpu 一组 6~8 个进程），旧的那组留在 cgroup 里直到 OOM-killer
-    出手。2026-11-13 03:00 的 egress-2 里同时挂着 **24 个 browser 主进程**、
-    cgroup 内存 2.96/3 GiB、一小时内 24 次 memcg OOM（kill 目标全是
-    chromium），就是这条路径。泄漏与崩溃互为因果：OOM 杀渲染进程 → 页面
-    is_closed() → 重建池子 → 再泄漏一份，滚到必定 OOM。
+    🔴 必须先摘引用再关（关闭过程有 await，期间不能被别的协程拿到半死实例）。
+    旧实现只换 `_state` 引用不关实例：每轮「页面全崩 → ensure_pool」再拉起
+    一整个 Chromium，旧的那组留在 cgroup 直到 OOM-killer 出手 ——
+    2026-11-13 03:00 的 egress-2 同时挂着 **24 个 browser 主进程**、
+    cgroup 2.96/3 GiB、一小时 24 次 memcg OOM，就是这条路径。
     """
-    browser = _state.get("browser")
-    pw = _state.get("pw")
-    # 先摘引用再关：关闭过程有 await，期间不能被别的协程拿到半死实例
-    _state.update({"pool": [], "browser": None, "pw": None, "sem": None})
+    shards = _state["shards"]
+    if k < 0 or k >= len(shards):
+        return
+    sh = shards[k] or {}
+    shards[k] = {}
+    browser, pw = sh.get("browser"), sh.get("pw")
     if browser is not None:
         try:
             await browser.close()
@@ -614,61 +627,131 @@ async def _teardown_browser() -> None:
             pass
 
 
-async def ensure_pool():
-    """保证「浏览器活着 + 池子非空」。
+async def _teardown_browser() -> None:
+    """关掉全部分片。只在「整池重置」时用（全部崩了 / 进程退出）。"""
+    for k in range(len(_state["shards"])):
+        await _teardown_shard(k)
+    _state.update({"pool": [], "browser": None, "pw": None, "sem": None})
+    _state["shards"] = []
 
-    判定从「所有页都没关」放宽成「浏览器连着且池子非空」：单页崩溃由
-    `_retire` / `_fill_pool_gap` 原位处理，不该为此重建整个浏览器——每次
-    重建都是一份常驻内存（见 _teardown_browser）。
-    """
-    pool = _state["pool"]
-    browser = _state.get("browser")
-    if pool and browser is not None and browser.is_connected():
-        return pool
-    async with _state["lock"]:
-        pool = _state["pool"]
-        browser = _state.get("browser")
-        if pool and browser is not None and browser.is_connected():
-            return pool
-        await _teardown_browser()
-        pw = await async_playwright().start()
-        proxy_cfg = _parse_proxy(PROXY_URL)
-        print(f"[pool] proxy={'on' if proxy_cfg else 'off'} pages={PAGES} "
-              f"max_inflight={MAX_INFLIGHT} tz={TZ_ID}", flush=True)
-        browser = None
-        try:
-            browser = await pw.chromium.launch(
-                executable_path=os.environ.get(
-                    "BFL2OPENAI_EGRESS_CHROMIUM", "/usr/bin/chromium"),
-                headless=True,
-                proxy=proxy_cfg,
-                args=[
-                    "--no-sandbox", "--disable-dev-shm-usage", "--lang=en-US",
-                    # 反 headless 检测：上游按 UA/webdriver/视口识别自动化环境
-                    "--disable-blink-features=AutomationControlled",
-                    "--window-size=1920,1080",
-                    "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
-                ],
-            )
-            version = browser.version
-            pages = [await _new_page(browser, i, version) for i in range(PAGES)]
-        except BaseException:
-            # 半成品（浏览器起来了但页面没建全）也要收干净，否则又是一份泄漏。
-            # 此刻还没登记进 _state，_teardown_browser() 看不到它，必须就地关。
-            if browser is not None:
-                try:
-                    await browser.close()
-                except Exception:  # noqa: BLE001
-                    pass
+
+async def _launch_shard(k: int):
+    """起一片独立的 pw + Chromium，只建属于它的页面。返回 (pw, browser, pages)。"""
+    pw = await async_playwright().start()
+    proxy_cfg = _parse_proxy(PROXY_URL)
+    browser = None
+    pages: list = []
+    try:
+        browser = await pw.chromium.launch(
+            executable_path=os.environ.get(
+                "BFL2OPENAI_EGRESS_CHROMIUM", "/usr/bin/chromium"),
+            headless=True,
+            proxy=proxy_cfg,
+            args=[
+                "--no-sandbox", "--disable-dev-shm-usage", "--lang=en-US",
+                # 反 headless 检测：上游按 UA/webdriver/视口识别自动化环境
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1920,1080",
+                "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
+            ],
+        )
+        version = browser.version
+        for i in range(PAGES):
+            if _shard_of(i) != k:
+                continue
+            pages.append(await _new_page(browser, i, version))
+    except BaseException:
+        # 半成品（浏览器起来了但页面没建全）也要收干净，否则又是一份泄漏。
+        # 此刻还没登记进 _state，_teardown_shard() 看不到它，必须就地关。
+        if browser is not None:
             try:
-                await pw.stop()
+                await browser.close()
             except Exception:  # noqa: BLE001
                 pass
-            raise
-        _state.update({"pw": pw, "browser": browser, "pool": pages,
-                       "sem": asyncio.Semaphore(MAX_INFLIGHT)})
-        print(f"[pool] {len(pages)} pages ready (chromium {version})", flush=True)
-        return pages
+        try:
+            await pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    return pw, browser, pages
+
+
+async def _ensure_shard(k: int) -> list:
+    """保证第 k 片活着并补齐它的页面；其他片完全不受影响。"""
+    async with _state["shard_locks"][k]:
+        if _shard_browser(k) is not None:
+            return [e for e in _state["pool"] if _shard_of(e["idx"]) == k]
+        idxs = [i for i in range(PAGES) if _shard_of(i) == k]
+        now = time.time()
+        for i in idxs:
+            _state["shard_block"][i] = now + 900
+        try:
+            await _teardown_shard(k)          # 幂等：清掉可能残留的半死实例
+            print(f"[pool] shard#{k} launching ({len(idxs)} pages) "
+                  f"pages_total={PAGES} shards={SHARDS} "
+                  f"max_inflight={MAX_INFLIGHT} tz={TZ_ID}", flush=True)
+            pw, browser, pages = await _launch_shard(k)
+            shards = _state["shards"]
+            while len(shards) <= k:
+                shards.append({})
+            shards[k] = {"pw": pw, "browser": browser}
+            async with _state["lock"]:
+                keep = [e for e in _state["pool"]
+                        if _shard_of(e["idx"]) != k]
+                _state["pool"] = keep + pages
+                if _state.get("sem") is None:
+                    _state["sem"] = asyncio.Semaphore(MAX_INFLIGHT)
+            print(f"[pool] shard#{k} {len(pages)} pages ready "
+                  f"(chromium {browser.version})", flush=True)
+            return pages
+        finally:
+            for i in idxs:
+                _state["shard_block"].pop(i, None)
+
+
+async def ensure_pool():
+    """保证每一片都活着。某片挂了只补那一片，不再整池重建。"""
+    pool = _state["pool"]
+    if pool and all(_shard_browser(k) is not None for k in range(SHARDS)):
+        return pool
+    for k in range(SHARDS):
+        await _ensure_shard(k)
+    return _state["pool"]
+
+
+def _shard_of(idx: int) -> int:
+    """idx 属于哪一片。取模而非区间：增删页时分配更均匀。"""
+    return idx % SHARDS if SHARDS > 1 else 0
+
+
+def _shard_browser(k: int):
+    """第 k 片可用的 browser；没建/掉线返回 None。"""
+    shards = _state["shards"]
+    if k < 0 or k >= len(shards):
+        return None
+    b = shards[k].get("browser")
+    if b is None:
+        return None
+    try:
+        return b if b.is_connected() else None
+    except Exception:  # noqa: BLE001 - CDP 断了
+        return None
+
+
+def _browser_for(idx: int):
+    return _shard_browser(_shard_of(idx))
+
+
+def _shard_blocked(idx: int) -> bool:
+    """该 idx 是否处在「所属分片正在重建」的窗口里。"""
+    return _state["shard_block"].get(idx, 0.0) > time.time()
+
+
+def _pick_shard() -> int:
+    """轮转选片：避免连续两次都重建同一片。"""
+    k = _state.get("shard_cursor", 0) % SHARDS
+    _state["shard_cursor"] = k + 1
+    return k
 
 
 def _backoff_wait(idx: int) -> float:
@@ -719,13 +802,12 @@ async def recycle_entry(entry: dict, *, premarked: bool = False):
         entry["recycling"] = True      # 同步：以下所有 await 前就生效
     try:
         async with _state["recycle_lock"]:
-            browser = _state.get("browser")
-            if browser is None or not browser.is_connected():
-                # 浏览器都掉了：整池重建
-                _state["pool"] = []
-                await ensure_pool()
-                return
             idx = entry["idx"]
+            browser = _browser_for(idx)
+            if browser is None:
+                # 该 idx 所属的分片掉了：只补这一片，不动其他片
+                await _ensure_shard(_shard_of(idx))
+                return
             version = browser.version
             wait = _backoff_wait(idx)
             if wait > 0:
@@ -967,19 +1049,22 @@ async def _fill_pool_gap() -> None:
     """
     if len(_state["pool"]) >= PAGES:
         return
-    browser = _state.get("browser")
-    if browser is None or not browser.is_connected():
-        return          # 浏览器都没了：交给 ensure_pool 全量重建
+    if not any(_shard_browser(k) is not None for k in range(SHARDS)):
+        return          # 所有分片都没了：交给 ensure_pool 全量重建
     async with _state["lock"]:
         pool = _state["pool"]
         have = {e["idx"] for e in pool if _page_ok(e)}
         # 退避中的槽位不算缺口：不过滤的话 _fill_pool_gap 每个 tick 都会
         # 挑中同一个失败槽位重试（15s 一次），退避形同虚设。
         missing = [i for i in range(PAGES)
-                   if i not in have and _backoff_wait(i) <= 0]
+                   if i not in have and _backoff_wait(i) <= 0
+                   and not _shard_blocked(i)]
         if not missing:
             return
         idx = missing[0]
+        browser = _browser_for(idx)
+        if browser is None:
+            return      # 该片正在重建
         try:
             fresh = await _new_page(browser, idx, browser.version)
         except Exception as exc:  # noqa: BLE001
@@ -1020,19 +1105,29 @@ def _cgroup_mem() -> tuple[int, int] | None:
     return None
 
 
-async def _restart_browser(reason: str) -> None:
-    """整池重启：关浏览器 → 立刻重建。
+async def _restart_shard(k: int, reason: str) -> None:
+    """只重建第 k 片：其余分片照常服务，池子不归零。
 
-    这是「优雅版 OOM」：水位到顶时主动重启，代价是此刻 in-flight 的请求
-    失败（本来也会被内核 OOM-killer 杀掉，且杀哪一组进程不可控、还会连带
-    打崩同一 cgroup 里其他页面）。
+    2026-11-18 之前这里是整池重启 —— 该实例 40 秒没有任何出口，三台撞到
+    同一时刻就是全站 502。分片后重建 1/SHARDS 的页面（约 10–15 秒），
+    容量瞬时下降但请求仍能路由到其他片。
     """
-    async with _state["lock"]:
-        if _state.get("browser") is None and not _state["pool"]:
-            return                      # 别人刚重启过
-        print(f"[pool] RESTART browser: {reason}", flush=True)
-        await _teardown_browser()
-    await ensure_pool()
+    idxs = [i for i in range(PAGES) if _shard_of(i) == k]
+    now = time.time()
+    for i in idxs:
+        _state["shard_block"][i] = now + 900
+    try:
+        print(f"[pool] RESTART shard#{k}: {reason}", flush=True)
+        # 与页面回收互斥：重建期间不要有别的协程在关同一片里的 ctx
+        async with _state["recycle_lock"]:
+            async with _state["lock"]:
+                _state["pool"] = [e for e in _state["pool"]
+                                  if _shard_of(e["idx"]) != k]
+            await _teardown_shard(k)
+        await _ensure_shard(k)
+    finally:
+        for i in idxs:
+            _state["shard_block"].pop(i, None)
 
 
 async def _maintain_pool():
@@ -1092,7 +1187,7 @@ async def _maintain_pool():
                     reason = f"mem {ratio:.0%} >= soft {MEM_SOFT_RATIO:.0%} (idle)"
                 if reason:
                     mem_restarts.append(now)
-                    await _restart_browser(reason)
+                    await _restart_shard(_pick_shard(), reason)
         except Exception as exc:  # noqa: BLE001
             print(f"[maintain] mem check error: {type(exc).__name__}: "
                   f"{str(exc)[:100]}", flush=True)
@@ -1176,6 +1271,9 @@ async def healthz():
         "pages_ready": ready,
         "pages_cooling": sum(1 for e in pool if e["cooldown_until"] > now),
         "pages_recycling": sum(1 for e in pool if e.get("recycling")),
+        "shards": SHARDS,
+        "shards_alive": sum(1 for k in range(SHARDS)
+                            if _shard_browser(k) is not None),
         "inflight": _state["total_inflight"],
         "max_inflight": MAX_INFLIGHT,
         "breaker": {"open": _breaker_open(), "trips": _breaker["trips"],

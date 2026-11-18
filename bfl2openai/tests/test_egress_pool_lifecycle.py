@@ -7,10 +7,12 @@
 Chromium，旧的那组 6~8 个进程留在 cgroup 里直到 OOM-killer 出手。而 OOM 又
 反过来杀渲染进程 → 页面 is_closed() → 再重建 → 再泄漏，形成正反馈。
 
-这里锁住三条不变量：
-  1. 浏览器活着且池子非空 ⇒ 直接复用，不重启；
-  2. **单页**崩溃不触发整池重建（交给 _retire / _fill_pool_gap 原位处理）；
-  3. 真的需要重建时，旧 browser / playwright 必须被关掉。
+2026-11-18 起 `_state["browser"]` 换成分片（`_state["shards"]`）：每片一个
+独立 pw+Chromium。下面四条规定因此按"片"来锁：
+  1. 分片都活着且池子非空 ⇒ 直接复用，不重启；
+  2. **单页**崩溃不触发重建（交给 _retire / _fill_pool_gap 原位处理）；
+  3. 某片掉线时只重建该片，且旧的 browser / playwright 必须被关掉；
+  4. 页面没建全就抛错时，半成品浏览器也要收干净。
 """
 from __future__ import annotations
 
@@ -76,10 +78,25 @@ def _entry(idx: int = 0, closed: bool = False) -> dict:
             "recycled": 0, "eval_lock": asyncio.Lock()}
 
 
+def _install_healthy_shards() -> list[dict]:
+    """装上 SHARDS 个健康分片，返回它们，便于断言是否被关闭。"""
+    shards = [{"pw": _FakePW(), "browser": _FakeBrowser()}
+              for _ in range(egress.SHARDS)]
+    egress._state["shards"] = shards
+    return shards
+
+
 @pytest.fixture(autouse=True)
 def _reset_state(monkeypatch):
-    egress._state.update({"pool": [], "browser": None, "pw": None, "sem": None,
-                          "total_inflight": 0})
+    egress._state.update({
+        "pool": [], "browser": None, "pw": None, "sem": None,
+        "total_inflight": 0, "shards": [],
+        # 每个用例重建 lock：asyncio.run 每次新建事件循环
+        "shard_locks": [asyncio.Lock() for _ in range(egress.SHARDS)],
+        "shard_cursor": 0,
+    })
+    egress._state["shard_block"].clear()
+    egress._state["refill_backoff"].clear()
     launches: list[dict] = []
 
     class _PWLauncher:
@@ -91,61 +108,64 @@ def _reset_state(monkeypatch):
 
     monkeypatch.setattr(egress, "async_playwright", lambda: _PWLauncher())
 
-    async def _fake_new_page(browser, idx, version):
+    async def _fake_new_page(browser, idx, version, **kw):
         return _entry(idx)
 
     monkeypatch.setattr(egress, "_new_page", _fake_new_page)
     yield launches
-    egress._state.update({"pool": [], "browser": None, "pw": None, "sem": None,
-                          "total_inflight": 0})
+    egress._state.update({
+        "pool": [], "browser": None, "pw": None, "sem": None,
+        "total_inflight": 0, "shards": [],
+    })
+    egress._state["shard_block"].clear()
+    egress._state["refill_backoff"].clear()
 
 
 def test_reuses_live_browser(_reset_state):
-    """池子非空且浏览器连着：不该重启（每次重启都是一份常驻内存）。"""
-    browser = _FakeBrowser()
-    egress._state.update({"browser": browser, "pw": _FakePW(),
-                          "pool": [_entry(0), _entry(1)]})
+    """分片都活着且池子非空：不该重启（每次重启都是一份常驻内存）。"""
+    shards = _install_healthy_shards()
+    egress._state["pool"] = [_entry(0), _entry(1)]
 
     pool = asyncio.run(egress.ensure_pool())
 
     assert len(pool) == 2
     assert _reset_state == [], "健康池子不该重新 launch chromium"
-    assert browser.closed is False
+    assert all(s["browser"].closed is False for s in shards)
 
 
 def test_single_dead_page_does_not_rebuild_pool(_reset_state):
-    """单页崩溃只该摘牌补位，不该重建整个浏览器（泄漏的触发点）。"""
-    browser = _FakeBrowser()
-    egress._state.update({"browser": browser, "pw": _FakePW(),
-                          "pool": [_entry(0), _entry(1, closed=True)]})
+    """单页崩溃只该摘牌补位，不该重建浏览器（泄漏的触发点）。"""
+    shards = _install_healthy_shards()
+    egress._state["pool"] = [_entry(0), _entry(1, closed=True)]
 
     pool = asyncio.run(egress.ensure_pool())
 
     assert len(pool) == 2
-    assert _reset_state == [], "单页崩溃触发了整池重建"
-    assert browser.closed is False
+    assert _reset_state == [], "单页崩溃触发了重建"
+    assert all(s["browser"].closed is False for s in shards)
 
 
 def test_rebuild_closes_previous_browser(_reset_state):
-    """必须重建时，旧浏览器与 playwright 驱动都要关掉。"""
-    old_browser = _FakeBrowser(connected=False)
-    old_pw = _FakePW()
-    egress._state.update({"browser": old_browser, "pw": old_pw,
-                          "pool": [_entry(0, closed=True)]})
+    """某片掉线时只重建该片，旧浏览器与 playwright 驱动都要关掉。"""
+    shards = _install_healthy_shards()
+    old = shards[0]
+    old_browser, old_pw = old["browser"], old["pw"]
+    old_browser.connected = False          # 模拟该片掉线
+    egress._state["pool"] = [_entry(0, closed=True)]
 
     asyncio.run(egress.ensure_pool())
 
     assert old_browser.closed is True, "旧 chromium 没被关闭（泄漏）"
     assert old_pw.stopped is True, "旧 playwright 驱动没被停止（泄漏）"
-    assert len(_reset_state) == 1, "重建时应当只 launch 一次"
+    assert len(_reset_state) == 1, "只该重建掉线的那一片"
+    # 其余片不能被牵连
+    assert all(s["browser"].closed is False for s in shards[1:])
 
 
 def test_partial_launch_failure_does_not_leak(_reset_state, monkeypatch):
     """页面没建全就抛错时，半成品浏览器也要收干净。"""
     class _BoomBrowser(_FakeBrowser):
-        async def close(self):
-            self.closed = True
-            self.connected = False
+        pass
 
     launched: list[_BoomBrowser] = []
 
@@ -167,7 +187,8 @@ def test_partial_launch_failure_does_not_leak(_reset_state, monkeypatch):
 
     monkeypatch.setattr(egress, "async_playwright", lambda: _PWLauncher2())
 
-    async def _boom(browser, idx, version):
+    async def _boom(browser, idx, version, **kw):
+        # 让第 2 页失败（必定属于某个分片）
         if idx == 2:
             raise RuntimeError("page.goto aborted")
         return _entry(idx)
@@ -175,7 +196,7 @@ def test_partial_launch_failure_does_not_leak(_reset_state, monkeypatch):
     monkeypatch.setattr(egress, "_new_page", _boom)
 
     with pytest.raises(RuntimeError):
-        asyncio.run(egress.ensure_pool())
+        asyncio.run(egress._ensure_shard(2))
 
     assert launched and launched[0].closed is True, "半成品浏览器泄漏了"
 
@@ -186,7 +207,7 @@ def test_cgroup_mem_reads_limit(monkeypatch):
 
     def _fake_open(path, *a, **kw):
         if path == "/sys/fs/cgroup/memory.current":
-            return real_open("/dev/stdin") if False else _Str("900")
+            return _Str("900")
         if path == "/sys/fs/cgroup/memory.max":
             return _Str("1000")
         return real_open(path, *a, **kw)
