@@ -7,6 +7,7 @@ worker 各自从 0 起算 ⇒ 每个 worker 的首发请求都打到第一个实
 
 import asyncio
 import base64
+import time
 
 import pytest
 
@@ -49,7 +50,7 @@ def test_endpoints_empty(monkeypatch):
 def test_round_robin_alternates(monkeypatch):
     seen = []
 
-    def fake_post(url, payload):
+    def fake_post(url, payload, timeout=None):
         seen.append(url)
         return _OK
 
@@ -63,7 +64,7 @@ def test_each_process_gets_its_own_phase(monkeypatch):
     """worker 间相位不同：两个"新进程"的首发不该都落在同一实例。"""
     seen = []
 
-    def fake_post(url, payload):
+    def fake_post(url, payload, timeout=None):
         seen.append(url)
         return _OK
 
@@ -83,7 +84,7 @@ def test_each_process_gets_its_own_phase(monkeypatch):
 def test_failover_on_503(monkeypatch):
     calls = []
 
-    def fake_post(url, payload):
+    def fake_post(url, payload, timeout=None):
         calls.append(url)
         if url == "http://a:8011":
             return 503, '{"error":"breaker open"}'
@@ -98,7 +99,7 @@ def test_failover_on_429_quota(monkeypatch):
     """429 = 该实例 8 个出口 IP 全打热；换一台是换一批 IP，值得重试。"""
     calls = []
 
-    def fake_post(url, payload):
+    def fake_post(url, payload, timeout=None):
         calls.append(url)
         if url == "http://a:8011":
             return 429, '{"error":"30 free generations"}'
@@ -110,7 +111,7 @@ def test_failover_on_429_quota(monkeypatch):
 
 
 def test_429_on_last_instance_still_raises(monkeypatch):
-    def fake_post(url, payload):
+    def fake_post(url, payload, timeout=None):
         return 429, '{"error":"quota"}'
 
     monkeypatch.setattr(cl, "_post", fake_post)
@@ -123,7 +124,7 @@ def test_cooldown_skips_recently_failed_instance(monkeypatch):
     """429 过的实例进冷却，下一次请求先试另一台（不再固定打同一台）。"""
     calls = []
 
-    def fake_post(url, payload):
+    def fake_post(url, payload, timeout=None):
         calls.append(url)
         if url == "http://a:8011":
             return 429, "quota"
@@ -137,7 +138,7 @@ def test_cooldown_skips_recently_failed_instance(monkeypatch):
 
 
 def test_failover_on_transport_error(monkeypatch):
-    def fake_post(url, payload):
+    def fake_post(url, payload, timeout=None):
         if url == "http://a:8011":
             raise OSError("connection refused")
         return _OK
@@ -150,7 +151,7 @@ def test_no_failover_on_content_reject(monkeypatch):
     """451 是语义结果（内容违规），换实例重试没有意义。"""
     calls = []
 
-    def fake_post(url, payload):
+    def fake_post(url, payload, timeout=None):
         calls.append(url)
         return 451, '{"error":"content moderation"}'
 
@@ -165,7 +166,7 @@ def test_no_failover_on_502_contract_error(monkeypatch):
     """502 = 上游契约错误（如 composition 冲突），换实例只会重复同一个错。"""
     calls = []
 
-    def fake_post(url, payload):
+    def fake_post(url, payload, timeout=None):
         calls.append(url)
         return 502, '{"error":"submit 400: composition"}'
 
@@ -173,3 +174,82 @@ def test_no_failover_on_502_contract_error(monkeypatch):
     with pytest.raises(cl.BrowserEgressError):
         _run(_call())
     assert len(calls) == 1
+
+
+# --------------------------------- 瞬态失败重试与熔断（2026-11-21）
+# 背景：线上 17:00–17:50 的 89×502 + 27×504 全部来自 sidecar 的 500/503
+# （rebind 超时、页面 TimeoutError）。旧客户端只对 429/503 换实例，500 直接
+# 上行；且没有墙钟预算，最坏情况 3 个实例各拖 180s，最后撞 nginx 300s。
+
+
+def test_failover_on_sidecar_500(monkeypatch):
+    calls = []
+
+    def fake_post(url, payload, timeout=None):
+        calls.append(url)
+        if url == "http://a:8011":
+            return 500, '{"error":"TimeoutError: "}'
+        return _OK
+
+    monkeypatch.setattr(cl, "_post", fake_post)
+    assert _run(_call()) == b"fake-png-bytes"
+    assert calls == ["http://a:8011", "http://b:8011"], "500 必须换实例"
+
+
+def test_breaker_skips_dead_instance(monkeypatch):
+    """连续失败到阈值后，后续请求先走健康实例，不再每次现撞一次超时。"""
+    calls = []
+
+    def fake_post(url, payload, timeout=None):
+        calls.append(url)
+        if url == "http://a:8011":
+            raise OSError("connection refused")
+        return _OK
+
+    monkeypatch.setattr(cl, "_post", fake_post)
+    # 关掉 20s 实例冷却，单独验证熔断这一层（冷却会把 a 排到最后，
+    # 连续失败计数根本涨不到阈值）。
+    monkeypatch.setattr(cl, "_COOLDOWN_S", 0.0)
+
+    def pinned():
+        # proxy_slot=0 → 固定从 a 开始，避免轮转相位把失败实例让过去
+        return cl.generate(b"png", "p", "1:1", "1k", "i2i", proxy_slot=0)
+
+    _run(pinned())          # a fail -> b ok（a streak=1）
+    calls.clear()
+    _run(pinned())          # a fail -> b ok（a streak=2 -> 熔断）
+    calls.clear()
+    _run(pinned())          # a 在熔断中：应先打 b，且成功即返回
+    assert calls == ["http://b:8011"], calls
+    assert cl.stats()["breaker_trips"] >= 1
+
+
+def test_deadline_stops_further_attempts(monkeypatch):
+    """预算不足时立即收手：不能再把下一个实例也拖 180s。"""
+    calls = []
+
+    def fake_post(url, payload, timeout=None):
+        calls.append(url)
+        raise OSError("timed out")
+
+    monkeypatch.setattr(cl, "_post", fake_post)
+    deadline = time.monotonic() + 20      # < _MIN_ATTEMPT_S(25)
+    with pytest.raises(cl.BrowserEgressError):
+        _run(cl.generate(b"png", "p", "1:1", "1k", "i2i", deadline=deadline))
+    assert len(calls) == 1, "预算不足时不得再试第二个实例"
+    assert cl._stats["deadline_hits"] >= 1
+
+
+def test_rebind_503_does_not_failover_to_other_instance(monkeypatch):
+    """rebind 是槽位级故障：换实例只会把同一个重建超时再花一遍，交给上层换槽。"""
+    calls = []
+
+    def fake_post(url, payload, timeout=None):
+        calls.append(url)
+        return 503, '{"error":"rebind slot 7 failed: TimeoutError"}'
+
+    monkeypatch.setattr(cl, "_post", fake_post)
+    with pytest.raises(cl.BrowserEgressError) as ei:
+        _run(_call())
+    assert ei.value.status == 503
+    assert len(calls) == 1, "rebind 失败应立即上行，不再打第二台"

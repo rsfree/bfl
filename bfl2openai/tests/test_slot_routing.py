@@ -25,7 +25,13 @@ def _env(monkeypatch):
     monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "2")
     monkeypatch.delenv("REDIS_URL", raising=False)
     ep.reset_backend()
+    # 进程内在途计数与黏性槽位是模块级全局：用例间必须清空。
+    # 有些用例直接调 `_next_slot()` 不配对释放，残留会让后面的用例
+    # 看到「池里还有空闲槽位却租不到」——表现为随机失败（2026-11-21）。
+    server._INFLIGHT.clear()
+    server._STICKY["slot"] = 0
     yield
+    server._INFLIGHT.clear()
     ep.reset_backend()
 
 
@@ -482,3 +488,66 @@ def test_min_gap_prefers_idle_slot(monkeypatch):
     asyncio.run(ep._b().hset(ep._slot_key(2),
                              mapping={"last_used": time.time() - 600}))
     assert asyncio.run(ep.acquire()).slot == 2, "应跳过刚用过的槽位"
+
+
+# ------------------------------- 瞬态错误换槽（2026-11-21）
+# 事故：sidecar 高负载下 `rebind slot N failed: TimeoutError` 124 次，
+# 旧实现直接上行成 502 —— 一个槽位的页面状态坏了，却让整笔请求失败。
+
+
+def test_rebind_503_rotates_to_another_slot(monkeypatch):
+    import asyncio
+
+    async def fake_probe(slot, timeout=12.0):
+        return {1: "1.1.1.1", 2: "2.2.2.2"}[slot]
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+
+    calls: list[int] = []
+
+    async def flaky(proxy_slot=None, deadline=None, **kw):
+        calls.append(proxy_slot)
+        if len(calls) == 1:
+            raise bec.BrowserEgressError(
+                'browser egress 503: {"error":"rebind slot 1 failed: '
+                'TimeoutError"}', 503)
+        return b"PNG"
+
+    monkeypatch.setattr(bec, "generate", flaky)
+    out = asyncio.run(server._browser_generate(prompt="x"))
+    assert out == b"PNG"
+    assert len(calls) == 2, "rebind 失败必须换槽重试"
+    assert calls[0] != calls[1], "不能在同一槽位重试"
+
+    rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
+    assert rows[calls[0]].fail == 1, "失败槽位记账，但不扣额度"
+    assert rows[calls[0]].used == 0
+    assert rows[calls[1]].used == 1
+
+
+def test_rebind_retries_are_bounded(monkeypatch):
+    """瞬态重试有上限：不能 6 个槽位全部重试到把预算耗尽。"""
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "4")
+
+    async def fake_probe(slot, timeout=12.0):
+        return f"10.0.0.{slot}"
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+
+    calls: list[int] = []
+
+    async def always(proxy_slot=None, deadline=None, **kw):
+        calls.append(proxy_slot)
+        raise bec.BrowserEgressError(
+            'browser egress 503: {"error":"rebind slot failed: TimeoutError"}',
+            503)
+
+    monkeypatch.setattr(bec, "generate", always)
+    with pytest.raises(bec.BrowserEgressError) as ei:
+        asyncio.run(server._browser_generate(prompt="x"))
+    assert ei.value.status == 503
+    assert len(calls) == 1 + server._TRANSIENT_ATTEMPTS, \
+        f"瞬态重试次数必须封顶，实际 {len(calls)} 次"

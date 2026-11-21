@@ -278,3 +278,80 @@ async def zrevrange(setkey: str, count: int) -> list[str]:
                 for m in await _r.zrevrange(setkey, 0, count - 1)]
     items = sorted(_ZSETS.get(setkey, {}).items(), key=lambda kv: -kv[1])
     return [m for m, _ in items[:count]]
+
+
+# ---- 全局计数（并发闸门 / 运行指标）------------------------------------
+# 为什么不用进程内变量：gunicorn 6 个 worker 各算各的，6 × 上限 = 实际上限
+# 放大 6 倍，闸门形同虚设。Redis INCR/DECR 是原子的，跨进程口径一致。
+_COUNTERS: dict[str, tuple[int, float | None]] = {}
+_HASHES: dict[str, dict[str, int]] = {}
+
+
+def _counter_read(key: str) -> int:
+    item = _COUNTERS.get(key)
+    if item is None:
+        return 0
+    val, exp = item
+    if exp and exp < time.time():
+        _COUNTERS.pop(key, None)
+        return 0
+    return val
+
+
+async def incr_counter(key: str, ttl_s: int | None = None,
+                       delta: int = 1) -> int:
+    """原子自增，返回自增后的值。`ttl_s` 每次刷新（用于在途计数防泄漏）。"""
+    if REDIS_URL:
+        if delta == 1:
+            v = await _r.incr(key)
+        else:
+            v = await _r.incrby(key, int(delta))
+        if ttl_s:
+            await _r.expire(key, int(ttl_s))
+        return int(v)
+    cur = _counter_read(key) + int(delta)
+    _COUNTERS[key] = (cur, time.time() + ttl_s if ttl_s else None)
+    return cur
+
+
+async def decr_counter(key: str) -> int:
+    """原子自减，下限 0（进程被杀会漏减，TTL 兜底，这里只防负数累积）。"""
+    if REDIS_URL:
+        v = int(await _r.decr(key))
+        if v < 0:
+            await _r.set(key, 0)
+            return 0
+        return v
+    cur = max(0, _counter_read(key) - 1)
+    _COUNTERS[key] = (cur, None)
+    return cur
+
+
+async def read_counter(key: str) -> int:
+    if REDIS_URL:
+        raw = await _r.get(key)
+        return int(raw or 0)
+    return _counter_read(key)
+
+
+async def hincr(key: str, field: str, delta: int = 1) -> int:
+    """哈希字段自增：多 worker 的累计指标都写这里。"""
+    if REDIS_URL:
+        return int(await _r.hincrby(key, field, int(delta)))
+    d = _HASHES.setdefault(key, {})
+    d[field] = d.get(field, 0) + int(delta)
+    return d[field]
+
+
+async def hgetall_int(key: str) -> dict[str, int]:
+    if REDIS_URL:
+        raw = await _r.hgetall(key)
+        out: dict[str, int] = {}
+        for k, v in (raw or {}).items():
+            kk = k.decode() if isinstance(k, bytes) else str(k)
+            try:
+                out[kk] = int(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+    return dict(_HASHES.get(key, {}))

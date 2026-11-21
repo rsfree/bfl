@@ -21,7 +21,7 @@ import time
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from . import egress_pool, logring, reqlog
+from . import egress_pool, logring, metrics, reqlog
 
 router = APIRouter(prefix="/panel", tags=["panel"])
 
@@ -86,6 +86,8 @@ async def api_snapshot(request: Request):
         snap = await egress_pool.snapshot()
         snap["now"] = int(time.time())
         snap["scan"] = await egress_pool.scan_status()
+        # 指标是附加块：前端不认也没关系，旧版本面板不会因此报错。
+        snap["metrics"] = await metrics.snapshot()
     except Exception as exc:  # noqa: BLE001 - 面板必须自己收尾
         print(f"[panel] snapshot failed: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=503, detail="state store unavailable")
@@ -143,6 +145,19 @@ async def api_logs(request: Request, limit: int = 200, level: str = "", q: str =
     except Exception as exc:  # noqa: BLE001 - 面板不能因日志挂了而 500
         print(f"[panel] logs failed: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=503, detail="log ring unavailable")
+    return JSONResponse(data, headers={"cache-control": "no-store"})
+
+
+@router.get("/api/metrics")
+async def api_metrics(request: Request):
+    """运行指标 + 闸门在途 + 侧车熔断状态。排查 5xx 风暴先看这里。"""
+    _check(request)
+    try:
+        data = await metrics.snapshot()
+        data["scan"] = await egress_pool.scan_status()
+    except Exception as exc:  # noqa: BLE001 - 面板必须自己收尾
+        print(f"[panel] metrics failed: {type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(status_code=503, detail="metrics unavailable")
     return JSONResponse(data, headers={"cache-control": "no-store"})
 
 
@@ -484,7 +499,14 @@ async function load(){
     card("唯一 IP / 网段",`${d.distinct_ips} / ${d.prefixes||0}`)+
     card("头部网段",`${d.top_prefix&&d.top_prefix.length?d.top_prefix[0][0]+" ("+d.top_prefix[0][1]+")":"—"}`)+
     card("碰撞剔除",`${d.dups}`)+
-    card("探测失败",`${d.errors}`);
+    card("探测失败",`${d.errors}`)+
+    // 稳定性指标（2026-11-21）：闸门在途、拒绝数、瞬态重试与预算耗尽。
+    // 排查 5xx 风暴时先看这四张：拒绝暴涨=入口过载，重试多=sidecar 不稳。
+    card("在途 / 闸门",`${(d.metrics&&d.metrics.gate&&d.metrics.gate.inflight>=0)?d.metrics.gate.inflight:"?"} / ${(d.metrics&&d.metrics.gate&&d.metrics.gate.limit)||0}`)+
+    card("闸门拒绝",`${(d.metrics&&d.metrics.counters&&d.metrics.counters.gate_reject)||0}`)+
+    card("瞬态重试 / 救回",`${(d.metrics&&d.metrics.counters)?((d.metrics.counters.rebind_timeout||0)+(d.metrics.counters.sidecar_500||0)+(d.metrics.counters.transport_timeout||0)):0} / ${(d.metrics&&d.metrics.counters&&d.metrics.counters.retry_ok)||0}`)+
+    card("预算耗尽",`${(d.metrics&&d.metrics.counters&&d.metrics.counters.budget_exhausted)||0}`)+
+    card("侧车熔断",`${(d.metrics&&d.metrics.breaker&&d.metrics.breaker.endpoints)?d.metrics.breaker.endpoints.filter(e=>e.open_s_left>0).length:0} 台`);
   render();
 }
 async function setQ(slot){
@@ -528,6 +550,7 @@ alt_router.add_api_route("/scan", api_scan, methods=["POST"])
 alt_router.add_api_route("/reset", api_reset, methods=["POST"])
 alt_router.add_api_route("/logs", api_logs, methods=["GET"])
 alt_router.add_api_route("/request_logs", api_request_logs, methods=["GET"])
+alt_router.add_api_route("/metrics", api_metrics, methods=["GET"])
 
 
 @router.get("", response_class=HTMLResponse)

@@ -128,7 +128,8 @@ _LEAKY = ('submit 400: Invalid enum sin1::mqx5x-1794832947662-54162c0d3047 '
 
 
 @pytest.mark.parametrize("status,expect", [(451, 451), (429, 429), (0, 504),
-                                           (502, 502), (500, 502)])
+                                           (502, 502), (500, 502),
+                                           (503, 503)])
 def test_browser_error_response_is_redacted(status, expect):
     resp = server.wrap_browser_egress_error(bec.BrowserEgressError(_LEAKY, status))
     assert resp.status_code == expect
@@ -215,3 +216,21 @@ def test_phrase_map_swallows_quota_tail():
     assert "<quota_exhausted>" in out
     assert "come back tomorrow" not in out
     assert "30" not in out
+
+
+# --------------------------- 瞬态错误的退避语义（2026-11-21）
+# rebind 超时是「此刻不可用」而不是「上游契约错误」：503 + Retry-After 让
+# 客户端有序退避；压成 502 会被监控当成上游故障，也会诱发立即重试。
+
+
+def test_rebind_503_maps_to_503_with_retry_after():
+    exc = _err(503, '{"error":"rebind slot 42 failed: TimeoutError"}')
+    resp = server.wrap_browser_egress_error(exc)
+    assert resp.status_code == 503
+    assert resp.headers.get("Retry-After"), "503 必须带 Retry-After"
+
+
+def test_timeout_504_carries_retry_after():
+    resp = server.wrap_browser_egress_error(_err(0, "timed out"))
+    assert resp.status_code == 504
+    assert resp.headers.get("Retry-After"), "504 必须带 Retry-After"

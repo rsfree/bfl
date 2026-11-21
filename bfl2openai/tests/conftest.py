@@ -17,8 +17,8 @@ from bfl2openai import store
 
 @pytest.fixture(autouse=True)
 def _isolate_inprocess_store():
-    for container in (store._MEM, store._ZSETS):
+    for container in (store._MEM, store._ZSETS, store._COUNTERS, store._HASHES):
         container.clear()
     yield
-    for container in (store._MEM, store._ZSETS):
+    for container in (store._MEM, store._ZSETS, store._COUNTERS, store._HASHES):
         container.clear()

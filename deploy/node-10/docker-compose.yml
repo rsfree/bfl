@@ -159,6 +159,22 @@ services:
       BFL2OPENAI_SLOT_ATTEMPTS: "${BFL2OPENAI_SLOT_ATTEMPTS:-6}"
       BFL2OPENAI_POOL_PREBIND: "${BFL2OPENAI_POOL_PREBIND:-1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36}"
       BFL2OPENAI_POOL_REBIND_SETTLE: "${BFL2OPENAI_POOL_REBIND_SETTLE:-3.0}"
+      # ---- 稳定性（2026-11-21）----
+      # 入口并发闸门：跨 worker 的在途生成数上限。实测 26 在途时宿主
+      # load 44（8 核），rebind 开始成批超时；但阈值压到 18 会在高峰期把
+      # 大量正常请求打成 429（请求日志回放：入口并发常驻 25~30，含 follower）。
+      # 24 只在真正越过实测水位时削峰；rebind/5xx 持续时再降到 20。
+      # 0 = 关闭（回滚开关）。
+      BFL2OPENAI_GATE_LIMIT: "${BFL2OPENAI_GATE_LIMIT:-24}"
+      # 单笔墙钟预算：必须小于 nginx proxy_read_timeout(300s) 与 gunicorn
+      # timeout(300s)。超预算主动回 504 JSON，而不是被 nginx 掐成 HTML。
+      BFL2OPENAI_JOB_BUDGET_S: "${BFL2OPENAI_JOB_BUDGET_S:-240}"
+      # rebind 超时 / sidecar 500 / 传输超时的换槽重试次数（每次可能几十秒）。
+      BFL2OPENAI_TRANSIENT_ATTEMPTS: "${BFL2OPENAI_TRANSIENT_ATTEMPTS:-2}"
+      # 槽位表定时重建：IP 是租来的会漂，旧表放三天等于拿失效出口继续打。
+      # 0 = 关闭；首次扫描至少等 STARTUP_DELAY 秒，避免部署瞬间抢 CPU。
+      BFL2OPENAI_POOL_SCAN_INTERVAL: "${BFL2OPENAI_POOL_SCAN_INTERVAL:-43200}"
+      BFL2OPENAI_POOL_SCAN_STARTUP_DELAY: "${BFL2OPENAI_POOL_SCAN_STARTUP_DELAY:-600}"
     env_file: ./.env                    # 凭证/回退代理/PUBLIC_BASE 注入容器环境
     depends_on:
       - redis

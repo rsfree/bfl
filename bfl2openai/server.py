@@ -43,6 +43,7 @@ from . import upscale as mps
 from . import uploads
 from . import async_images
 from . import logring
+from . import metrics
 from . import probe
 from . import reqlog
 from . import store
@@ -66,6 +67,9 @@ async def _lifespan(_app: FastAPI):
     # 探针在 lifespan 里启动：on_event 已被 FastAPI 标记 deprecated，
     # 而 requirements 是 fastapi>=0.110（会随 pip 升到最新），不能赌它还在。
     probe.start()
+    # 槽位→IP 映射定时重建（默认 12h）。多 worker 靠 Redis 同一时间桶抢锁，
+    # 只有一个进程真正扫描；关闭用 BFL2OPENAI_POOL_SCAN_ENABLE=0。
+    egress_pool.start_scan_scheduler()
     yield
 
 
@@ -332,9 +336,17 @@ def wrap_browser_egress_error(
         # 客户端会当成服务故障无限重试）。
         return openai_error(413, "payload too large for upstream; "
                                  "downscale the input images", "invalid_request_error")
+    if exc.status == 503:
+        # sidecar 明确说"现在不可用"（rebind 超时 / 熔断）：503 比 502 准确，
+        # 且 Retry-After 让客户端有序退避，而不是立刻再打一轮。
+        resp = openai_error(503, _SAFE_ERRORS["upstream_unavailable"], "api_error")
+        resp.headers["Retry-After"] = "10"
+        return resp
     if exc.status == 0:
-        return openai_error(504, _SAFE_ERRORS["upstream_timeout"],
+        resp = openai_error(504, _SAFE_ERRORS["upstream_timeout"],
                             "api_error")
+        resp.headers["Retry-After"] = "10"
+        return resp
     return openai_error(502, _SAFE_ERRORS["upstream_unavailable"],
                         "api_error")
 
@@ -468,7 +480,7 @@ async def _idem_lock_alive(lock_key: str) -> bool:
     return True
 
 
-async def _idem_run(fp: str, produce) -> JSONResponse:
+async def _idem_run(fp: str, produce, weight: int = 1) -> JSONResponse:
     """同指纹请求单飞：第一个执行并缓存，其余等它的结果。
 
     `produce` 只在拿到锁的进程里执行一次。锁用 SET NX 保证跨 worker 唯一；
@@ -508,7 +520,18 @@ async def _idem_run(fp: str, produce) -> JSONResponse:
         if await store.set_nx(lock_key, {"ts": time.time()}, _IDEM_LOCK_TTL_S):
             hb = asyncio.create_task(_idem_heartbeat(lock_key))
             try:
-                resp = await produce()
+                # 闸门只罩住真正干活的 leader：follower 在等结果，不占容量；
+                # 被拒的请求也不该留下幂等缓存（只缓存 451/200）。
+                async with metrics.admit(weight) as ok:
+                    if not ok:
+                        log.warning("ingress gate full limit=%d weight=%d",
+                                    metrics.GATE_LIMIT, weight)
+                        resp = openai_error(
+                            429, "server busy; retry shortly",
+                            "rate_limit_error")
+                        resp.headers["Retry-After"] = "5"
+                        return resp
+                    resp = await produce()
                 raw = bytes(resp.body)
                 if resp.status_code == 451 and _NEG_TTL_S > 0:
                     # 只缓存 451：内容审核是内容属性，同内容重提必然再拒；
@@ -582,6 +605,19 @@ async def _idem_run(fp: str, produce) -> JSONResponse:
 #: （2026-11-18 实测每分钟 8 次 "all exit slots exhausted"）。加深到 6 后，
 #: 只有真正无槽可换才会失败。
 _SLOT_ATTEMPTS = int(os.environ.get("BFL2OPENAI_SLOT_ATTEMPTS", "6"))
+
+#: 单笔请求的墙钟预算（秒）。必须小于 nginx 的 proxy_read_timeout（300s）与
+#: gunicorn 的 timeout（300s）：超了就不是「返回 504」，而是 nginx 回 HTML
+#: 504 或 gunicorn 直接杀 worker —— 后者会丢掉在途任务，还会留下僵尸锁。
+#: 2026-11-21 故障窗口里 p90 305s 的请求全部走了这条最坏路径。
+_JOB_BUDGET_S = float(os.environ.get("BFL2OPENAI_JOB_BUDGET_S", "240"))
+
+#: 瞬态错误（rebind 超时 / sidecar 500 / 传输超时）换槽重试的次数。
+#: 与 _SLOT_ATTEMPTS 分开：429/403 的换槽是毫秒级，瞬态重试每次可能要
+#: 花掉几十秒，必须单独设上限并受 deadline 约束。
+_TRANSIENT_ATTEMPTS = int(os.environ.get("BFL2OPENAI_TRANSIENT_ATTEMPTS", "2"))
+#: 剩余预算低于这个值就不再发起瞬态重试（一次冷页面重建都不够）。
+_TRANSIENT_MIN_S = float(os.environ.get("BFL2OPENAI_TRANSIENT_MIN_S", "45"))
 
 #: 请求级出口开关（灰度用）。`X-Bfl-Egress: pool` 强制走槽位，`legacy`
 #: 强制走 2088。不带头时按环境变量决定 —— 这样可以在真实流量的同时验证
@@ -703,7 +739,7 @@ def _is_daily_quota(exc) -> bool:
     return any(h in text for h in _DAILY_QUOTA_HINTS)
 
 
-async def _browser_generate(**kwargs) -> bytes:
+async def _browser_generate(*, deadline: float | None = None, **kwargs) -> bytes:
     """经侧车生成，并**把成败记到出口 IP 头上**。
 
     未配置 2090 池时完全走原路径（2088 轮换），行为与历史一致 —— 这是
@@ -713,8 +749,12 @@ async def _browser_generate(**kwargs) -> bytes:
     把所有请求判成"池子耗尽"并回 429。宁可退回旧行为，也不能因为部署
     顺序把整站打挂。
 
-    429 的处置是这里的关键：不重试同一槽位，而是**换槽**。同一个 IP 在
-    429 之后短期内不会恢复，原地重试只会把上游的限流窗口越拖越长。
+    错误处置：
+      * 429 / 403 —— 换槽（该 IP 今天/这一刻不行）。次数走 _SLOT_ATTEMPTS。
+      * 503 rebind / 500 页面超时 / 0 传输超时 —— 换槽 + 受墙钟预算约束。
+        这三类在 2026-11-21 的故障窗口里占了全部 5xx：sidecar 在高负载下
+        重建链路超时，旧实现直接上行成 502/504，客户端重试又放大一轮。
+      * 451 / 413 / 502 契约错误 —— 立即上行，重试只会重复同一个结果。
     """
     mode = _EGRESS_MODE.get()
     if mode == "legacy":
@@ -723,12 +763,21 @@ async def _browser_generate(**kwargs) -> bytes:
         use_pool = await egress_pool.ready()
     else:
         use_pool = egress_pool.configured() and await egress_pool.ready()
+
+    now = time.monotonic()
+    if deadline is None:
+        deadline = now + _JOB_BUDGET_S
     if not use_pool:
-        return await browser_egress_client.generate(**kwargs)
+        return await browser_egress_client.generate(deadline=deadline, **kwargs)
 
     tried: set[int] = set()
     last: browser_egress_client.BrowserEgressError | None = None
+    transient_left = _TRANSIENT_ATTEMPTS
+    transient_failed = False
     for _ in range(_SLOT_ATTEMPTS):
+        # 预算见底：再换槽也只是把请求拖到 nginx 300s，不如带着真实原因收手。
+        if last is not None and time.monotonic() + _TRANSIENT_MIN_S > deadline:
+            break
         slot = await _next_slot(tried)
         if slot is None:
             # 全部槽位额度耗尽/冷却中：429 比 502 更接近真相。
@@ -741,7 +790,7 @@ async def _browser_generate(**kwargs) -> bytes:
         tried.add(slot.slot)
         try:
             data = await browser_egress_client.generate(
-                proxy_slot=slot.slot, **kwargs)
+                proxy_slot=slot.slot, deadline=deadline, **kwargs)
         except browser_egress_client.BrowserEgressError as exc:
             # 429（额度/限流）与 403（出口被拒）都是"这个 IP 今天别再用"，
             # 处置一致：标记冷却 + 换下一个槽位。区别只在计数口径。
@@ -763,12 +812,41 @@ async def _browser_generate(**kwargs) -> bytes:
                 last = exc
                 continue
             await egress_pool.note_failure(slot.slot)
+            if exc.status in (0, 500, 503):
+                if exc.status == 503 and "rebind" in str(exc):
+                    await metrics.bump("rebind_timeout")
+                elif exc.status == 500:
+                    await metrics.bump("sidecar_500")
+                else:
+                    await metrics.bump("transport_timeout")
+                # rebind 是**槽位级**状态（该页面/该代理链路坏了），换槽比
+                # 原地重试有效；500/传输超时同理，但每次可能要花几十秒，
+                # 所以只在预算还够一次尝试时才做，且总次数有上限。
+                if transient_left > 0 \
+                        and time.monotonic() + _TRANSIENT_MIN_S < deadline:
+                    transient_left -= 1
+                    transient_failed = True
+                    await metrics.bump("retry_transient")
+                    log.warning(
+                        "slot %03d transient status=%s, rotating (left=%d): %s",
+                        slot.slot, exc.status, transient_left, str(exc)[:160])
+                    last = exc
+                    continue
             raise
         finally:
             _release(slot.slot)
             await egress_pool.drop_lease(slot.slot)
         await egress_pool.note_success(slot.slot)
+        if transient_failed:
+            await metrics.bump("retry_ok")
+        await metrics.bump("gen_ok")
         return data
+    if last is not None and time.monotonic() >= deadline - 5:
+        # 预算耗尽：用 0（传输层超时）语义上行，映射成 504 + Retry-After，
+        # 而不是把 sidecar 的 503 包装成"上游不可用"的 502。
+        await metrics.bump("budget_exhausted")
+        raise browser_egress_client.BrowserEgressError(
+            f"generation budget exhausted (last status={last.status})", 0) from last
     log.warning("gave up after %d slots, last=%s", len(tried),
                 getattr(last, "status", None))
     raise last or browser_egress_client.BrowserEgressError(
@@ -788,6 +866,9 @@ async def _run_job_impl(
     upscale_to: int | None = None,
     reference_images: list[tuple[bytes, str]] | None = None,
 ) -> JSONResponse:
+    # 墙钟预算从进入生成实现就开始计时（含 n>1 的并发分支）。
+    deadline = time.monotonic() + _JOB_BUDGET_S
+
     # ---- 多图（composition）归一化 -------------------------------------
     # 上游契约（2026-10-26 实测，Zod 报错暴露枚举）：mode 只有 't2i' | 'i2i'，
     # 且 canvas(`image` 部件) 与 references 互斥：
@@ -857,7 +938,8 @@ async def _run_job_impl(
                 aspect_ratio=aspect_ratio, resolution=gen_resolution, mode=mode,
                 boxes_json=json.dumps(boxes) if boxes else None,
                 refs=[b for b, _ in fit_refs],
-                ref_mode="single" if single_branch else None)
+                ref_mode="single" if single_branch else None,
+                deadline=deadline)
             image_token = poll_token
         else:
             try:
@@ -892,7 +974,8 @@ async def _run_job_impl(
                     mode=mode,
                     boxes_json=json.dumps(boxes) if boxes else None,
                     refs=[b for b, _ in fit_refs],
-                    ref_mode="single" if single_branch else None)
+                    ref_mode="single" if single_branch else None,
+                    deadline=deadline)
                 image_token = poll_token
             else:
                 image_token = await upstream.wait_for_result(
@@ -1025,6 +1108,7 @@ async def run_job(
             upscale_to=upscale_to,
             reference_images=reference_images,
         ),
+        weight=max(1, min(n, 4)),
     )
 
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import random
 import time
@@ -64,6 +65,17 @@ MIN_GAP_S = float(os.environ.get("BFL2OPENAI_POOL_MIN_GAP", "18"))
 
 #: 建映射时探测出口 IP 的并发度。探测只打 ipify，不消耗上游额度。
 SCAN_CONCURRENCY = int(os.environ.get("BFL2OPENAI_POOL_SCAN_CONCURRENCY", "16"))
+
+#: 定时重建槽位→IP 映射。默认 12h。IP 是租来的、会漂：旧表放三天等于拿一批
+#: 可能已经失效的出口继续打（2026-11-21 实测 built_at 还是 11-18 部署那次）。
+#: 0 = 关闭；``BFL2OPENAI_POOL_SCAN_ENABLE=0`` 也可关。
+SCAN_INTERVAL_S = float(os.environ.get("BFL2OPENAI_POOL_SCAN_INTERVAL", "43200"))
+SCAN_ENABLE = os.environ.get("BFL2OPENAI_POOL_SCAN_ENABLE", "1") == "1"
+#: 首次扫描的最短延迟：给页面池/业务请求让路，别在部署后立刻抢 CPU。
+SCAN_STARTUP_DELAY_S = float(
+    os.environ.get("BFL2OPENAI_POOL_SCAN_STARTUP_DELAY", "600"))
+_scan_task: asyncio.Task | None = None
+log = logging.getLogger("bfl2openai.egress_pool")
 
 #: 上游按「天」计额度，换日时区未公开 —— **2026-11-18 已实测确定为 UTC 整点**。
 #:
@@ -366,8 +378,74 @@ async def scan_status() -> dict:
         "running": st.get("scan_running") == "1",
         "started": int(float(st.get("scan_started", 0) or 0)),
         "finished": int(float(st.get("scan_finished", 0) or 0)),
+        "built_at": int(float(st.get("built_at", 0) or 0)),
         "error": st.get("scan_error", ""),
     }
+
+
+def scan_due_delay(built_at: float, now: float | None = None) -> float:
+    """距下一次扫描应等多久。
+
+    `built_at` = 上次成功建表时刻。已过期（或从未扫过）时不要立刻扫：
+    部署/重启瞬间页面池还在预热，扫描的 16 路探测会跟着抢 CPU。给一个
+    最短启动延迟，让业务先落地。
+    """
+    now = time.time() if now is None else now
+    if SCAN_INTERVAL_S <= 0:
+        return 0.0
+    due = (float(built_at or 0) + SCAN_INTERVAL_S) - now
+    return min(max(due, SCAN_STARTUP_DELAY_S), SCAN_INTERVAL_S)
+
+
+async def _scan_loop() -> None:
+    from . import store  # 局部导入：store 不依赖本模块，但保持模块顶部轻量
+
+    try:
+        st = await scan_status()
+        delay = scan_due_delay(float(st.get("built_at") or 0))
+    except Exception:  # noqa: BLE001 - 状态读不到就按最短延迟来
+        delay = SCAN_STARTUP_DELAY_S
+    log.info("scan scheduler: first run in %.0fs, interval=%.0fs",
+             delay, SCAN_INTERVAL_S)
+    while True:
+        await asyncio.sleep(delay)
+        delay = SCAN_INTERVAL_S
+        if not configured() or not _has_creds():
+            continue
+        try:
+            # 6 个 worker 都会跑这个循环：同一时间桶只让一个真正扫描。
+            bucket = int(time.time() // max(1.0, SCAN_INTERVAL_S))
+            claimed = await store.set_nx(
+                f"{_PREFIX}:scan:claim:{bucket}", {"pid": os.getpid()},
+                ttl_s=int(SCAN_INTERVAL_S) + 600)
+            if not claimed:
+                continue
+            res = await scan()
+            if res.get("skipped"):
+                log.warning("scheduled scan skipped: manual scan already running")
+            else:
+                log.info("scheduled scan done: %s", res)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 定时任务不能因一次失败退出
+            log.warning("scheduled scan failed: %s: %s",
+                        type(exc).__name__, str(exc)[:200])
+            delay = min(600.0, SCAN_INTERVAL_S)   # 10 分钟后重试
+            continue
+
+
+def start_scan_scheduler() -> None:
+    """应用启动时调用：按 SCAN_INTERVAL_S 定时重建映射。"""
+    global _scan_task
+    if not SCAN_ENABLE or SCAN_INTERVAL_S <= 0:
+        log.info("scan scheduler disabled")
+        return
+    if not configured() or not _has_creds():
+        log.info("scan scheduler idle: pool not configured")
+        return
+    if _scan_task is not None and not _scan_task.done():
+        return
+    _scan_task = asyncio.create_task(_scan_loop())
 
 
 async def _scan_impl(slots: Iterable[int] | None) -> dict[str, Any]:
