@@ -57,16 +57,22 @@ def test_second_daily_429_books_slot():
     assert s.booked is True
 
 
-def test_first_daily_429_does_not_book():
+def test_first_daily_429_books_slot():
+    """口径以上游计数为准（2026-11-22）：命中日额度文案即置死，不二次确认。
+
+    上游的 "30 free generations" 是它自己的计数，包含我们看不见的提交；
+    本地 n_ok 只记成功出图，用它反推必然算错。
+    """
     async def go():
         await _seed(1, used=3, n_ok=3)
         verdict = await ep.note_429(1, daily_hint=True)
         return verdict, await ep.get_slot(1)
 
     verdict, s = asyncio.run(go())
-    assert verdict == "cooling"
-    assert s.used == 3 and s.n_ok == 3
-    assert s.booked is False, "首次只冷却，绝不能置账"
+    assert verdict == "exhausted", "上游说用完即用完"
+    assert s.used == s.quota, "必须置满，否则调度器会继续撞同一堵墙"
+    assert s.booked is True, "置账要打标，供对账与面板区分"
+    assert s.n_ok == 3, "真实出图数不受置账影响"
 
 
 def test_snapshot_exposes_real_and_booked():
@@ -140,8 +146,12 @@ def test_scan_skips_when_owner_alive(monkeypatch):
     assert res.get("skipped") is True
 
 
-def test_legacy_record_backfills_n_ok_from_used():
-    """升级前的槽位没有 n_ok 字段：显示上按 used 回填，不能显示 0。"""
+def test_legacy_record_does_not_backfill_n_ok():
+    """缺 n_ok 时不得用 used 回填（2026-11-22 修正）。
+
+    置账槽位的 used 被强制设成 quota，回填会把「一张没出」读成「出了 30 张」：
+    线上正是这个 bug 让面板 real_ok_today 显示 13346，而账本真实只有 1755。
+    """
     async def go():
         await ep._b().hset(ep._slot_key(3), mapping={
             "day": ep._today(), "ip": "10.0.0.3", "state": ep.STATE_PRIMARY,
@@ -149,7 +159,9 @@ def test_legacy_record_backfills_n_ok_from_used():
         return await ep.get_slot(3)
 
     s = asyncio.run(go())
-    assert s.n_ok == 17 and s.booked is False
+    assert s.n_ok == 0, "缺失即未知，宁可记 0 也不能拿 used 冒充产出"
+    assert s.used == 17, "used 本身不受影响"
+    assert s.booked is False
 
 
 def test_new_record_with_zero_n_ok_is_not_backfilled():

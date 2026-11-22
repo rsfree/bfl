@@ -443,13 +443,11 @@ def test_lease_is_global_not_per_process(monkeypatch):
     assert asyncio.run(ep.try_lease(1, 1)) is True, "释放后应可再租"
 
 
-def test_note_429_after_day_rollover_only_cools():
-    """换日后的第一次「日额度」429 只该冷却。
+def test_note_429_after_day_rollover_still_exhausts():
+    """换日后命中「日额度」文案同样是上游说用完，直接置死。
 
-    回归背景（2026-11-18）：`_to_slot` 已经把 used 做读时归零，所以
-    exhausted 会随换日自动消失。但 `n429d` 不清的话，昨天被判死两次的槽位
-    今天第一次 429 就又判死（seen_daily >= 1）—— "每天 08:00 自动重置"
-    就变成了半重置：used 回来了，判定阈值还带着昨天的伤。
+    换日只该清掉 n429d 这类统计，不该让判定放水 —— 上游的计数是新的，
+    它说用完就是新的那一天也用完了。
     """
     import asyncio
 
@@ -463,9 +461,9 @@ def test_note_429_after_day_rollover_only_cools():
         return res, await b.hgetall(key)
 
     res, d = asyncio.run(_run())
-    assert res == "cooling", "换日后首次 429 就被判额度耗尽"
-    assert d.get("used") != "30", "不该置 used=quota"
-    assert d["n429d"] == "1", "n429d 应从换日后的 0 重新计数"
+    assert res == "exhausted", "上游说用完即用完，与本地换日无关"
+    assert d.get("used") == "30", "必须置满"
+    assert d["n429d"] == "1", "n429d 从换日后的 0 重新计数"
     assert d["day"] == ep._today()
 
 

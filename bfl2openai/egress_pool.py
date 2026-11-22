@@ -630,10 +630,12 @@ def _to_slot(n: int, d: dict[str, str], default_quota: int) -> Slot:
     # 每个请求都产生一次写。
     fresh = d.get("day") == _today()
     used = int(d.get("used", 0) or 0) if fresh else 0
-    # 旧记录没有 n_ok：把 used 当真实成功数（升级前的账本只能这样回填）。
-    # 新记录一定带 n_ok（note_success 首次写入），因此 0 与缺失必须区分。
+    # 缺 n_ok（历史扫描洗掉，见 2026-11-22 的 scan keep 修复）时**不得**
+    # 用 used 回填：置账槽位的 used 被强制设成 quota，回填会把「一张没出」
+    # 读成「出了 30 张」—— 这正是面板 real_ok_today 虚高 7.6 倍的成因
+    # （账本 sum(n_ok)=1755，面板却显示 13346）。宁可保守记为 0。
     raw_ok = d.get("n_ok")
-    n_ok = used if raw_ok in (None, "") else int(raw_ok or 0)
+    n_ok = 0 if raw_ok in (None, "") else int(raw_ok or 0)
     return Slot(
         slot=n, ip=d.get("ip", ""), state=d.get("state", STATE_ERROR),
         used=used,
@@ -803,16 +805,18 @@ async def note_429(slot: int, *, daily_hint: bool = False,
                    cooldown_s: int | None = None) -> str:
     """记一次 429，返回处置结论：`"exhausted"`（当日额度耗尽）或 `"cooling"`（仅冷却）。
 
-    为什么不看文案就直接置满 —— 上游对**细粒度频控**复用同一句
-    "You've used today's 30 free generations" 文案，只靠 `_is_daily_quota()`
-    的文案匹配必然把"限流"判成"额度用完"。线上实测（2026-11-18 12:40）：
-    353 个被判耗尽的槽位里 **341 个只撞过一次 429**，而当天全站真实出图
-    约 4700 张（≈8 张/IP），不可能都真的打满 30 张 ⇒ 绝大多数是误杀。
-    被误杀的 IP 还有二十多张额度，却整天不参与调度，可用池从 588 掉到 234。
+    **口径以上游计数为准（2026-11-22 重定）**：上游文案
+    "You've used today's 30 free generations" 里的 generation 是**上游自己
+    的计数**，包含我们看不见的提交（重试、失败提交、以及同 IP 的其他使用者）。
+    我们本地的 `n_ok` 只记成功出图，与它不是一个口径，用它反推"还有没有额度"
+    必然算错 —— 线上实测：账本记 1755 张真实出图，506 个 IP 却全部报
+    "30 张用完"，差额 88% 是上游计了而本地没计的提交。
 
-    因此改成**二次确认**：文案命中 **且** 该 IP 已撞过一次，才置 used=quota；
-    首次一律只冷却（指数退避，120s 起）。代价是真耗尽时多一次被拒的提交
-    （429 不消耗额度），收益是把被误杀的额度收回来。
+    所以命中日额度文案即置 `used=quota`，不做二次确认。此前的二次确认
+    （首次只冷却）建立在"n_ok 低 ⇒ 额度还在"的错误前提上，实际效果是
+    每个已耗尽的 IP 被反复选中，每次白烧 24~58s 的 prep/submit。
+
+    非日额度的 429（纯频控文案）仍然只冷却，不置死。
     """
     b = _b()
     key = _slot_key(slot)
@@ -826,14 +830,12 @@ async def note_429(slot: int, *, daily_hint: bool = False,
         await b.hset(key, mapping={"day": _today(), "n429": 0,
                                    "n429d": 0, "nthrottle": 0})
         d = await b.hgetall(key) or {}
-    # 必须分开计数：`n429` 是面板口径的「所有 429」，而判定耗尽只该看
-    # 「带今日额度文案的 429」次数（`n429d`）。混用一个计数器会让
-    # 「先被频控打一次、随后真撞额度」这种序列在第一次就被判死。
-    seen_daily = int(d.get("n429d", 0) or 0)
+    # `n429` 是面板口径的「所有 429」；`n429d` 单独记「带今日额度文案的
+    # 429」，保留下来供对账与面板观察，但不再参与判定（口径已改为以上游为准）。
     await b.hincrby(key, "n429", 1)
     if daily_hint:
         await b.hincrby(key, "n429d", 1)
-    if daily_hint and seen_daily >= 1:
+    if daily_hint:
         quota = int(d.get("quota", _cfg()["quota"]) or _cfg()["quota"])
         cd = DEFAULT_429_COOLDOWN_S if cooldown_s is None else cooldown_s
         await b.hset(key, mapping={

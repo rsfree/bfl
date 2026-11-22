@@ -109,10 +109,10 @@ def test_429_rotates_to_another_slot(monkeypatch):
     rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
     failed = rows[calls[0]]
     ok = rows[calls[1]]
-    # 首次 429 只冷却、不扣额度：同一 IP 第二次仍是 429 才判定当日耗尽。
-    # 否则被细粒度频控打中的好 IP 会被整天枪毙（线上 341/353 属此情形）。
-    assert failed.used == 0, "首次 429 不得扣额度"
-    assert failed.cool_until > 0, "首次 429 必须进入冷却"
+    # 口径以上游计数为准：命中日额度文案即置满，不再二次确认。
+    assert failed.used == failed.quota, "日额度文案即置死"
+    assert failed.booked is True, "置账要打标"
+    assert failed.cool_until > 0, "置死同时也要冷却"
     assert ok.used == 1, "成功的槽位记 1 次"
 
 
@@ -134,10 +134,11 @@ def test_all_slots_exhausted_maps_to_429(monkeypatch):
     with pytest.raises(bec.BrowserEgressError) as ei:
         asyncio.run(server._browser_generate(prompt="x"))
     assert ei.value.status == 429
-    # 首次 429 一律只冷却：两个槽位都不应被扣掉额度，否则一次抖动就废掉整池
+    # 两个槽位都会被置死：上游对它们都说了「今天用完」
     rows = asyncio.run(ep.list_slots())
-    assert all(r.cool_until > 0 for r in rows), "首次 429 应各自进入冷却"
-    assert all(r.used == 0 for r in rows), "没有一条该被直接判成额度耗尽"
+    assert all(r.cool_until > 0 for r in rows), "置死也要带冷却"
+    assert all(r.used == r.quota for r in rows), "日额度文案即置死"
+    assert all(r.booked for r in rows), "置账要打标"
 
 
 def test_non_429_failure_does_not_consume_quota(monkeypatch):
@@ -359,10 +360,7 @@ def test_daily_quota_vs_short_throttle(monkeypatch):
             pass
         burned = [r for r in asyncio.run(ep.list_slots())
                   if r.used == r.quota]
-        if round_ == 0:
-            assert not burned, "首次 429 不得直接把 IP 判死"
-        else:
-            assert burned, "第二次 429 必须判为当日耗尽"
+        assert burned, "首次命中日额度文案即判死，不再二次确认"
 
 
 def test_concurrent_requests_spread_across_slots(monkeypatch):
@@ -426,14 +424,10 @@ def test_second_429_exhausts_slot(monkeypatch):
     monkeypatch.setattr(ep, "_probe_ip", fake_probe)
     asyncio.run(ep.scan())
 
-    assert asyncio.run(ep.note_429(1, daily_hint=True)) == "cooling"
-    row = {s.slot: s for s in asyncio.run(ep.list_slots())}[1]
-    assert row.used == 0, "首次 429 不得扣额度"
-    assert row.cool_until > 0, "首次 429 必须进入冷却"
-
     assert asyncio.run(ep.note_429(1, daily_hint=True)) == "exhausted"
     row = {s.slot: s for s in asyncio.run(ep.list_slots())}[1]
-    assert row.used == row.quota, "第二次 429 才判定当日耗尽"
+    assert row.used == row.quota, "首次命中日额度文案即判定当日耗尽"
+    assert row.cool_until > 0, "置死同时必须进入冷却"
 
 
 def test_429_without_daily_hint_never_exhausts(monkeypatch):
