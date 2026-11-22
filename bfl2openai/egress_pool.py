@@ -518,7 +518,18 @@ async def _scan_impl(slots: Iterable[int] | None) -> dict[str, Any]:
                 "used": cur.get("used", 0),
                 "quota": cur.get("quota", c["quota"]),
                 "soft_quota": cur.get("soft_quota", c["soft_quota"]),
-                "last_used": cur.get("last_used", 0)}
+                "last_used": cur.get("last_used", 0),
+                # 账本记忆必须跨扫描存活（2026-11-22 事故）：
+                # 只留 used 会丢掉 n429d ⇒「二次确认」退化成「永远第一次」，
+                # 已判死的 IP 重新进调度，每个再烧 20~37s 页面时间；
+                # 丢掉 n_ok ⇒ hidden_capacity 恒为 0，误杀无法被对账发现。
+                "n_ok": cur.get("n_ok", 0),
+                "n429": cur.get("n429", 0),
+                "n429d": cur.get("n429d", 0),
+                "booked": cur.get("booked", 0),
+                # cool_until 是绝对时间戳，过期自然失效；清掉反而会让正在
+                # 冷却的槽位被立刻重新调度，撞同一堵墙。
+                "cool_until": cur.get("cool_until", 0)}
         # 「新增 IP」的判定依据：只有 IP 真的变了才刷新 seen_at，
         # 否则每次重扫都会把全部槽位标成新增，标记就没意义了。
         cur_ip = cur.get("ip", "")
