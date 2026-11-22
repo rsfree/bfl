@@ -134,6 +134,31 @@ if exc.status == 429:
 
 验收：额度枯竭期 429 的 p50 耗时从 210s 降到 60s 以内。
 
+### L6 重启必须清空闸门计数（部署安全，2026-11-22 实测踩到）
+
+`bfl:gate:inflight` 是 Redis 里的跨 worker 计数器，**进程被杀时不会 DECR**。
+0.2.122 部署后实测：新容器健康启动，但计数器残留在 24（=limit），
+TTL 还要 420 秒才过期 —— 这 7 分钟里**每个新请求都会被闸门拒绝**。
+
+修法（二选一）：
+
+```python
+# A. 启动时清空（最简单，适合单实例主服务）
+@app.on_event("startup")
+async def _reset_gate():
+    await store.delete(GATE_KEY)   # 容器重启 = 所有旧在途必然已死
+
+# B. 分键（适合多实例/滚动发布）
+GATE_KEY = f"bfl:gate:inflight:{os.environ.get('HOSTNAME', 'x')}"
+# 读取时对全部键求和，进程退出后自己的键由 TTL 回收
+```
+
+A 的风险是滚动发布时两个实例互相清对方的计数；B 更严谨但需要聚合读。
+当前是单实例主服务，建议先用 A，并在 `deploy.sh` 的第 6 步加一行
+`docker exec redis redis-cli DEL bfl:gate:inflight` 作为兜底。
+
+验收：重启后 `/pq/metrics` 的 `gate.inflight` 应立即为 0，而不是停在 limit。
+
 ### L5 页面重建预算（防 CPU 雪崩）
 
 现状：`TargetClosedError` → retire → 重建，没有全局限速。load 72 时重建本身
