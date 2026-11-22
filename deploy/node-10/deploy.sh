@@ -51,7 +51,9 @@ echo "    关键变量 $N 个"
 echo "==> 4/6 更新镜像 tag 并拉取"
 run "cd $DIR && sed -i 's/^BFL_IMAGE_TAG=.*/BFL_IMAGE_TAG=$TAG/' .env && docker compose pull -q 2>&1 | tail -3"
 
-if [ "$STRATEGY" = "rolling" ]; then
+if [ "${SKIP_EGRESS:-0}" = "1" ]; then
+  echo "==> 5/6 SKIP_EGRESS=1：只改 app 时跳过 sidecar 重建（省 10-18 分钟与重启期 5xx）"
+elif [ "$STRATEGY" = "rolling" ]; then
   echo "==> 5/6 滚动重建 sidecar（一次一台，等 pages_ready >= ${PAGES}，上限 ${READY_TIMEOUT}s/台）"
   ssh "$JUMP" "ssh $HOST bash -s" <<EOF
 set -u

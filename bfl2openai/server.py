@@ -581,6 +581,7 @@ async def _idem_run(fp: str, produce, weight: int = 1) -> JSONResponse:
         else:
             # 锁一直在，说明 leader 确实还在跑：这次是「等不到」而非「没人干」
             log.warning("idem wait timeout fp=%s (leader still running)", fp[:8])
+            await metrics.bump("idem_wait_timeout")
             resp = openai_error(
                 504,
                 "an identical generation is still in flight; retry in a few seconds",
@@ -592,6 +593,7 @@ async def _idem_run(fp: str, produce, weight: int = 1) -> JSONResponse:
         log.warning("idem leader gone without result fp=%s, taking over", fp[:8])
 
     # 两轮都被抢走（极端并发）：让客户端退避重试，别继续压
+    await metrics.bump("idem_slot_busy")
     resp = openai_error(504, "generation slot busy; retry shortly", "timeout")
     resp.headers["Retry-After"] = "2"
     return resp
@@ -785,6 +787,7 @@ async def _browser_generate(*, deadline: float | None = None, **kwargs) -> bytes
             # ——这两者在旧日志里长得一模一样。
             log.warning("no slot available (tried=%d inflight=%d)",
                         len(tried), len(_INFLIGHT))
+            await metrics.bump("slots_exhausted")
             raise browser_egress_client.BrowserEgressError(
                 "all exit slots exhausted", 429)
         tried.add(slot.slot)

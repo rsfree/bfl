@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import random
+import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -343,6 +344,41 @@ async def _probe_ip(slot: int, *, timeout: float = 12.0) -> str | None:
     return None
 
 
+def _owner_id() -> str:
+    """扫描归属标识：`<容器 hostname>:<worker pid>`。
+
+    Docker 默认把容器 ID 作为 hostname，容器重建后必然变化；因此这个标识
+    同时能识别「另一个 worker 在扫」与「上一个容器的尸检标志」。
+    """
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def _owner_alive(owner: str) -> bool:
+    """归属的扫描进程是否还活着。
+
+    没有 owner 字段（旧版本写入的数据）时退回 True —— 让原来的 30 分钟
+    超时规则继续兜底。
+    """
+    if not owner:
+        return True
+    host, _, pid_s = owner.rpartition(":")
+    if host != socket.gethostname():
+        return False            # 容器已重建，旧进程不可能还活着
+    try:
+        pid = int(pid_s)
+    except ValueError:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True             # 进程存在，只是不归当前用户
+    except OSError:
+        return False
+
+
 async def scan(slots: Iterable[int] | None = None) -> dict[str, Any]:
     """探测槽位出口 IP 并**就地消除碰撞**，结果写入注册表。
 
@@ -356,11 +392,17 @@ async def scan(slots: Iterable[int] | None = None) -> dict[str, Any]:
     st = await b0.hgetall(_meta_key()) or {}
     # 扫描状态必须放 Redis：gunicorn 6 个 worker，进程内变量互相看不见，
     # 面板会显示"没在扫"而实际正在扫（或反之）。
-    if st.get("scan_running") == "1" and (
-            time.time() - float(st.get("scan_started", 0) or 0) < 1800):
-        return {"running": True, "skipped": True}
+    age = time.time() - float(st.get("scan_started", 0) or 0)
+    if st.get("scan_running") == "1" and age < 1800:
+        owner = st.get("scan_owner", "")
+        if _owner_alive(owner):
+            return {"running": True, "skipped": True}
+        # 归属进程已死（worker 被 max_requests 回收 / 容器重建）：清掉僵死
+        # 标志继续扫。2026-11-22 08:13 那次就是这样被拖到 10:34 的。
+        log.warning("clearing zombie scan flag owner=%s age=%.0fs", owner, age)
     await b0.hset(_meta_key(), mapping={
-        "scan_running": 1, "scan_started": int(time.time()), "scan_error": ""})
+        "scan_running": 1, "scan_started": int(time.time()),
+        "scan_owner": _owner_id(), "scan_error": ""})
     try:
         return await _scan_impl(slots)
     except BaseException as exc:  # noqa: BLE001 - 记录后再抛，面板才看得到原因
@@ -422,9 +464,12 @@ async def _scan_loop() -> None:
                 continue
             res = await scan()
             if res.get("skipped"):
-                log.warning("scheduled scan skipped: manual scan already running")
-            else:
-                log.info("scheduled scan done: %s", res)
+                # 有别的进程在扫：10 分钟后再看，而不是傻等 12 小时
+                # （一次手动扫描 18 分钟，12h 的等待会把当天的刷新彻底错过）。
+                log.warning("scheduled scan skipped: another scan in progress")
+                delay = 600.0
+                continue
+            log.info("scheduled scan done: %s", res)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - 定时任务不能因一次失败退出
@@ -534,6 +579,11 @@ class Slot:
     prefix: str = ""
     #: 这个 IP 第一次出现的时刻（扫描时发现 IP 变化才刷新）。面板「新增」用。
     first_seen: float = 0.0
+    #: 真实成功出图次数（只由 note_success 累加，429 置账不会碰它）。
+    #: 与 used 分开是为了区分「真的出满 30 张」和「被二次 429 判死置账」。
+    n_ok: int = 0
+    #: True = 当日 used 是被 429 规则置成 quota 的，不是真实消耗。
+    booked: bool = False
 
     @property
     def seg(self) -> str:
@@ -581,6 +631,8 @@ def _to_slot(n: int, d: dict[str, str], default_quota: int) -> Slot:
         last_used=float(d.get("last_used", 0) or 0),
         prefix=d.get("prefix", ""),
         first_seen=float(d.get("seen_at", 0) or 0),
+        n_ok=int(d.get("n_ok", 0) or 0) if fresh else 0,
+        booked=(d.get("booked") == "1") if fresh else False,
     )
 
 
@@ -688,15 +740,18 @@ async def note_success(slot: int) -> int:
     d = await b.hgetall(key) or {}
     if d.get("day") != today:
         # 当日首单：把用量重新起算（昨天的账不带到今天）
-        await b.hset(key, mapping={"day": today, "used": 1,
-                                   "n429": 0, "nthrottle": 0})
+        await b.hset(key, mapping={"day": today, "used": 1, "n_ok": 1,
+                                   "booked": 0, "n429": 0, "nthrottle": 0})
         n = 1
     else:
         n = await b.hincrby(key, "used", 1)
+        await b.hincrby(key, "n_ok", 1)
     await b.hset(key, mapping={"last_used": time.time(), "nthrottle": 0,
                                # 出过图就说明这个出口是好的：清掉"疑似日额度"
                                # 的历史，否则明天之前的一次误判会连累后面的判定
-                               "n429d": 0})
+                               "n429d": 0,
+                               # 真的出图了：之前的置账标记作废
+                               "booked": 0})
     return n
 
 
@@ -770,6 +825,8 @@ async def note_429(slot: int, *, daily_hint: bool = False,
             # day 必须一起写，否则读侧会把这条"已耗尽"当成昨天的账归零
             "day": _today(),
             "used": quota,
+            # 标记这是规则置账（真实成功数在 n_ok 里，通常远小于 quota）
+            "booked": 1,
         })
         return "exhausted"
     await note_throttled(slot, cooldown_s)
@@ -851,8 +908,8 @@ async def reset_day() -> int:
     b = _b()
     for s in slots:
         await b.hset(_slot_key(s.slot), mapping={
-            "day": _today(), "used": 0, "n429": 0, "n429d": 0,
-            "nthrottle": 0, "fail": 0,
+            "day": _today(), "used": 0, "n_ok": 0, "booked": 0,
+            "n429": 0, "n429d": 0, "nthrottle": 0, "fail": 0,
             "cool_until": 0, "last_used": 0})
     return len(slots)
 
@@ -868,7 +925,7 @@ async def snapshot() -> dict[str, Any]:
         "used": s.used, "quota": s.quota, "remaining": s.remaining,
         "soft_quota": s.cap, "remaining_safe": s.remaining_safe,
         "n429": s.n429, "n403": s.n403, "nthrottle": s.nthrottle,
-        "fail": s.fail,
+        "fail": s.fail, "n_ok": s.n_ok, "booked": s.booked,
         "first_seen": int(s.first_seen),
         "cooling_s": max(0, int(s.cool_until - now)),
         "idle_s": int(now - s.last_used) if s.last_used else None,
@@ -898,6 +955,13 @@ async def snapshot() -> dict[str, Any]:
         # 容量按**软**额度算：这才是敢用出去的量
         "capacity_left": sum(r["remaining_safe"] for r in usable),
         "used_today": sum(r["used"] for r in rows if r["state"] == STATE_PRIMARY),
+        # 账面 vs 真实：429 二次确认会把 used 置成 quota，n_ok 才是真出图数。
+        # hidden_capacity = 被置账吞掉、但可能实际还存在的额度（上限估计）。
+        "real_ok_today": sum(r["n_ok"] for r in rows
+                             if r["state"] == STATE_PRIMARY),
+        "booked_slots": sum(1 for r in rows if r["booked"]),
+        "hidden_capacity": sum(max(0, r["used"] - r["n_ok"]) for r in rows
+                               if r["booked"] and r["state"] == STATE_PRIMARY),
         "quota_per_ip": _cfg()["quota"],
         "soft_quota_per_ip": _cfg()["soft_quota"],
         "stretch": _cfg()["stretch"],

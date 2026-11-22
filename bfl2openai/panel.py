@@ -276,7 +276,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
     <span class="mut" id="msg"></span>
   </div>
   <table><thead><tr>
-    <th>槽位</th><th>出口 IP</th><th>状态</th><th>已用 / 软上限</th><th>安全余量</th>
+    <th>槽位</th><th>出口 IP</th><th>状态</th><th>已用 / 软上限</th><th>真实成功</th><th>安全余量</th>
     <th>进度</th><th>硬额度</th><th>429 / 403</th><th>失败</th><th>空闲</th><th>改停手点</th>
   </tr></thead><tbody id="rows"></tbody></table>
 
@@ -468,7 +468,8 @@ function render(){
     <td>#${String(r.slot).padStart(3,"0")}${tag}</td>
     <td style="font-family:ui-monospace,monospace">${r.ip||"—"}<span class="mut" style="margin-left:6px">${r.prefix?r.prefix+".0/24":""}</span></td>
     <td class="s-${r.cooling_s>0?"exhausted":r.exhausted?"exhausted":r.state}">${r.cooling_s>0?"冷却 "+fmtCool(r.cooling_s):r.exhausted?"额度用尽":r.state==="primary"?"可用":r.state==="dup"?"碰撞":"失败"}</td>
-    <td>${r.used} / ${r.soft_quota}</td>
+    <td>${r.used} / ${r.soft_quota}${r.booked?'<i class="tag-new" title="使用的 used 由二次 429 规则置账，不是真实消耗">置账</i>':''}</td>
+    <td>${r.n_ok||0}</td>
     <td>${r.remaining_safe}</td>
     <td><div class="bar"><i style="width:${pct(r.used,r.soft_quota)}%;background:${r.remaining_safe>0?"var(--ok)":"var(--bad)"}"></i></div></td>
     <td>${r.quota}</td>
@@ -476,7 +477,7 @@ function render(){
     <td>${r.idle_s==null?"—":fmtCool(r.idle_s)}</td>
     <td><input type="number" min="0" value="${r.soft_quota}" id="q${r.slot}">
         <button onclick="setQ(${r.slot})">改</button></td>
-  </tr>`}).join("")||'<tr><td colspan="11" class="mut">没有匹配的槽位</td></tr>';
+  </tr>`}).join("")||'<tr><td colspan="12" class="mut">没有匹配的槽位</td></tr>';
   el("pginfo").textContent=`第 ${PAGE}/${pages} 页 · 共 ${rows.length} 行`;
   el("pgprev").disabled=PAGE<=1;
   el("pgnext").disabled=PAGE>=pages;
@@ -495,6 +496,8 @@ async function load(){
     card("可用槽位",`${d.usable}/${d.slots}`)+
     card("安全余量",`${d.capacity_left} 张`)+
     card("今日已用",`${d.used_today} 张`)+
+    card("真实出图",`${d.real_ok_today??d.used_today} 张`)+
+    card("置账槽位",`${d.booked_slots||0}`)+
     card("软上限 / IP",`${d.soft_quota_per_ip} 张`)+
     card("唯一 IP / 网段",`${d.distinct_ips} / ${d.prefixes||0}`)+
     card("头部网段",`${d.top_prefix&&d.top_prefix.length?d.top_prefix[0][0]+" ("+d.top_prefix[0][1]+")":"—"}`)+
