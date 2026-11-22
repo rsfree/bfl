@@ -87,6 +87,13 @@ echo "==> 6/6 重建主服务与探针并健康检查"
 # bfl-probe 与 app 同镜像（命令不同），漏了它会长期停在旧版本：2026-11-18
 # 实测部署完 app 已 0.2.99 而 probe 还是 0.2.98。
 run "cd $DIR && docker compose up -d --no-deps bfl2openai bfl-probe 2>&1 | tail -3"
+
+# 闸门在途计数在 Redis 里跨 worker 共享，旧进程被杀时不会 DECR。不清的话
+# 新进程会带着接近 limit 的残留值启动，TTL(420s) 到期前每个请求都被 429
+# —— 2026-11-22 实测重启后 7 分钟全站拒绝。计数偏低只会多放行几个请求，
+# 偏高会全拒，所以宁可在启动后立刻清零。
+run "docker exec bfl2openai-redis redis-cli DEL bfl:gate:inflight >/dev/null 2>&1 || true"
+
 for _ in $(seq 1 40); do
   ok=$(run "docker ps --filter name=bfl2openai --format '{{.Status}}' | grep -c healthy || true" | tail -1)
   [ "${ok:-0}" = "1" ] && break
