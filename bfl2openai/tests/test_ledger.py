@@ -138,3 +138,25 @@ def test_scan_skips_when_owner_alive(monkeypatch):
 
     res = asyncio.run(go())
     assert res.get("skipped") is True
+
+
+def test_legacy_record_backfills_n_ok_from_used():
+    """升级前的槽位没有 n_ok 字段：显示上按 used 回填，不能显示 0。"""
+    async def go():
+        await ep._b().hset(ep._slot_key(3), mapping={
+            "day": ep._today(), "ip": "10.0.0.3", "state": ep.STATE_PRIMARY,
+            "used": 17, "quota": 30})
+        return await ep.get_slot(3)
+
+    s = asyncio.run(go())
+    assert s.n_ok == 17 and s.booked is False
+
+
+def test_new_record_with_zero_n_ok_is_not_backfilled():
+    async def go():
+        await ep._b().hset(ep._slot_key(4), mapping={
+            "day": ep._today(), "ip": "10.0.0.4", "state": ep.STATE_PRIMARY,
+            "used": 0, "quota": 30, "n_ok": 0})
+        return await ep.get_slot(4)
+
+    assert asyncio.run(go()).n_ok == 0

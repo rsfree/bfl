@@ -618,9 +618,14 @@ def _to_slot(n: int, d: dict[str, str], default_quota: int) -> Slot:
     # 跨日：昨天的 used 不算数。用读时归零而不是写时重置，避免
     # 每个请求都产生一次写。
     fresh = d.get("day") == _today()
+    used = int(d.get("used", 0) or 0) if fresh else 0
+    # 旧记录没有 n_ok：把 used 当真实成功数（升级前的账本只能这样回填）。
+    # 新记录一定带 n_ok（note_success 首次写入），因此 0 与缺失必须区分。
+    raw_ok = d.get("n_ok")
+    n_ok = used if raw_ok in (None, "") else int(raw_ok or 0)
     return Slot(
         slot=n, ip=d.get("ip", ""), state=d.get("state", STATE_ERROR),
-        used=int(d.get("used", 0) or 0) if fresh else 0,
+        used=used,
         quota=int(d.get("quota", default_quota) or default_quota),
         cool_until=float(d.get("cool_until", 0) or 0),
         n429=int(d.get("n429", 0) or 0),
@@ -631,7 +636,7 @@ def _to_slot(n: int, d: dict[str, str], default_quota: int) -> Slot:
         last_used=float(d.get("last_used", 0) or 0),
         prefix=d.get("prefix", ""),
         first_seen=float(d.get("seen_at", 0) or 0),
-        n_ok=int(d.get("n_ok", 0) or 0) if fresh else 0,
+        n_ok=n_ok if fresh else 0,
         booked=(d.get("booked") == "1") if fresh else False,
     )
 
