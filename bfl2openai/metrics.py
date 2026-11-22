@@ -28,6 +28,7 @@ follower，真实在途约 26），阈值压到 18 会在高峰期把大量正�
   retry_ok           重试后成功的次数
   budget_exhausted   墙钟预算耗尽、主动收手的次数
   gate_reject        闸门拒绝的次数
+  daily_quota_exhausted  连续多个出口 IP 报日额度耗尽后的提前收手次数
   gen_ok             成功出图次数
 """
 from __future__ import annotations

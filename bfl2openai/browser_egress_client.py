@@ -70,9 +70,13 @@ class BrowserEgressError(RuntimeError):
     客户端误判"服务崩了"并无效重试（生产实测：重试放大了 502 潮）。
     """
 
-    def __init__(self, message: str, status: int = 0) -> None:
+    def __init__(self, message: str, status: int = 0,
+                 retry_after: int | str | None = None) -> None:
         super().__init__(message)
         self.status = status
+        #: 建议的 Retry-After（秒或 HTTP 日期串）。只在「整池额度枯竭」
+        #: 时给出，让客户端直接睡到换日，而不是 60s 一轮空转。
+        self.retry_after = retry_after
 
 
 def configured() -> bool:

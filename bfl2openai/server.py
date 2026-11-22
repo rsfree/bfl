@@ -213,6 +213,11 @@ _SAFE_ERRORS = {
 #: 短期内确有恢复可能；给太大等于让客户端一小时内不再尝试。
 _RETRY_AFTER_S = "60"
 
+#: 连续多少个出口 IP 报「今日额度已用完」就判定整池枯竭。
+#: 依据：usable/primary < 5% 时换 3 个槽位仍失败的概率 > 95%，
+#: 继续换只是把 60s 的失败拖成 210s（2026-11-22 实测 208~216s）。
+_DAILY_HITS_LIMIT = 3
+
 #: 429 语义兜底识别。显式 kind/status 之外，旧版 sidecar 会把上游 429 折叠进
 #: 502 的错误文本里（`submit 429: ...`），滚动发布期间必须靠文案兜住。
 #: 只参与「→ 429」的判定，绝不参与对外文案。
@@ -326,7 +331,10 @@ def wrap_browser_egress_error(
     if exc.status == 429 or (exc.status == 502
                              and _RATE_LIMIT_RE.search(str(exc))):
         resp = openai_error(429, _SAFE_ERRORS["rate_limit"], "rate_limit_error")
-        resp.headers["Retry-After"] = _RETRY_AFTER_S
+        # 整池枯竭时给换日时间（小时级）；其余 429 仍是 60s，因为换 IP
+        # 短期内确有恢复可能。
+        resp.headers["Retry-After"] = str(
+            getattr(exc, "retry_after", None) or _RETRY_AFTER_S)
         return resp
     if exc.status == 451:
         return openai_error(451, _SAFE_ERRORS["content_policy_violation"],
@@ -741,6 +749,15 @@ def _is_daily_quota(exc) -> bool:
     return any(h in text for h in _DAILY_QUOTA_HINTS)
 
 
+def _seconds_until_reset() -> int:
+    """距换日的秒数，用作 429 的 Retry-After。"""
+    try:
+        left = egress_pool.next_reset_at() - time.time()
+    except Exception:  # noqa: BLE001 - 时区配置错误不该挡住错误响应
+        return 3600
+    return max(60, int(left))
+
+
 async def _browser_generate(*, deadline: float | None = None, **kwargs) -> bytes:
     """经侧车生成，并**把成败记到出口 IP 头上**。
 
@@ -776,6 +793,8 @@ async def _browser_generate(*, deadline: float | None = None, **kwargs) -> bytes
     last: browser_egress_client.BrowserEgressError | None = None
     transient_left = _TRANSIENT_ATTEMPTS
     transient_failed = False
+    # 本轮连续撞到「今日额度已用完」的 IP 数：用于尽早收手，别烧满预算。
+    daily_hits = 0
     for _ in range(_SLOT_ATTEMPTS):
         # 预算见底：再换槽也只是把请求拖到 nginx 300s，不如带着真实原因收手。
         if last is not None and time.monotonic() + _TRANSIENT_MIN_S > deadline:
@@ -802,10 +821,23 @@ async def _browser_generate(*, deadline: float | None = None, **kwargs) -> bytes
                 # 且文案带「今日额度已用完」才判定当天耗尽。理由见
                 # `egress_pool.note_429` —— 一次性置满会把被细粒度频控打中的
                 # 好 IP 整天枪毙（线上 341/353 只撞过一次 429 就被判死）。
+                daily = _is_daily_quota(exc)
                 verdict = await egress_pool.note_429(
-                    slot.slot, daily_hint=_is_daily_quota(exc))
+                    slot.slot, daily_hint=daily)
                 log.warning("slot %03d ip=%s 429 -> %s, rotating (n=%d)",
                             slot.slot, slot.ip, verdict, len(tried))
+                if daily:
+                    daily_hits += 1
+                    if daily_hits >= _DAILY_HITS_LIMIT:
+                        # 换几个 IP 都是「今日额度已用完」⇒ 别再拿 240s 预算
+                        # 换一个注定失败的猜测。直接把换日时间告诉客户端。
+                        await metrics.bump("daily_quota_exhausted")
+                        log.warning(
+                            "daily quota exhausted on %d ips, giving up early "
+                            "(tried=%d)", daily_hits, len(tried))
+                        raise browser_egress_client.BrowserEgressError(
+                            "daily quota exhausted on sampled exit ips",
+                            429, retry_after=_seconds_until_reset()) from exc
                 last = exc
                 continue
             if exc.status == 403:
