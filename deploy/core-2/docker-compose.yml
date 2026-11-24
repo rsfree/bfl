@@ -1,0 +1,282 @@
+# bfl2openai · node-10 部署声明（2026-10-23 迁移自 ai-prod）
+#
+# 端口只绑回环（红线）：公网入口一律 nginx + bfl.1task.cn。
+# .env（凭证 + 回退代理 + 浏览器出口）只挂载不进镜像；宿主上 chmod 640。
+#
+# 与 ai-prod 版本的差异（针对 8C/16G/29G 的小机器）：
+#   1) logging 显式限制 —— 29G 系统盘，daemon.json 已设默认值，这里再兜一道
+#   2) mem_limit —— 防单容器 OOM 拖垮整机（16G 而非 48G）
+#   3) BFL2OPENAI_SUBMIT_CONCURRENCY=12 —— 上游全局仅 50 槽，
+#      原 3 worker x 16 = 48 几乎独占配额，导致 503「50 of 50 slots in use」
+#   4) bfl-browser-egress —— 上游按 HTTP/2 帧指纹拒绝 curl_cffi，只放行真浏览器，
+#      出口改由本机 Chromium 池承担（详见 browser_egress/main.py）
+name: bfl2openai
+
+# 出口 sidecar 的公共部分：三台只有容器名 / 静态 IP / 页面数不同，其余全同。
+x-egress: &egress
+  # 与主服务共用 BFL_IMAGE_TAG：升级/回滚一个变量同时生效，版本不会漂。
+  # 服务器不再保存 sidecar 源码（2026-11-05 起走 GHCR，和 bfl 一起由 release.yml 构建）。
+  # 本地要改 sidecar：docker build -t ghcr.io/rsfree/bfl-egress:dev ./browser_egress
+  #   然后 BFL_IMAGE_TAG=dev docker compose up -d bfl-browser-egress
+  image: ghcr.io/rsfree/bfl-egress:${BFL_IMAGE_TAG:-latest}
+  restart: unless-stopped
+  shm_size: 1g                        # Chromium 必需，否则 /dev/shm 不足会崩渲染进程
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "2"
+  mem_limit: 4g                      # 上限，不是占用。2026-11-18 实测 12 页 RSS
+                                     # 2.4–2.8G（chromium 多进程合计），留 1.2G 余量。
+                                     # 🔴 三台 4g + app 5g = 17G > 15.6G 物理，原来那行
+                                     # "9G+4G+0.5G=13.5G 不超卖"从页面数改成 12 起就失效。
+                                     # 实际合计约 9G 打不满；真同时暴涨先撞 cgroup 限额
+                                     # （容器 OOMKilled），不会拖垮宿主机。
+  cpus: 6                            # 这不是"预留"，是单台上限。稳态一台只用 0.1–0.3 核，
+                                     # 只有冷启动预热 12 页时才逼近 6 核。三台同时预热 =
+                                     # 18 核抢 8 核（2026-11-18 事故形态，load 22.9），
+                                     # 所以重建必须走 deploy.sh 的滚动模式，一次一台。
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8011/healthz"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 180s                # 9 页分 3 片加载 + 预热生成需要时间
+
+x-egress-env: &egress-env
+  BFL2OPENAI_EGRESS_PAGES: "9"               # 页面池大小（每页=独立出口 IP）。
+                                             # 12→9：分片后每片多一份 Chromium 固定开销
+                                             # （主进程+zygote+gpu ≈150–200MB），12 页 × 3 片
+                                             # 会把 4G 限额推到 ~86%，必须回到安全水位。
+  BFL2OPENAI_EGRESS_SHARDS: "3"              # 每 3 页一个独立 Chromium。内存到水位只重建一片
+                                             # ⇒ 容量瞬时降 1/3，池子不归零。整池重启的代价是
+                                             # 该实例 40 秒零出口（14:13–14:15 全站 502 33 次）。
+  BFL2OPENAI_EGRESS_MAX_INFLIGHT: "20"       # 全局并发闸门（9 页 → 每页 cap 2.2）
+  BFL2OPENAI_EGRESS_MAX_REQ_PER_CTX: "25"    # 单会话 25 次后换 IP/新 cookie（pin 模式下不生效）
+  BFL2OPENAI_EGRESS_RELOAD_EVERY: "8"        # 单页累计 8 次提交后原地 reload：不换 context、
+                                             # 不换 IP，只重载文档以清空 V8 堆。MEDIA_JS 每次
+                                             # 取图产生 3–4 倍图片体积的临时对象，GC 不还 OS。
+                                             # 🔴 校准依据（2026-11-18 实测）：每页每 8 分钟约
+                                             # 5 次提交，内存约 10 分钟触顶 92%。阈值设 20 时
+                                             # 用户根本攒不到（10 分钟才 7 次），等于没开。
+  BFL2OPENAI_EGRESS_DRAIN_BUDGET: "45"       # 分片重建前等这片的在途请求跑完（秒）。
+                                             # 不等待会抛 TargetClosedError（实测 4/5 次 502）。
+  BFL2OPENAI_EGRESS_POLL_TIMEOUT: "165"      # 必须 < 应用侧 180s，否则失败原因送不回
+  BFL2OPENAI_EGRESS_IP_COOLDOWN: "20"        # 403/429 后该页冷却秒数
+  BFL2OPENAI_EGRESS_TZ: "America/New_York"   # 须与出口地域一致（UTC 是机房特征）
+  # 池代理凭证放 .env，不进版本库
+  UPSTREAM_PROXY: "${UPSTREAM_PROXY:?UPSTREAM_PROXY 未在 .env 中配置}"
+  # ── 2090 pin 模式：账号=槽位 → 固定出口 IP ──────────────────────────
+  # 不配这三个变量就是历史行为（2088 逐连接轮换），可作为一键回滚开关。
+  # 槽位数 0 = 关闭。凭证只从 .env 注入，绝不写进本文件。
+  BFL2OPENAI_POOL_HOST: "${BFL2OPENAI_POOL_HOST:-}"
+  BFL2OPENAI_POOL_PORT: "${BFL2OPENAI_POOL_PORT:-2090}"
+  BFL2OPENAI_POOL_PASS: "${BFL2OPENAI_POOL_PASS:-}"
+  BFL2OPENAI_POOL_USER_PREFIX: "${BFL2OPENAI_POOL_USER_PREFIX:-poolclient}"
+  BFL2OPENAI_POOL_SLOTS: "${BFL2OPENAI_POOL_SLOTS:-3000}"
+  BFL2OPENAI_POOL_QUOTA: "${BFL2OPENAI_POOL_QUOTA:-30}"
+  BFL2OPENAI_POOL_SOFT_QUOTA: "${BFL2OPENAI_POOL_SOFT_QUOTA:-}"
+  #: 停手点留空 = 榨干（等于额度 30）。想留风控余量就配 20 这类小值，
+  #: 有效值恒 ≤ 额度，配超了会被夹住。
+  BFL2OPENAI_POOL_STRETCH: "${BFL2OPENAI_POOL_STRETCH:-0}"
+  #: rebind 后等 Vercel 挑战通过的静默期（秒）。3s 是保守值，实测降到 1s
+  #: 仍能过，直接省掉 2s 冷启动开销。
+  BFL2OPENAI_POOL_REBIND_SETTLE: "${BFL2OPENAI_POOL_REBIND_SETTLE:-3.0}"
+  #: 预绑定槽位（逗号分隔）。侧车在启动时把页面绑到这些槽位，app 优先路由
+  #: 过去 —— 两边必须完全一致，否则绑了也用不上。
+  #: 预绑定切片：每台侧车只绑 slot%3==本实例序号 的那 12 个，app 侧按同一
+  #: 规则做路由亲和。具体 offset 在各服务块里覆盖。
+  BFL2OPENAI_POOL_PREBIND_STRIDE: "${BFL2OPENAI_POOL_PREBIND_STRIDE:-3}"
+  BFL2OPENAI_POOL_PREBIND_FROM: "${BFL2OPENAI_POOL_PREBIND_FROM:-1}"
+  BFL2OPENAI_POOL_PREBIND_TO: "${BFL2OPENAI_POOL_PREBIND_TO:-36}"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: bfl2openai-redis
+    restart: unless-stopped
+    # 仅容器网内可见（无 ports）——跨 worker 状态外置的存储
+    command: ["redis-server", "--maxmemory", "256mb",
+              "--maxmemory-policy", "volatile-ttl"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "2"
+    mem_limit: 512m
+
+  bfl2openai:
+    image: ghcr.io/rsfree/bfl:${BFL_IMAGE_TAG:-latest}
+    container_name: bfl2openai
+    restart: unless-stopped
+    user: "10001:10001"
+    ports:
+      - "127.0.0.1:39100:8000"           # 仅回环；公网入口走 bfl.1task.cn（nginx）
+    environment:
+      REDIS_URL: redis://redis:6379/0   # 跨 worker 状态外置（见 store.py）
+      # 面板浏览器密码（HTTP Basic，用户名不校验）。值只放服务器 .env，
+      # 不入库；留空则退回「nginx 404 + SSH 隧道」的老办法。
+      BFL2PANEL_PASS: "${BFL2PANEL_PASS:-}"
+      # 2026-11-17：3 -> 6。实测（18:30）：3 worker 每进程 RSS ~640MB（site-packages
+      # 仅 102MB，其余是 PIL/base64 处理大图后的分配器高水位，不归还 OS），
+      # 单容器 1.86GB；同时在途只有 3~4 个请求、容器 CPU 12% —— 说明卡的是上游
+      # 而不是 worker 数，加 worker 买的是「突发时多接几个」和 CPU 并行度，
+      # 不是吞吐翻倍。8 核留 2 核给 3 个 Chromium sidecar，故取 6。
+      GUNICORN_WORKERS: "6"
+      # ⚠️ 这条只对非浏览器路径（upstream.py 的 _SUBMIT_SEM）生效；当前
+      # BFL2OPENAI_BROWSER_PRIMARY=1，线上根本不走那条代码，并发上限实际由
+      # 三个 sidecar 的 BFL2OPENAI_EGRESS_MAX_INFLIGHT=20 决定（3x20=60）。
+      # 所以调 worker 数不会动上游 50 槽的预算，无需重新平衡这个值。
+      # 历史（2026-10-23）：曾按「3 worker x 16 = 48，留 2 槽」配，代价是流量
+      # 冲高会打出 503「50 of 50 slots in use」，ai-prod 时期单小时成功率跌至 68.7%。
+      BFL2OPENAI_SUBMIT_CONCURRENCY: "${BFL2OPENAI_SUBMIT_CONCURRENCY:-16}"
+      # 浏览器出口：地址必须与下面 sidecar 的静态 IP 一致（Docker 内嵌 DNS
+      # 在容器重建后会缓存旧 IP，实测导致 connection refused，故用固定 IP）。
+      # 多实例：逗号分隔，客户端按进程内相位 + 轮询分发；传输失败/503/429 换实例。
+      BFL2OPENAI_BROWSER_EGRESS: "http://172.19.0.10:8011,http://172.19.0.11:8011,http://172.19.0.12:8011"
+      BFL2OPENAI_BROWSER_PRIMARY: "1"   # 跳过 curl_cffi（当前恒 403，白耗 2-3 分钟）
+      # 出口槽注册表（2090 pin 模式）。与 sidecar 侧同名变量一致；不配则整套
+      # 路由逻辑自动旁路（egress_pool.configured() 为假），行为与历史完全一致。
+      BFL2OPENAI_POOL_HOST: "${BFL2OPENAI_POOL_HOST:-}"
+      BFL2OPENAI_POOL_PORT: "${BFL2OPENAI_POOL_PORT:-2090}"
+      BFL2OPENAI_POOL_PASS: "${BFL2OPENAI_POOL_PASS:-}"
+      BFL2OPENAI_POOL_USER_PREFIX: "${BFL2OPENAI_POOL_USER_PREFIX:-poolclient}"
+      BFL2OPENAI_POOL_SLOTS: "${BFL2OPENAI_POOL_SLOTS:-3000}"
+      BFL2OPENAI_POOL_QUOTA: "${BFL2OPENAI_POOL_QUOTA:-30}"
+      BFL2OPENAI_POOL_SOFT_QUOTA: "${BFL2OPENAI_POOL_SOFT_QUOTA:-}"
+      BFL2OPENAI_POOL_STRETCH: "${BFL2OPENAI_POOL_STRETCH:-0}"
+      #: 451（内容审核拒绝）负缓存秒数：同内容重提直接秒回，省浏览器页面时间。
+      #: 0 = 关闭。默认 30 分钟；若担心上游审核非确定性，可调到 300。
+      #: 只在主服务生效（sidecar 不跑幂等缓存）。
+      BFL2OPENAI_NEG_TTL_S: "${BFL2OPENAI_NEG_TTL_S:-1800}"
+      # 段内候选摊薄宽度 / 单 IP 最小间隔（秒，18s ≈ 3.3 发/分，
+      # 压在上游细粒度频控约 3.5 发/分的阈值之下）
+      BFL2OPENAI_POOL_SPREAD: "${BFL2OPENAI_POOL_SPREAD:-32}"
+      BFL2OPENAI_POOL_MIN_GAP: "${BFL2OPENAI_POOL_MIN_GAP:-18}"
+      # 3 太浅：并发下抢不到租约的请求 3 轮就放弃，池里还有上百空闲槽时
+      # 仍会给客户端回 429（2026-11-18 实测每分钟 8 次）。线上取值以这里为准，
+      # 会覆盖代码里的默认值 —— 改代码默认值请同步改这里。
+      BFL2OPENAI_SLOT_ATTEMPTS: "${BFL2OPENAI_SLOT_ATTEMPTS:-6}"
+      BFL2OPENAI_POOL_PREBIND: "${BFL2OPENAI_POOL_PREBIND:-1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36}"
+      BFL2OPENAI_POOL_REBIND_SETTLE: "${BFL2OPENAI_POOL_REBIND_SETTLE:-3.0}"
+      # ---- 稳定性（2026-11-21）----
+      # 入口并发闸门：跨 worker 的在途生成数上限。实测 26 在途时宿主
+      # load 44（8 核），rebind 开始成批超时；但阈值压到 18 会在高峰期把
+      # 大量正常请求打成 429（请求日志回放：入口并发常驻 25~30，含 follower）。
+      # 24 只在真正越过实测水位时削峰；rebind/5xx 持续时再降到 20。
+      # 0 = 关闭（回滚开关）。
+      BFL2OPENAI_GATE_LIMIT: "${BFL2OPENAI_GATE_LIMIT:-24}"
+      # 单笔墙钟预算：必须小于 nginx proxy_read_timeout(300s) 与 gunicorn
+      # timeout(300s)。超预算主动回 504 JSON，而不是被 nginx 掐成 HTML。
+      BFL2OPENAI_JOB_BUDGET_S: "${BFL2OPENAI_JOB_BUDGET_S:-240}"
+      # rebind 超时 / sidecar 500 / 传输超时的换槽重试次数（每次可能几十秒）。
+      BFL2OPENAI_TRANSIENT_ATTEMPTS: "${BFL2OPENAI_TRANSIENT_ATTEMPTS:-2}"
+      # rebind 超时的槽位冷却（2026-11-23）：此前失败只记数、不参与调度，
+      # 坏链路每次都会被重新选中并重花一个 60s 的 rebind 超时。base 起指数
+      # 翻倍，封顶 1h；成功出图即清零档位。base=0 即关闭（回滚开关）。
+      BFL2OPENAI_POOL_FAIL_COOLDOWN_BASE: "${BFL2OPENAI_POOL_FAIL_COOLDOWN_BASE:-180}"
+      BFL2OPENAI_POOL_FAIL_COOLDOWN_MAX: "${BFL2OPENAI_POOL_FAIL_COOLDOWN_MAX:-3600}"
+      # 距上次失败超过该窗口 ⇒ 视为新一轮连续失败，退避从头算。
+      BFL2OPENAI_POOL_FAIL_RESET: "${BFL2OPENAI_POOL_FAIL_RESET:-3600}"
+      # 槽位表定时重建：IP 是租来的会漂，旧表放三天等于拿失效出口继续打。
+      # 0 = 关闭；首次扫描至少等 STARTUP_DELAY 秒，避免部署瞬间抢 CPU。
+      BFL2OPENAI_POOL_SCAN_INTERVAL: "${BFL2OPENAI_POOL_SCAN_INTERVAL:-43200}"
+      BFL2OPENAI_POOL_SCAN_STARTUP_DELAY: "${BFL2OPENAI_POOL_SCAN_STARTUP_DELAY:-600}"
+    env_file: ./.env                    # 凭证/回退代理/PUBLIC_BASE 注入容器环境
+    depends_on:
+      - redis
+      - bfl-browser-egress
+      - bfl-browser-egress-2
+      - bfl-browser-egress-3
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "2"
+    # 6 worker x ~640MB ≈ 3.8GB，留 1.2GB 给突发大图（6 路同时在处理 6~9MB body
+    # 时每路会多占用几十到上百 MB）。宿主机 15GB，sidecar 约 6.6GB，别超过 5g，
+    # 否则一旦真的吃满会把 Chromium 挤到 OOM。
+    mem_limit: 5g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── 端到端探针 ──────────────────────────────────────────────────────
+  # 复用 app 镜像里的 `python -m bfl2openai.probe` 入口，单独一个容器。
+  # 为什么独立：探针要能在 app 挂掉时继续报告 —— 放进 app 的 lifespan 里，
+  # app 一死探针也死，而那正是最需要它的时候。每 30 分钟真跑一张 768sq
+  # 最小图，走完整路径（提交→裸 GET 轮询→取图校验 PNG），结果写 Redis，
+  # app 的 /healthz 读同一份（probe 字段）。镜像不需要额外打包。
+  bfl-probe:
+    image: ghcr.io/rsfree/bfl:${BFL_IMAGE_TAG:-latest}
+    container_name: bfl-probe
+    restart: unless-stopped
+    user: "10001:10001"
+    command: ["python", "-m", "bfl2openai.probe"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      BFL2OPENAI_PROBE_BASE: "http://bfl2openai:8000"
+      BFL2OPENAI_PROBE_INTERVAL_S: "${BFL2OPENAI_PROBE_INTERVAL_S:-1800}"
+      BFL2OPENAI_PROBE_TIMEOUT_S: "150"
+      BFL2OPENAI_PROBE_RESOLUTION: "768sq"
+    env_file: ./.env                    # BFL_NATIVE_API_KEY 等
+    depends_on:
+      - bfl2openai
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+    mem_limit: 256m
+
+  # ── 浏览器出口 sidecar 池 ────────────────────────────────────────────
+  # 页面池 + 页面内 fetch 完成 提交→轮询→取图。镜像走 GHCR：ghcr.io/rsfree/bfl-egress，
+  # 与主服务同一个 tag（release.yml 的 docker job 矩阵构建）。本地改代码用上面的 dev tag。
+  #
+  # 为什么是多实例：实测单实例舒适区 8 并发 ≈ 1,225 张/h，历史峰值 3,482/h
+  # （≈25 并发 × 25.5s 中位）。每实例 8 页 / 闸门 20，三实例给到 24-60 并发、
+  # 24 条出口 IP。资源实测（8 页空闲）RSS 1.17GB / CPU ~1%，满载峰值 2.6 核
+  # —— cpus/mem 是「上限」不是「占用」，三实例真实合计约 3.5GB。
+  # 出口 IP 由 poolclient 逐连接轮换（实测：48 并发得 48 个不同 IP，20+20
+  # 采样零重复）⇒ 加实例不吃「固定 IP 配额」，只是同时占用更多连接。
+  # 真正的 429 来源是「同一页的连接复用了同一 IP 超过 30 次/天」，由
+  # MAX_REQ_PER_CTX=25 提前换 context 兜住（余量只有 5 次）。
+  # ⚠️ 加第 N 台三处要一起改：下面 anchors 默认值、服务块的 ipv4_address、
+  #    以及 app 的 BFL2OPENAI_BROWSER_EGRESS 列表。
+  bfl-browser-egress:
+    <<: *egress
+    container_name: bfl-browser-egress
+    networks:
+      bfl_net:
+        ipv4_address: 172.19.0.10       # 固定 IP：Docker 内嵌 DNS 会缓存旧 IP
+    environment:
+      BFL2OPENAI_POOL_PREBIND_OFFSET: "0"
+      <<: *egress-env
+
+  bfl-browser-egress-2:
+    <<: *egress
+    container_name: bfl-browser-egress-2
+    networks:
+      bfl_net:
+        ipv4_address: 172.19.0.11       # 与 app 侧 BFL2OPENAI_BROWSER_EGRESS 对应
+    environment:
+      BFL2OPENAI_POOL_PREBIND_OFFSET: "1"
+      <<: *egress-env
+
+  bfl-browser-egress-3:
+    <<: *egress
+    container_name: bfl-browser-egress-3
+    networks:
+      bfl_net:
+        ipv4_address: 172.19.0.12
+    environment:
+      BFL2OPENAI_POOL_PREBIND_OFFSET: "2"
+      <<: *egress-env
+
+# 复用已存在的项目网络：external 方式避免 compose 重建网络（重建会连带重启应用）。
+networks:
+  bfl_net:
+    external: true
+    name: bfl2openai_default
