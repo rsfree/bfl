@@ -45,6 +45,30 @@ DEFAULT_QUOTA = int(os.environ.get("BFL2OPENAI_POOL_QUOTA", "30"))
 #: 单看状态码无法区分，只能给一个中等值：太短会反复撞墙，太长会白闲置。
 DEFAULT_429_COOLDOWN_S = int(os.environ.get("BFL2OPENAI_POOL_429_COOLDOWN", "600"))
 
+#: 命中「日额度」文案但还没确认时用的冷却。上游对细粒度频控复用同一句
+#: 文案（代码里 2026-11-18 的注释已记录），所以单次命中不能直接判死；
+#: 但也不该像常规 429 那样歇 10 分钟 —— 均摊之后连续命中很少见，给 5
+#: 分钟足够让短窗口限流恢复，又不会让 IP 长期脱离调度。
+DAILY_HINT_COOLDOWN_S = int(
+    os.environ.get("BFL2OPENAI_POOL_DAILY_COOLDOWN", "300"))
+
+#: rebind 超时（槽位级故障）的冷却。
+#:
+#: 为什么必须有：`fail` 此前只累加，而 `available()` 与 `acquire_many()`
+#: 都不看它 ⇒ 坏链路下一次请求照样会被选中，每次都要把一个上限 60s 的
+#: rebind 超时重新花一遍（2026-11-23 09:37 的
+#: `rebind slot 248 failed: TimeoutError` 就是这条路径反复撞出来的）。
+#: 退避形态与 `note_throttled` 同构：连续失败才升级，成功一次即清零。
+#: 注意口径变化：`fail` 现在只由 rebind 失败累加（历史数据里还混着页面
+#: 500 / 传输超时，跨日后自然归零），不再代表「所有非 429 失败」。
+FAIL_COOLDOWN_BASE_S = float(
+    os.environ.get("BFL2OPENAI_POOL_FAIL_COOLDOWN_BASE", "180"))
+FAIL_COOLDOWN_MAX_S = float(
+    os.environ.get("BFL2OPENAI_POOL_FAIL_COOLDOWN_MAX", "3600"))
+#: 距上次失败超过这个窗口 ⇒ 视为新一轮连续失败，退避从头算。
+#: 没有它，一个每天偶发失败一次的槽位会把计数攒到上限、白关一小时。
+FAIL_RESET_S = float(os.environ.get("BFL2OPENAI_POOL_FAIL_RESET", "3600"))
+
 #: 候选随机度：在最老的 N 个段 / N 个槽位之间随机挑，而不是只挑"唯一最老"的那一个。
 #:
 #: 为什么必须随机：原实现严格取 last_used 唯一的全局最小值，而多个并发请求会
@@ -529,7 +553,12 @@ async def _scan_impl(slots: Iterable[int] | None) -> dict[str, Any]:
                 "booked": cur.get("booked", 0),
                 # cool_until 是绝对时间戳，过期自然失效；清掉反而会让正在
                 # 冷却的槽位被立刻重新调度，撞同一堵墙。
-                "cool_until": cur.get("cool_until", 0)}
+                "cool_until": cur.get("cool_until", 0),
+                # 失败退避状态同理：重扫只换映射，不该把「这个槽坏了三次」
+                # 的记忆抹掉，否则每 12h 扫描都会把坏槽放回调度。
+                "fail": cur.get("fail", 0),
+                "fail_at": cur.get("fail_at", 0),
+                "fail_reason": cur.get("fail_reason", "")}
         # 「新增 IP」的判定依据：只有 IP 真的变了才刷新 seen_at，
         # 否则每次重扫都会把全部槽位标成新增，标记就没意义了。
         cur_ip = cur.get("ip", "")
@@ -769,7 +798,13 @@ async def note_success(slot: int) -> int:
                                # 的历史，否则明天之前的一次误判会连累后面的判定
                                "n429d": 0,
                                # 真的出图了：之前的置账标记作废
-                               "booked": 0})
+                               "booked": 0,
+                               # 失败退避清零：能出图就证明链路和页面都是好的，
+                               # 留着 fail 会让它下次偶发失败直接跳到长冷却。
+                               # 注意只清计数、**不清 cool_until**：并发下「刚撞墙、
+                               # 另一个在途请求又成功」不代表链路已稳定，冷却按原
+                               # 期限走完；清零的只是退避档位。
+                               "fail": 0, "fail_reason": ""})
     return n
 
 
@@ -827,15 +862,20 @@ async def note_429(slot: int, *, daily_hint: bool = False,
     # （下面 seen_daily >= 1），比全新槽位更脆弱 —— 这会让"每天 08:00
     # 自动重置"变成半重置：used 回来了，判定阈值却还带着昨天的伤。
     if d.get("day") != _today():
+        # 换日一并清 `fail`：与 n429d 同理，昨天已经被判死的槽位如果带着
+        # 5 次失败进入新的一天，第一次偶发失败就直接跳到 1h 冷却 ——
+        # 「每天 08:00 自动重置」会变成半重置（used 回来了，退避档位没回来）。
         await b.hset(key, mapping={"day": _today(), "n429": 0,
-                                   "n429d": 0, "nthrottle": 0})
+                                   "n429d": 0, "nthrottle": 0,
+                                   "fail": 0, "fail_reason": ""})
         d = await b.hgetall(key) or {}
     # `n429` 是面板口径的「所有 429」；`n429d` 单独记「带今日额度文案的
     # 429」，保留下来供对账与面板观察，但不再参与判定（口径已改为以上游为准）。
+    seen_daily = int(d.get("n429d", 0) or 0)
     await b.hincrby(key, "n429", 1)
     if daily_hint:
         await b.hincrby(key, "n429d", 1)
-    if daily_hint:
+    if daily_hint and seen_daily >= 2:
         quota = int(d.get("quota", _cfg()["quota"]) or _cfg()["quota"])
         cd = DEFAULT_429_COOLDOWN_S if cooldown_s is None else cooldown_s
         await b.hset(key, mapping={
@@ -847,7 +887,15 @@ async def note_429(slot: int, *, daily_hint: bool = False,
             "booked": 1,
         })
         return "exhausted"
-    await note_throttled(slot, cooldown_s)
+    # 日额度文案但只命中一两次：先冷却，别把可能只是被短窗口限流的 IP 判死。
+    # 冷却本身递增（300s → 600s），第 3 次才在上面判死。
+    if cooldown_s is not None:
+        cd = cooldown_s
+    elif daily_hint:
+        cd = DAILY_HINT_COOLDOWN_S * (2 ** max(0, seen_daily))
+    else:
+        cd = None
+    await note_throttled(slot, cd)
     return "cooling"
 
 
@@ -903,9 +951,47 @@ async def note_throttled(slot: int, cooldown_s: int | None = None) -> float:
     return until
 
 
-async def note_failure(slot: int) -> int:
-    """非 429 的失败：只记数，不扣额度（没有出图就是没消耗上游配额）。"""
-    return await _b().hincrby(_slot_key(slot), "fail", 1)
+async def note_failure(slot: int, cooldown_s: float | None = None,
+                       reason: str = "") -> float:
+    """记一次**槽位级**失败：计数 + 指数冷却 + 退出调度。
+
+    当前唯一的调用点是 sidecar 的 `rebind ... failed: TimeoutError` ——
+    只有它构成「这条出口建链路失败」的**槽位级**证据。传输层失败（连不上
+    sidecar）与 500（页面内求值超时）不在此列：它们与出口无关，冷却会在
+    宿主过载时批量误杀好 IP。451/413/502 同理（内容/契约问题）。
+
+    冷却必须落进注册表，而不是只留一个计数：`available()` 与
+    `acquire_many()` 只看 `cool_until` / `used` / `last_used`。此前 `fail`
+    只累加不参与调度，于是同一坏槽被反复选中，每次重花一个 rebind 超时
+    （上限 60s）。2026-11-23 09:37 那条
+    `rebind slot 248 failed: TimeoutError` 就是这么连着撞出来的。
+
+    `cool_until` 取 max：不能把 403（6h）或日额度（10min）已经设好的更长
+    冷却，缩短成这里的几百秒。
+    """
+    b = _b()
+    key = _slot_key(slot)
+    now = time.time()
+    d = await b.hgetall(key) or {}
+    prev = int(d.get("fail", 0) or 0)
+    last = float(d.get("fail_at", 0) or 0)
+    if prev and now - last > FAIL_RESET_S:
+        # 距上次失败已超过一个窗口：按新的一轮从 1 开始，避免把「每天偶发
+        # 失败一次」的槽位攒到上限。
+        await b.hset(key, mapping={"fail": 0})
+    # 用 HINCRBY 而不是读-改-写：同槽并发失败时计数仍然单调。
+    n = await b.hincrby(key, "fail", 1)
+    if cooldown_s is None:
+        cd = min(FAIL_COOLDOWN_BASE_S * (2 ** (n - 1)), FAIL_COOLDOWN_MAX_S)
+    else:
+        cd = cooldown_s
+    until = max(now + cd, float(d.get("cool_until", 0) or 0))
+    await b.hset(key, mapping={
+        "cool_until": int(until),
+        "fail_at": int(now),
+        "fail_reason": (reason or "")[:120],
+    })
+    return until
 
 
 async def set_quota(slot: int, quota: int) -> None:

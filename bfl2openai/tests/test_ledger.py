@@ -44,9 +44,23 @@ def test_success_counts_real_and_clears_booked():
     assert s.booked is False, "真出图后置账标记必须清掉"
 
 
-def test_second_daily_429_books_slot():
+def test_second_daily_429_still_cools():
+    """两次命中还不够判死：上游对短窗口频控复用同一句文案。"""
     async def go():
         await _seed(1, used=3, n_ok=3, n429d=1)
+        verdict = await ep.note_429(1, daily_hint=True)
+        return verdict, await ep.get_slot(1)
+
+    verdict, s = asyncio.run(go())
+    assert verdict == "cooling"
+    assert s.used == 3, "未确认前不得扣额度"
+    assert s.booked is False
+
+
+def test_third_daily_429_books_slot():
+    """第三次命中才判死：均摊之后连续命中同一 IP 极罕见。"""
+    async def go():
+        await _seed(1, used=3, n_ok=3, n429d=2)
         verdict = await ep.note_429(1, daily_hint=True)
         return verdict, await ep.get_slot(1)
 
@@ -57,11 +71,11 @@ def test_second_daily_429_books_slot():
     assert s.booked is True
 
 
-def test_first_daily_429_books_slot():
-    """口径以上游计数为准（2026-11-22）：命中日额度文案即置死，不二次确认。
+def test_first_daily_429_only_cools():
+    """首次命中只冷却：上游对短窗口频控复用同一句「今天 30 张用完」。
 
-    上游的 "30 free generations" 是它自己的计数，包含我们看不见的提交；
-    本地 n_ok 只记成功出图，用它反推必然算错。
+    2026-11-24 实测：改成「首次即置死」后一天累积 566 个 IP 被判死，
+    平均只出过 7 张图，而 sidecar 侧成功率仍有 60% —— 多数是误杀。
     """
     async def go():
         await _seed(1, used=3, n_ok=3)
@@ -69,10 +83,10 @@ def test_first_daily_429_books_slot():
         return verdict, await ep.get_slot(1)
 
     verdict, s = asyncio.run(go())
-    assert verdict == "exhausted", "上游说用完即用完"
-    assert s.used == s.quota, "必须置满，否则调度器会继续撞同一堵墙"
-    assert s.booked is True, "置账要打标，供对账与面板区分"
-    assert s.n_ok == 3, "真实出图数不受置账影响"
+    assert verdict == "cooling"
+    assert s.used == 3, "未确认前不得扣额度"
+    assert s.booked is False
+    assert s.cool_until > 0, "必须进入冷却"
 
 
 def test_snapshot_exposes_real_and_booked():

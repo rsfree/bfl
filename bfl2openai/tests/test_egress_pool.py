@@ -256,7 +256,67 @@ def test_failure_does_not_consume_quota(monkeypatch):
     rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
     assert rows[1].used == 0, "失败不该扣额度"
     assert rows[1].fail == 2
-    assert rows[1].available()
+    # 2026-11-23：失败必须让槽位退出调度。旧断言 `available()` 记录的正是
+    # 被修掉的行为 —— 坏槽原地可用 ⇒ 下一个请求把同一个 rebind 超时再花一遍。
+    assert not rows[1].available(), "连续失败的槽位必须冷却"
+    assert asyncio.run(ep.acquire()) is None, "冷却期内不该再被选中"
+
+
+def test_failure_cooldown_backs_off_and_resets(monkeypatch):
+    """连续失败指数退避且有上限；一次成功即清零并恢复调度。"""
+    import asyncio
+    import time
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "1")
+    monkeypatch.setenv("BFL2OPENAI_POOL_FAIL_COOLDOWN_BASE", "180")
+    monkeypatch.setenv("BFL2OPENAI_POOL_FAIL_COOLDOWN_MAX", "3600")
+    monkeypatch.setattr(ep, "_probe_ip", _probe_by_slot({"1.1.1.1": [1]}))
+    asyncio.run(ep.scan())
+
+    gaps = []
+    for _ in range(6):
+        until = asyncio.run(ep.note_failure(1))
+        gaps.append(int(until - time.time()))
+    assert gaps[0] <= 181
+    assert gaps[1] > gaps[0], "第二次必须更久"
+    assert gaps[-1] <= 3600, "不得超过上限"
+    assert gaps == sorted(gaps), f"应单调递增：{gaps}"
+
+    asyncio.run(ep.note_success(1))
+    rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
+    assert rows[1].fail == 0, "出图成功后失败计数要清零"
+    # cool_until 不跟着清：并发下「刚撞墙、另一个在途请求又成功」不代表
+    # 链路已稳定，冷却按原期限走完。把冷却拨到过去，验证退避档位确实归零。
+    asyncio.run(ep._b().hset(ep._slot_key(1), mapping={"cool_until": 0}))
+    until = asyncio.run(ep.note_failure(1))
+    assert int(until - time.time()) <= 181, "清零后下次失败应从 base 重新起算"
+
+
+def test_day_rollover_clears_failure_backoff(monkeypatch):
+    """跨日后失败档位归零：否则昨天的伤会让今天第一次失败就关 1h。"""
+    import asyncio
+    import time
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "1")
+    monkeypatch.setattr(ep, "_probe_ip", _probe_by_slot({"1.1.1.1": [1]}))
+    asyncio.run(ep.scan())
+    for _ in range(5):
+        asyncio.run(ep.note_failure(1))
+    # 模拟「这些失败发生在昨天」
+    asyncio.run(ep._b().hset(ep._slot_key(1), mapping={
+        "day": "1970-01-01", "fail": 9, "fail_at": int(time.time())}))
+    asyncio.run(ep.note_429(1, daily_hint=False))
+    rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
+    assert rows[1].fail == 0, "跨日必须重置失败档位"
+
+
+def test_failure_never_shortens_existing_cooldown(monkeypatch):
+    """rebind 超时不能把 403 的 6h 冷却覆盖成 3 分钟。"""
+    import asyncio
+    monkeypatch.setenv("BFL2OPENAI_POOL_SLOTS", "1")
+    monkeypatch.setattr(ep, "_probe_ip", _probe_by_slot({"1.1.1.1": [1]}))
+    asyncio.run(ep.scan())
+    long_until = asyncio.run(ep.note_rate_limited(1, field="n403"))
+    until = asyncio.run(ep.note_failure(1, reason="503:rebind"))
+    assert until >= long_until - 1, "更长的冷却不得被缩短"
 
 
 def test_snapshot_shape(monkeypatch):
@@ -443,12 +503,8 @@ def test_lease_is_global_not_per_process(monkeypatch):
     assert asyncio.run(ep.try_lease(1, 1)) is True, "释放后应可再租"
 
 
-def test_note_429_after_day_rollover_still_exhausts():
-    """换日后命中「日额度」文案同样是上游说用完，直接置死。
-
-    换日只该清掉 n429d 这类统计，不该让判定放水 —— 上游的计数是新的，
-    它说用完就是新的那一天也用完了。
-    """
+def test_note_429_after_day_rollover_only_cools():
+    """换日后 n429d 归零，首次命中日额度文案只冷却（三次确认制的必然结果）。"""
     import asyncio
 
     async def _run():
@@ -461,21 +517,21 @@ def test_note_429_after_day_rollover_still_exhausts():
         return res, await b.hgetall(key)
 
     res, d = asyncio.run(_run())
-    assert res == "exhausted", "上游说用完即用完，与本地换日无关"
-    assert d.get("used") == "30", "必须置满"
+    assert res == "cooling", "换日后计数归零，首次命中只冷却"
+    assert d.get("used") != "30", "未确认前不得扣额度"
     assert d["n429d"] == "1", "n429d 从换日后的 0 重新计数"
     assert d["day"] == ep._today()
 
 
-def test_note_429_same_day_second_hint_still_exhausts():
-    """同一账本日内第二次「日额度」429 仍然要判死（不能被重置逻辑放水）。"""
+def test_note_429_same_day_third_hint_exhausts():
+    """同一账本日内第三次「日额度」429 才判死（前两次只冷却）。"""
     import asyncio
 
     async def _run():
         b = ep._b()
         key = ep._slot_key(2)
-        await b.hset(key, mapping={"day": ep._today(), "n429d": 1,
-                                   "n429": 1, "quota": 30,
+        await b.hset(key, mapping={"day": ep._today(), "n429d": 2,
+                                   "n429": 2, "quota": 30,
                                    "ip": "5.6.7.8", "state": "primary"})
         return await ep.note_429(2, daily_hint=True)
 

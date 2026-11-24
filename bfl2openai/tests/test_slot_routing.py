@@ -109,10 +109,9 @@ def test_429_rotates_to_another_slot(monkeypatch):
     rows = {s.slot: s for s in asyncio.run(ep.list_slots())}
     failed = rows[calls[0]]
     ok = rows[calls[1]]
-    # 口径以上游计数为准：命中日额度文案即置满，不再二次确认。
-    assert failed.used == failed.quota, "日额度文案即置死"
-    assert failed.booked is True, "置账要打标"
-    assert failed.cool_until > 0, "置死同时也要冷却"
+    # 首次命中只冷却：同一 IP 第三次才判死（上游文案对频控也复用）。
+    assert failed.used == 0, "首次 429 不得扣额度"
+    assert failed.cool_until > 0, "首次 429 必须进入冷却"
     assert ok.used == 1, "成功的槽位记 1 次"
 
 
@@ -134,11 +133,10 @@ def test_all_slots_exhausted_maps_to_429(monkeypatch):
     with pytest.raises(bec.BrowserEgressError) as ei:
         asyncio.run(server._browser_generate(prompt="x"))
     assert ei.value.status == 429
-    # 两个槽位都会被置死：上游对它们都说了「今天用完」
+    # 首次 429 一律只冷却：两个槽位都不该被扣额度
     rows = asyncio.run(ep.list_slots())
-    assert all(r.cool_until > 0 for r in rows), "置死也要带冷却"
-    assert all(r.used == r.quota for r in rows), "日额度文案即置死"
-    assert all(r.booked for r in rows), "置账要打标"
+    assert all(r.cool_until > 0 for r in rows), "首次 429 应各自进入冷却"
+    assert all(r.used == 0 for r in rows), "没有一条该被直接判成额度耗尽"
 
 
 def test_non_429_failure_does_not_consume_quota(monkeypatch):
@@ -158,7 +156,34 @@ def test_non_429_failure_does_not_consume_quota(monkeypatch):
         asyncio.run(server._browser_generate(prompt="x"))
     rows = asyncio.run(ep.list_slots())
     assert sum(r.used for r in rows) == 0, "没出图不该扣额度"
-    assert sum(r.fail for r in rows) == 1
+    # 2026-11-23：只有传输超时 / 500 / 503(rebind) 才记「槽位坏了」。
+    # 502 是上游契约错误（composition 冲突等），出口本身是好的 —— 记失败
+    # 会让 `note_failure` 把它冷却，等于白白扔掉一个还能出 30 张的 IP。
+    assert sum(r.fail for r in rows) == 0, "502 是契约错误，不该记槽位失败"
+    assert all(r.available() for r in rows if r.state == ep.STATE_PRIMARY), \
+        "契约错误不得冷却出口"
+
+
+def test_transport_failure_does_not_cool_slot(monkeypatch):
+    """连不上 sidecar 是实例问题，不能记到出口头上（会在过载时批量误杀）。"""
+    import asyncio
+
+    async def fake_probe(slot, timeout=12.0):
+        return {1: "1.1.1.1", 2: "2.2.2.2"}[slot]
+
+    monkeypatch.setattr(ep, "_probe_ip", fake_probe)
+    asyncio.run(ep.scan())
+
+    async def dead(proxy_slot=None, **kw):
+        raise bec.BrowserEgressError("browser egress transport: timed out", 0)
+
+    monkeypatch.setattr(bec, "generate", dead)
+    with pytest.raises(bec.BrowserEgressError):
+        asyncio.run(server._browser_generate(prompt="x"))
+    rows = asyncio.run(ep.list_slots())
+    assert sum(r.fail for r in rows) == 0, "传输层失败不该记槽位失败"
+    assert all(r.available() for r in rows if r.state == ep.STATE_PRIMARY), \
+        "实例不可用不得冷却出口"
 
 
 def test_canary_header_forces_pool(monkeypatch):
@@ -349,7 +374,7 @@ def test_daily_quota_vs_short_throttle(monkeypatch):
             'generations. Please come back tomorrow."}', 429)
 
     monkeypatch.setattr(bec, "generate", quota)
-    for round_ in range(2):
+    for round_ in range(3):
         # 清掉冷却，模拟冷却期满后同一 IP 再次被选中
         for s in asyncio.run(ep.list_slots()):
             asyncio.run(ep._b().hset(ep._slot_key(s.slot),
@@ -360,7 +385,10 @@ def test_daily_quota_vs_short_throttle(monkeypatch):
             pass
         burned = [r for r in asyncio.run(ep.list_slots())
                   if r.used == r.quota]
-        assert burned, "首次命中日额度文案即判死，不再二次确认"
+        if round_ < 2:
+            assert not burned, "前两次命中只冷却（上游文案对频控也复用）"
+        else:
+            assert burned, "第三次命中才判死"
 
 
 def test_concurrent_requests_spread_across_slots(monkeypatch):
@@ -424,10 +452,15 @@ def test_second_429_exhausts_slot(monkeypatch):
     monkeypatch.setattr(ep, "_probe_ip", fake_probe)
     asyncio.run(ep.scan())
 
+    assert asyncio.run(ep.note_429(1, daily_hint=True)) == "cooling"
+    row = {s.slot: s for s in asyncio.run(ep.list_slots())}[1]
+    assert row.used == 0, "首次 429 不得扣额度"
+    assert row.cool_until > 0, "首次 429 必须进入冷却"
+
+    assert asyncio.run(ep.note_429(1, daily_hint=True)) == "cooling"
     assert asyncio.run(ep.note_429(1, daily_hint=True)) == "exhausted"
     row = {s.slot: s for s in asyncio.run(ep.list_slots())}[1]
-    assert row.used == row.quota, "首次命中日额度文案即判定当日耗尽"
-    assert row.cool_until > 0, "置死同时必须进入冷却"
+    assert row.used == row.quota, "第三次 429 才判定当日耗尽"
 
 
 def test_429_without_daily_hint_never_exhausts(monkeypatch):

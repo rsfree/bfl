@@ -663,6 +663,14 @@ _PREBIND: list[int] = [int(x) for x in
 #: 而一次生成约 20s ⇒ 一个 IP 同时只该跑 1 个请求。
 #: 并发要靠**摊到不同 IP** 拿到，不是靠一个 IP 硬扛。
 _SLOT_CAP = int(os.environ.get("BFL2OPENAI_SLOT_INFLIGHT", "1"))
+
+#: 黏性槽位最多被连续占用多少次，超过就主动让位。
+#: 没有这个上限时，6 个 worker 各黏一个 IP，595 个出口里只有个位数在被
+#: 反复使用 —— 它们先打满、先被 429，其余 550 个整天空闲（2026-11-24：
+#: 566 个 IP 被判死时平均只出过 7 张图）。取 8 的依据：595 × 8 = 4760，
+#: 覆盖单日约 6600 次提交的 72%，每个 IP 都能轮到，而单 IP 的 rebind
+#: 成本被摊到 1/8（prep 中位 58s ÷ 8 ≈ 7s/次）。
+_STICKY_MAX_USED = int(os.environ.get("BFL2OPENAI_STICKY_MAX_USED", "8"))
 _INFLIGHT: dict[int, int] = {}
 
 #: 每个 worker 从预绑定列表的不同位置起扫。不这么做的话 6 个 worker 会全部
@@ -705,7 +713,10 @@ async def _next_slot(exclude: set[int]):
     cur = _STICKY["slot"]
     if cur and cur not in exclude and _has_room(cur):
         s = await egress_pool.get_slot(cur)
-        if s is not None and s.available() and _spaced(s) \
+        # 黏性不是无限的：用够 _STICKY_MAX_USED 次就让位给池子里最久没用的
+        # 那个，否则少数 IP 会被长期占住、先耗尽，均摊形同虚设。
+        if s is not None and s.available() and s.used < _STICKY_MAX_USED \
+                and _spaced(s) \
                 and await egress_pool.try_lease(s.slot, _SLOT_CAP):
             _take(s.slot)
             return s
@@ -716,7 +727,8 @@ async def _next_slot(exclude: set[int]):
         if n in exclude or not _has_room(n):
             continue
         s = await egress_pool.get_slot(n)
-        if s is not None and s.available() and _spaced(s) \
+        if s is not None and s.available() \
+                and s.used < _STICKY_MAX_USED and _spaced(s) \
                 and await egress_pool.try_lease(s.slot, _SLOT_CAP):
             _STICKY["slot"] = n
             _take(s.slot)
@@ -846,9 +858,16 @@ async def _browser_generate(*, deadline: float | None = None, **kwargs) -> bytes
                             slot.slot, slot.ip, len(tried))
                 last = exc
                 continue
-            await egress_pool.note_failure(slot.slot)
             if exc.status in (0, 500, 503):
+                # 只有 rebind 超时是**槽位级**证据：sidecar 明确说「这条出口
+                # 建链路失败了」。其余两类证据强度不够，不能记到槽位头上：
+                #   * status=0 是连不上 sidecar 实例（网络/进程），与出口无关；
+                #   * 500 是页面内求值超时，页面级问题，换页往往就能救。
+                # 把这两类也冷却，会在宿主过载窗口里批量误杀好 IP ——
+                # 与 note_429 注释里批评的「一次 429 就整天枪毙」同款错误。
                 if exc.status == 503 and "rebind" in str(exc):
+                    await egress_pool.note_failure(
+                        slot.slot, reason=f"rebind:{str(exc)[:60]}")
                     await metrics.bump("rebind_timeout")
                 elif exc.status == 500:
                     await metrics.bump("sidecar_500")
