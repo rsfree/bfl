@@ -7,12 +7,14 @@
 
 ## 0. 结论（先看这段）
 
-> **落地状态（18:50 CST）**
+> **落地状态（18:58 CST，镜像 v0.2.126）**
 > - **P0-1 已执行**：生产 `.env` 的 `BFL2OPENAI_POOL_HOST` 由 `pool.livetest.cn`
 >   改为 `172.96.142.53`；三台 egress 滚动重建 **65s**（各 20s 预热，11/11/10 就绪），
->   app 与 probe 同步重建，`probe.last_ok=true`（15.8s）。
-> - **P0-2 代码已入库**：`bfl2openai/server.py` 增加入口绑定自检（每 30min，
->   结果挂 `/healthz.entry_binding`），随下一个镜像 tag 生效。
+>   app 与 probe 同步重建，`probe.last_ok=true`（17.8s）。
+> - **P0-2 已上线**：`/healthz.entry_binding` 实测
+>   `{state: ok, expected: 38.6.213.100, actual: 38.6.213.100}`。
+>   sidecar 仍是 0.2.125（本次只改 app，用 `SKIP_EGRESS=1` 跳过重建，
+>   browser_egress 代码未变）。
 > - 未做：`roles/gost_front` 节点清单确定性排序（双前提高可用的前提）。
 
 1. **「到 2090 的连接数」不是需要优化的指标。** 32 页 ≈ 400 条稳态连接、峰值 1,186 条，
