@@ -729,7 +729,8 @@ async def get_slot(n: int) -> Slot | None:
     return _to_slot(n, d, _cfg()["quota"]) if d else None
 
 
-async def acquire_many(limit: int = 1, *, exclude: Iterable[int] = ()) -> list[Slot]:
+async def acquire_many(limit: int = 1, *, exclude: Iterable[int] = (),
+                       prefer_proven: bool = False) -> list[Slot]:
     """按调度优先级返回**至多 limit 个候选**（一次快照，供调用方逐个试租约）。
 
     为什么要批量：`list_slots()` 要扫 588 个 key，而并发时每个请求都要
@@ -746,6 +747,17 @@ async def acquire_many(limit: int = 1, *, exclude: Iterable[int] = ()) -> list[S
             if s.available(now) and s.slot not in ex]
     if not cand:
         return []
+
+    if prefer_proven:
+        # 抢救模式：只认「今天真实出过图」（n_ok>0）的槽位 —— 它证明账号与
+        # 链路当天是好的；按本地剩余额度降序，先把还能用的榨干。
+        # 没有 proven 槽位就返回空，让上层按原有早退逻辑收手（不要在
+        # 几千个未验证槽位里盲试，那正是 2026-11-22 长尾的成因）。
+        proven = [s for s in cand if s.n_ok > 0]
+        if not proven:
+            return []
+        proven.sort(key=lambda s: (-s.remaining, s.last_used))
+        return proven[:limit]
 
     by_seg: dict[str, list[Slot]] = {}
     for s in cand:

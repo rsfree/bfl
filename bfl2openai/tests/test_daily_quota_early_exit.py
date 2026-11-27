@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -77,6 +78,71 @@ def test_early_exit_after_n_daily_hits(monkeypatch):
     assert len(calls) < server._SLOT_ATTEMPTS, "早退必须发生在槽位次数上限之前"
     assert exc.retry_after is not None, "整池枯竭必须带 Retry-After"
     assert exc.retry_after >= 60
+
+
+def test_acquire_many_prefers_proven_slots(monkeypatch):
+    """抢救模式只挑「今天真实出过图」且本地还有余额的槽位。"""
+
+    async def go():
+        await _scan(monkeypatch)
+        await ep.note_success(5)          # slot 5: n_ok=1, used=1
+        return await ep.acquire_many(1, prefer_proven=True)
+
+    slots = asyncio.run(go())
+    assert slots and slots[0].slot == 5
+    assert slots[0].n_ok == 1
+
+
+def test_acquire_many_prefers_none_when_no_proven(monkeypatch):
+    """没有任何 proven 槽位时返回空 —— 让上层按原有早退收手，不盲试。"""
+
+    async def go():
+        await _scan(monkeypatch)
+        return await ep.acquire_many(1, prefer_proven=True)
+
+    assert asyncio.run(go()) == []
+
+
+def test_scavenge_uses_proven_slot_after_daily_limit(monkeypatch):
+    """连撞 3 个日额度后，用剩余尝试抢救 proven 槽位并成功。"""
+    calls: list[tuple] = []
+
+    async def ready():
+        return True
+
+    monkeypatch.setattr(ep, "configured", lambda: True)
+    monkeypatch.setattr(ep, "ready", ready)
+
+    async def fake_next(exclude, prefer_proven=False):
+        if prefer_proven:
+            calls.append(("proven", 5))
+            return ep.Slot(slot=5, ip="10.0.0.5", state=ep.STATE_PRIMARY,
+                           used=1, quota=30, cool_until=0, n429=0, n_ok=1)
+        n = 1 + sum(1 for c in calls if c[0] == "normal")
+        calls.append(("normal", n))
+        return ep.Slot(slot=n, ip=f"10.0.0.{n}", state=ep.STATE_PRIMARY,
+                       used=0, quota=30, cool_until=0, n429=0, n_ok=0)
+
+    async def fake_generate(proxy_slot=None, **kw):
+        calls.append(("gen", proxy_slot))
+        if proxy_slot == 5:
+            return b"PNG"
+        raise bec.BrowserEgressError("browser egress 429: " + _DAILY_BODY, 429)
+
+    monkeypatch.setattr(server, "_next_slot", fake_next)
+    monkeypatch.setattr(bec, "generate", fake_generate)
+
+    async def go():
+        await _scan(monkeypatch)
+        return await server._browser_generate(
+            prompt="x", deadline=time.monotonic() + 200)
+
+    assert asyncio.run(go()) == b"PNG"
+    normal = [c for c in calls if c[0] == "normal"]
+    proven = [c for c in calls if c[0] == "proven"]
+    assert len(normal) == server._DAILY_HITS_LIMIT
+    assert proven == [("proven", 5)]
+    assert ("gen", 5) in calls
 
 
 def test_non_daily_429_does_not_early_exit(monkeypatch):

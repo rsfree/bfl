@@ -268,6 +268,15 @@ _RETRY_AFTER_S = "60"
 #: 继续换只是把 60s 的失败拖成 210s（2026-11-22 实测 208~216s）。
 _DAILY_HITS_LIMIT = 3
 
+#: 日额度早退后的「抢救」次数：只从当天真实出过图（n_ok>0）、本地还有余额
+#: 的槽位里挑。2026-11-27 实测：连撞 3 个日额度就早退，但池里 slot 50 仍能
+#: 出图（24s）——「多数死、少数活」的尾部被 3 次硬截断丢掉了。
+#: 抢救的尝试计入 _SLOT_ATTEMPTS（默认 6），不会回到 2026-11-22 的 210s 长尾；
+#: 预算不足 _SCAVENGE_MIN_BUDGET_S 时直接放弃，避免拖过 nginx 300s。
+_SCAVENGE_ATTEMPTS = int(os.environ.get("BFL2OPENAI_SCAVENGE_ATTEMPTS", "3"))
+_SCAVENGE_MIN_BUDGET_S = float(
+    os.environ.get("BFL2OPENAI_SCAVENGE_MIN_BUDGET_S", "20"))
+
 #: 429 语义兜底识别。显式 kind/status 之外，旧版 sidecar 会把上游 429 折叠进
 #: 502 的错误文本里（`submit 429: ...`），滚动发布期间必须靠文案兜住。
 #: 只参与「→ 429」的判定，绝不参与对外文案。
@@ -758,7 +767,26 @@ def _spaced(s, now: float | None = None) -> bool:
     return (time.time() if now is None else now) - s.last_used >= gap
 
 
-async def _next_slot(exclude: set[int]):
+async def _next_slot(exclude: set[int], prefer_proven: bool = False):
+    if prefer_proven:
+        # 抢救模式：只挑「当天真实出过图（n_ok>0）+ 本地还有余额」的槽位。
+        # 这类槽位少，但命中率远高于随机轮转 —— 2026-11-27 实测随机 3 次
+        # 全撞日额度，而账本里仍有 slot 50 可用（24s 出图）。
+        # 不写 _STICKY：这类槽位接近当日上限，黏住只会更快撞墙。
+        ex = set(exclude)
+        for _ in range(2):
+            cands = await egress_pool.acquire_many(
+                12, exclude=ex, prefer_proven=True)
+            if not cands:
+                return None
+            for s in cands:
+                if _has_room(s.slot) \
+                        and await egress_pool.try_lease(s.slot, _SLOT_CAP):
+                    _take(s.slot)
+                    return s
+                ex.add(s.slot)
+        return None
+
     # 1) 当前黏住的槽位（前提是还有并发余量）
     cur = _STICKY["slot"]
     if cur and cur not in exclude and _has_room(cur):
@@ -820,6 +848,13 @@ def _seconds_until_reset() -> int:
     return max(60, int(left))
 
 
+def _daily_quota_error(daily_hits: int) -> browser_egress_client.BrowserEgressError:
+    """整池日额度耗尽的统一错误（带换日 Retry-After）。"""
+    return browser_egress_client.BrowserEgressError(
+        f"daily quota exhausted on {daily_hits} sampled exit ips",
+        429, retry_after=_seconds_until_reset())
+
+
 async def _browser_generate(*, deadline: float | None = None, **kwargs) -> bytes:
     """经侧车生成，并**把成败记到出口 IP 头上**。
 
@@ -857,12 +892,23 @@ async def _browser_generate(*, deadline: float | None = None, **kwargs) -> bytes
     transient_failed = False
     # 本轮连续撞到「今日额度已用完」的 IP 数：用于尽早收手，别烧满预算。
     daily_hits = 0
+    # 日额度早退后的抢救模式：只从 proven 槽位里挑，尝试次数计入总上限。
+    scavenge = False
+    scavenge_left = 0
     for _ in range(_SLOT_ATTEMPTS):
         # 预算见底：再换槽也只是把请求拖到 nginx 300s，不如带着真实原因收手。
         if last is not None and time.monotonic() + _TRANSIENT_MIN_S > deadline:
             break
-        slot = await _next_slot(tried)
+        slot = await _next_slot(tried, prefer_proven=scavenge)
         if slot is None:
+            if daily_hits:
+                # 正常轮转已经证明「随机抽到的都在日额度上」；proven 槽位
+                # 也没有可用的，才认定整池真的枯竭。
+                await metrics.bump("daily_quota_exhausted")
+                log.warning("no proven slot left after %d daily hits "
+                            "(tried=%d inflight=%d)",
+                            daily_hits, len(tried), len(_INFLIGHT))
+                raise _daily_quota_error(daily_hits)
             # 全部槽位额度耗尽/冷却中：429 比 502 更接近真相。
             # 带上 tried/inflight，才能区分"池子真的空了"与"并发把候选抢光了"
             # ——这两者在旧日志里长得一模一样。
@@ -890,16 +936,37 @@ async def _browser_generate(*, deadline: float | None = None, **kwargs) -> bytes
                             slot.slot, slot.ip, verdict, len(tried))
                 if daily:
                     daily_hits += 1
-                    if daily_hits >= _DAILY_HITS_LIMIT:
-                        # 换几个 IP 都是「今日额度已用完」⇒ 别再拿 240s 预算
-                        # 换一个注定失败的猜测。直接把换日时间告诉客户端。
-                        await metrics.bump("daily_quota_exhausted")
-                        log.warning(
-                            "daily quota exhausted on %d ips, giving up early "
-                            "(tried=%d)", daily_hits, len(tried))
-                        raise browser_egress_client.BrowserEgressError(
-                            "daily quota exhausted on sampled exit ips",
-                            429, retry_after=_seconds_until_reset()) from exc
+                    if scavenge:
+                        scavenge_left -= 1
+                        if scavenge_left <= 0:
+                            await metrics.bump("daily_quota_exhausted")
+                            log.warning(
+                                "daily quota exhausted on %d ips, scavenge "
+                                "exhausted (tried=%d)", daily_hits, len(tried))
+                            raise _daily_quota_error(daily_hits) from exc
+                    elif daily_hits >= _DAILY_HITS_LIMIT:
+                        # 连撞 N 个日额度后先别整池判死：池里可能还有
+                        # 「当天出过图、本地仍有余额」的少数槽位（2026-11-27
+                        # 实测：3 次随机全死，slot 50 仍可出图）。用剩余
+                        # 尝试次数做一轮 proven 抢救，仍失败才带换日时间收手。
+                        room = _SLOT_ATTEMPTS - len(tried)
+                        budget_ok = (time.monotonic() + _SCAVENGE_MIN_BUDGET_S
+                                     < deadline)
+                        if _SCAVENGE_ATTEMPTS > 0 and room > 0 and budget_ok:
+                            scavenge = True
+                            scavenge_left = min(_SCAVENGE_ATTEMPTS, room)
+                            log.warning(
+                                "daily quota on %d ips; scavenging %d proven "
+                                "slots (tried=%d)", daily_hits, scavenge_left,
+                                len(tried))
+                        else:
+                            # 没有可抢救的预算/候选：保持 2026-11-22 的早退，
+                            # 不把 60s 的失败拖成 210s。
+                            await metrics.bump("daily_quota_exhausted")
+                            log.warning(
+                                "daily quota exhausted on %d ips, giving up "
+                                "early (tried=%d)", daily_hits, len(tried))
+                            raise _daily_quota_error(daily_hits) from exc
                 last = exc
                 continue
             if exc.status == 403:
@@ -951,6 +1018,10 @@ async def _browser_generate(*, deadline: float | None = None, **kwargs) -> bytes
         await metrics.bump("budget_exhausted")
         raise browser_egress_client.BrowserEgressError(
             f"generation budget exhausted (last status={last.status})", 0) from last
+    if daily_hits:
+        # 循环正常走完（抢救尝试被非日额度错误消耗）：仍按「日额度枯竭」
+        # 上行，确保带换日 Retry-After，而不是裸 429 让客户端 60s 后重试。
+        raise _daily_quota_error(daily_hits)
     log.warning("gave up after %d slots, last=%s", len(tried),
                 getattr(last, "status", None))
     raise last or browser_egress_client.BrowserEgressError(
