@@ -368,6 +368,15 @@ async def _probe_ip(slot: int, *, timeout: float = 12.0) -> str | None:
     return None
 
 
+async def probe_slot_ip(slot: int, *, timeout: float = 12.0) -> str | None:
+    """实测某槽位**当前**的出口 IP（对外版本，用于入口绑定自检）。
+
+    与 `_probe_ip` 的唯一区别是语义：扫描用它建表，自检用它比对账本。
+    两者必须走同一条路径（同一 host/端口/用户名拼法），否则比对没有意义。
+    """
+    return await _probe_ip(slot, timeout=timeout)
+
+
 def _owner_id() -> str:
     """扫描归属标识：`<容器 hostname>:<worker pid>`。
 

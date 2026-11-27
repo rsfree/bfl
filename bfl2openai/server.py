@@ -70,7 +70,57 @@ async def _lifespan(_app: FastAPI):
     # 槽位→IP 映射定时重建（默认 12h）。多 worker 靠 Redis 同一时间桶抢锁，
     # 只有一个进程真正扫描；关闭用 BFL2OPENAI_POOL_SCAN_ENABLE=0。
     egress_pool.start_scan_scheduler()
+    # 入口绑定自检：前置机/节点清单一换，账本里的 slot→IP 就全部失效。
+    asyncio.create_task(_watch_entry_binding())
     yield
+
+
+#: 入口绑定自检状态（见 `_watch_entry_binding`）。挂在 /healthz 上。
+_ENTRY_BINDING: dict = {"state": "pending", "checked_at": 0.0}
+#: 自检周期（秒）。gost_front 的 nodes 清单被改 = 全池 slot→IP 重排，
+#: 半小时内必须能发现，否则只会表现为「配额莫名提前用光」。
+ENTRY_CHECK_INTERVAL_S = float(os.environ.get("BFL2OPENAI_ENTRY_CHECK_S", "1800"))
+
+
+async def _verify_entry_binding() -> dict:
+    """比对「账本里 slot N 的 IP」与「实测出口 IP」。
+
+    为什么需要：2090/2091 的选路是 `crc32(用户名) % 节点数`，结果同时取决于
+    **前置机**和**节点清单**。两者任一变化，同一个 slot 的出口 IP 就变了，
+    而 used/quota 是按 IP 记账的 —— 账面会以为旧 IP 还有额度，真实新 IP
+    却在无人计数的情况下被消耗（配额提前穿底）；已加载页面握着的挑战凭据
+    也会跨 IP 失效。
+
+    只做观测：不一致写 ERROR 并挂到 /healthz，不阻断请求 —— 让它先被人看见，
+    由运维决定重扫还是切回。真正要拦住的是「静默变账」。
+    """
+    slot_no = int(os.environ.get("BFL2OPENAI_ENTRY_CHECK_SLOT", "1"))
+    try:
+        slot = await egress_pool.get_slot(slot_no)
+        if slot is None or not slot.ip:
+            return {"state": "no_table"}
+        actual = await egress_pool.probe_slot_ip(slot_no)
+        if not actual:
+            return {"state": "probe_failed", "expected": slot.ip}
+        if actual == slot.ip:
+            return {"state": "ok", "expected": slot.ip, "actual": actual}
+        log.error(
+            "入口绑定不一致：slot %03d 账本=%s 实测=%s。前置机或 "
+            "gost_front 的节点清单已被更换 ⇒ 全池 slot→IP 重排，"
+            "必须重扫槽位表（POST /panel/api/scan）并清 IP 记账。",
+            slot_no, slot.ip, actual)
+        return {"state": "mismatch", "expected": slot.ip, "actual": actual}
+    except Exception as exc:  # noqa: BLE001 - 自检失败不能影响服务
+        return {"state": f"error:{type(exc).__name__}"}
+
+
+async def _watch_entry_binding() -> None:
+    await asyncio.sleep(20)          # 让扫描调度与首发请求先跑
+    while True:
+        result = await _verify_entry_binding()
+        _ENTRY_BINDING.clear()       # 保持同一对象引用，healthz 读的是它
+        _ENTRY_BINDING.update(result, checked_at=time.time())
+        await asyncio.sleep(ENTRY_CHECK_INTERVAL_S)
 
 
 app = FastAPI(title="bfl2openai", version="0.2.0", lifespan=_lifespan)
@@ -1179,6 +1229,9 @@ async def healthz() -> dict:
         out["probe"] = await probe.summary()
     except Exception:  # noqa: BLE001
         pass
+    # 入口绑定自检结果。state=mismatch 表示「账本 IP ≠ 实测 IP」，
+    # 此时 used/quota 已不可信，先看它再看成功率。
+    out["entry_binding"] = dict(_ENTRY_BINDING)
     return out
 
 
