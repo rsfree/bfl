@@ -10,6 +10,9 @@ analysis/bfl_openapi.json):
   request   application/json
     prompt             string, required
     images             string | [string] (http(s) URL or base64), 1..10
+    width / height     exact pixels, [256, 6256]; <=16.8 MP for t2i and
+                       <=4 MP with reference images; set together and
+                       override resolution + aspect_ratio (openapi 2026-10-22)
     aspect_ratio       default "auto"
     resolution         enum 768sq | 1k | 1.5k | 2k | 4k, default "1k"
     safety_tolerance   int 0..4 (default 2)      -- accepted, dropped
@@ -206,7 +209,153 @@ def _boxes_native(rows) -> list[dict]:
     return out
 
 
-async def _bridge_upscale(token: str, media: bytes, magnify: int) -> tuple[bytes | None, str]:
+# ---- exact size (width/height) -------------------------------------------
+#: docs.bfl.ai `/v1/flux-3-image` (openapi 2026-11-27): `width`/`height` are
+#: exact pixels in [256, 6256]; the pixel budget is 16.8 MP for text-to-image
+#: and 4 MP once reference images are attached. Both override `resolution`
+#: and `aspect_ratio`.
+#:
+#: The playground upstream we reverse-engineered (2026-10-09) exposes only
+#: tier + ratio. So an exact size is honoured as:
+#:   tier  = smallest playground tier whose long edge covers max(w, h)
+#:   ratio = nearest legal enum
+#:   bytes = cover-crop to w:h, then LANCZOS to exactly w x h
+#: That keeps the API contract ("you get the pixels you asked for") without
+#: inventing an upstream knob that does not exist. Sizes the tier already
+#: produces bit-for-bit (2048x2048 on 2k) skip the re-encode entirely.
+EXACT_MIN_SIDE = 256
+EXACT_MAX_SIDE = 6256
+EXACT_MAX_PIXELS = 16_822_272
+EXACT_MAX_PIXELS_REFS = 4_194_304
+
+#: Long-edge ceiling of each anonymous tier (square-equivalent).
+_TIER_EDGES = (("768sq", 768), ("1k", 1024), ("1.5k", 1536), ("2k", 2048))
+
+
+#: Slot-aware generator injected by server.py at import time (it owns the
+#: 2090 pool, lease ledger and 403/429 rotation). Falls back to the plain
+#: sidecar client when native runs standalone (unit tests / local dev).
+_BROWSER_GENERATE = None
+
+
+def set_browser_generate(fn) -> None:
+    """Wire the pool-aware generator without a native -> server import cycle."""
+    global _BROWSER_GENERATE
+    _BROWSER_GENERATE = fn
+
+
+class _SizeError(ValueError):
+    """A width/height pair that violates the official contract."""
+
+    def __init__(self, field: str, message: str) -> None:
+        super().__init__(message)
+        self.field = field
+        self.message = message
+
+
+def _as_pixels(value: object) -> int | None:
+    """JSON number -> int, rejecting bools and fractional values."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _parse_exact_size(payload: dict, has_refs: bool) -> tuple[int, int] | None:
+    """Validate the official width/height pair; None when neither is sent.
+
+    Raises ``_SizeError`` for half a pair, non-integers, out-of-range sides
+    and over-budget areas. Budgets are the documented ones: 16.8 MP for
+    text-to-image, 4 MP when reference images ride along.
+    """
+    raw_w, raw_h = payload.get("width"), payload.get("height")
+    if raw_w is None and raw_h is None:
+        return None
+    if raw_w is None or raw_h is None:
+        raise _SizeError("width", "width and height must be set together")
+    width, height = _as_pixels(raw_w), _as_pixels(raw_h)
+    for field, value in (("width", width), ("height", height)):
+        if value is None:
+            raise _SizeError(field, f"{field} must be an integer")
+        if not EXACT_MIN_SIDE <= value <= EXACT_MAX_SIDE:
+            raise _SizeError(
+                field,
+                f"{field} must be between {EXACT_MIN_SIDE} and {EXACT_MAX_SIDE}")
+    budget = EXACT_MAX_PIXELS_REFS if has_refs else EXACT_MAX_PIXELS
+    if width * height > budget:
+        suffix = " with reference images" if has_refs else ""
+        raise _SizeError(
+            "width",
+            f"width x height must be at most {budget} pixels{suffix}")
+    return width, height
+
+
+def _aspect_for_size(width: int, height: int) -> str:
+    """Nearest legal upstream ratio; exact pixel error is absorbed later."""
+    return bridging.nearest_ratio(width / height)
+
+
+def _tier_for_exact(width: int, height: int) -> tuple[str, int | None]:
+    """Smallest tier covering the requested long edge; composite beyond 2k."""
+    edge = max(width, height)
+    for name, cap in _TIER_EDGES:
+        if edge <= cap:
+            return name, None
+    # Beyond the anonymous 2k ceiling: generate at 2k, then MPS x2/x4.
+    return ("4k", 2) if edge <= 3840 else ("8k", 4)
+
+
+def _fit_exact(media: bytes, width: int, height: int) -> bytes:
+    """Return PNG bytes at exactly ``width x height``.
+
+    Cover-crop to the target ratio first (a 2:1 target served by a 1:1 tier
+    must lose top/bottom, not squash), then LANCZOS to the exact size. A
+    no-op when the tier already produced the requested pixels, so the common
+    2048x2048 case keeps the upstream bytes untouched.
+    """
+    try:
+        im = Image.open(io.BytesIO(media))
+        im.load()
+    except Exception as exc:  # noqa: BLE001 - never fail a paid generation here
+        log.warning("exact-size fit skipped (undecodable %d bytes): %s",
+                    len(media), exc)
+        return media
+    if im.size == (width, height):
+        return media
+    target = width / height
+    current = im.width / im.height
+    if abs(current - target) > 1e-6:
+        if current > target:
+            keep = max(1, round(im.height * target))
+            left = (im.width - keep) // 2
+            im = im.crop((left, 0, left + keep, im.height))
+        else:
+            keep = max(1, round(im.width / target))
+            top = (im.height - keep) // 2
+            im = im.crop((0, top, im.width, top + keep))
+    if im.size != (width, height):
+        im = im.resize((width, height), Image.LANCZOS)
+    if im.mode not in ("RGB", "RGBA", "L"):
+        im = im.convert("RGB")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _fetch_url_bytes(url: str, timeout: float = 120.0) -> bytes:
+    """Blocking download for COS signed URLs (call via asyncio.to_thread)."""
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return r.read()
+
+
+async def _bridge_upscale(token: str, media: bytes, magnify: int,
+                          target_size: tuple[int, int] | None = None,
+                          ) -> tuple[bytes | None, str]:
     """4k/8k 复合的超分段：CI 同步优先，MPS 异步任务兜底（同 _composite_step）。"""
     # COMPOSITE_TIERS 的值是 float（2.0 / 4.0），直接拼进 URL 会变成
     # `magnify=2.0`，数据万象判 InvalidArgument "param magnify invalid"
@@ -218,21 +367,39 @@ async def _bridge_upscale(token: str, media: bytes, magnify: int) -> tuple[bytes
     await mps.upload_to_cos(media, ikey)
     try:
         up = await mps.ci_super_resolve_cos(ikey, magnify=magnify, data=media)
-        # CI 输出格式跟随输入（超预算的 2k 输入必被压成 JPEG），key 必须
-        # 与内容一致，否则 COS 按扩展名回 image/png 而体是 JPEG。
-        okey = f"results/{token[:16]}.{mps.image_ext(up)}"
+        if target_size:
+            # CI 输出被裁到精确尺寸后一律是 PNG，key 必须跟着变。
+            up = await asyncio.to_thread(_fit_exact, up, *target_size)
+            okey = f"results/{token[:16]}-{target_size[0]}x{target_size[1]}.png"
+        else:
+            # CI 输出格式跟随输入（超预算的 2k 输入必被压成 JPEG），key 必须
+            # 与内容一致，否则 COS 按扩展名回 image/png 而体是 JPEG。
+            okey = f"results/{token[:16]}.{mps.image_ext(up)}"
         await mps.upload_to_cos(up, okey)
         return up, mps.cos_presigned_get("/" + okey, ttl_s=86400)
     except mps.MPSError as exc:
         log.warning("bridge CI upscale failed, MPS task fallback: %s", exc)
     task_id = await mps.submit_cos(ikey, percent=float(magnify))
-    return None, await mps.wait_done(task_id)
+    url = await mps.wait_done(task_id)
+    if target_size:
+        # 异步 MPS 只回 COS 链接；精确尺寸必须落地成本地字节再转存。
+        try:
+            raw = await asyncio.to_thread(_fetch_url_bytes, url)
+        except Exception as exc:  # noqa: BLE001 - 保留可用的放大结果
+            log.warning("exact-size fit skipped for MPS url: %s", exc)
+            return None, url
+        fitted = await asyncio.to_thread(_fit_exact, raw, *target_size)
+        okey = f"results/{token[:16]}-{target_size[0]}x{target_size[1]}.png"
+        await mps.upload_to_cos(fitted, okey)
+        return fitted, mps.cos_presigned_get("/" + okey, ttl_s=86400)
+    return None, url
 
 
 async def _bridge_run(token: str, image_png: bytes, prompt: str, boxes: list[dict],
                       aspect_ratio: str, resolution: str, mode: str,
                       reference_images: list[tuple[bytes, str]] | None,
-                      magnify: int | None, proxy_sample: str) -> None:
+                      magnify: int | None, proxy_sample: str,
+                      target_size: tuple[int, int] | None = None) -> None:
     """后台跑 sidecar 生成，终态写进 bridge:{token}（get_result 消费）。
 
     多图归一化与 server.run_job 一致：canvas 与 references 互斥（上游
@@ -248,14 +415,22 @@ async def _bridge_run(token: str, image_png: bytes, prompt: str, boxes: list[dic
         # 同一套上传预算（桥也直连 sidecar，不走 upstream 的 normalize）
         fit_main, fit_refs = payload_mod.fit_body_budget(
             image_png or b"", [b for b, _ in (reference_images or [])])
-        media = await browser_egress_client.generate(
+        # server.py injects its pool-aware wrapper: native requests must lease
+        # a 2090 slot like every other door, otherwise they are stuck on the
+        # 32 sidecar pages and burn them (429) while 410 slots sit idle
+        # (2026-11-27: three 2048 probes all hit "today's 30 free generations").
+        generate = _BROWSER_GENERATE or browser_egress_client.generate
+        media = await generate(
             image_png=fit_main, prompt=prompt, aspect_ratio=aspect_ratio,
             resolution=gen_resolution, mode=mode,
             boxes_json=json.dumps(boxes) if boxes else None,
             refs=fit_refs)
         sample: str | None = None
         if magnify:
-            media, sample = await _bridge_upscale(token, media, magnify)
+            media, sample = await _bridge_upscale(token, media, magnify,
+                                                  target_size)
+        if target_size and media is not None and sample is None:
+            media = await asyncio.to_thread(_fit_exact, media, *target_size)
         if sample is None:
             if mps.configured():
                 okey = f"results/{token[:16]}.png"
@@ -291,24 +466,6 @@ def register(app: FastAPI) -> None:
                 content={"detail": [{"loc": ["body", "prompt"],
                                      "msg": "Field required"}]},
             )
-        resolution = payload.get("resolution") or "1k"
-        if resolution not in RESOLUTIONS and resolution not in COMPOSITE_TIERS:
-            return JSONResponse(
-                status_code=422,
-                content={"detail": [{"loc": ["body", "resolution"],
-                                     "msg": f"must be one of {sorted(set(RESOLUTIONS) | set(COMPOSITE_TIERS))}"}]},
-            )
-        if resolution in COMPOSITE_TIERS and not mps.configured():
-            # Guard BEFORE any reference processing or submission: 4k/8k are
-            # composites (2k generation + MPS x2/x4); without MPS they would
-            # otherwise spend a generation and fail afterwards.
-            return JSONResponse(
-                status_code=503,
-                content={"detail":
-                         "resolution 4k/8k requires MPS super-resolution "
-                         "(MPS_SECRET_ID / MPS_SECRET_KEY not configured)"},
-            )
-
         images = payload.get("images")
         if images is None:
             refs = []
@@ -344,6 +501,51 @@ def register(app: FastAPI) -> None:
                                      "msg": f"at most {MAX_IMAGES} images "
                                             f"(uploads included)"}]},
             )
+
+        # width/height (official contract since 2026-10-22) override
+        # resolution and aspect_ratio. Validate AFTER upload handles so the
+        # 4 MP reference budget counts every image that will ride upstream.
+        try:
+            target_size = _parse_exact_size(payload, has_refs=bool(refs))
+        except _SizeError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": [{"loc": ["body", exc.field],
+                                     "msg": exc.message}]},
+            )
+        if target_size:
+            aspect_ratio = _aspect_for_size(*target_size)
+            resolution, magnify = _tier_for_exact(*target_size)
+            if magnify and not mps.configured():
+                # Same guard as resolution 4k/8k: reject before any generation.
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail":
+                             f"exact size {target_size[0]}x{target_size[1]} "
+                             "exceeds the 2k anonymous ceiling and requires MPS "
+                             "super-resolution (MPS_SECRET_ID / "
+                             "MPS_SECRET_KEY not configured)"},
+                )
+        else:
+            resolution = payload.get("resolution") or "1k"
+            if resolution not in RESOLUTIONS and resolution not in COMPOSITE_TIERS:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": [{"loc": ["body", "resolution"],
+                                         "msg": f"must be one of {sorted(set(RESOLUTIONS) | set(COMPOSITE_TIERS))}"}]},
+                )
+            if resolution in COMPOSITE_TIERS and not mps.configured():
+                # Guard BEFORE any reference processing or submission: 4k/8k
+                # are composites (2k generation + MPS x2/x4); without MPS they
+                # would otherwise spend a generation and fail afterwards.
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail":
+                             "resolution 4k/8k requires MPS super-resolution "
+                             "(MPS_SECRET_ID / MPS_SECRET_KEY not configured)"},
+                )
+            magnify = COMPOSITE_TIERS.get(resolution)
+            aspect_ratio = str(payload.get("aspect_ratio") or "auto")
 
         boxes_raw = payload.get("bounding_boxes")
         try:
@@ -388,12 +590,13 @@ def register(app: FastAPI) -> None:
             proxy_base = PUBLIC_BASE or str(request.base_url).rstrip("/")
             task = asyncio.create_task(_bridge_run(
                 token, png or b"", prompt, boxes,
-                str(payload.get("aspect_ratio") or "auto"),
+                aspect_ratio,
                 "2k" if resolution in COMPOSITE_TIERS else resolution,
                 "i2i" if png else "t2i",
                 reference_images or None,
-                COMPOSITE_TIERS.get(resolution),
-                f"{proxy_base}/v1/flux3-image/results/{token}"))
+                magnify,
+                f"{proxy_base}/v1/flux3-image/results/{token}",
+                target_size))
             _BRIDGE_TASKS.add(task)
             task.add_done_callback(_BRIDGE_TASKS.discard)
             # 🔴 必须用 PUBLIC_BASE：nginx 反代下 request.base_url 是 http，
@@ -418,13 +621,22 @@ def register(app: FastAPI) -> None:
                     image_png=png,
                     prompt=prompt,
                     boxes=boxes,
-                    aspect_ratio=str(payload.get("aspect_ratio") or "auto"),
+                    aspect_ratio=aspect_ratio,
                     resolution=gen_resolution,
                     mode="i2i",
                     reference_images=reference_images or None,
                 )
                 if resolution in COMPOSITE_TIERS:
-                    await store.put(f"comp:{poll_token}", {"phase": "gen", "target": resolution}, ttl_s=_COMP_TTL)
+                    await store.put(f"comp:{poll_token}", {
+                        "phase": "gen", "target": resolution,
+                        "target_size": list(target_size) if target_size else None,
+                    }, ttl_s=_COMP_TTL)
+                elif target_size:
+                    # No sidecar: the tier output is persisted in get_result,
+                    # which is where the exact-size fit happens.
+                    await store.put(f"exact:{poll_token}",
+                                    {"w": target_size[0], "h": target_size[1]},
+                                    ttl_s=_COMP_TTL)
             else:
                 # text-to-image: verified 2026-10-09 (mode t2i, no image part,
                 # explicit aspect ratio -- "auto" is canvas-only semantics).
@@ -435,12 +647,19 @@ def register(app: FastAPI) -> None:
                     image_png=b"",
                     prompt=prompt,
                     boxes=boxes,
-                    aspect_ratio=str(payload.get("aspect_ratio") or "auto"),
+                    aspect_ratio=aspect_ratio,
                     resolution="2k" if resolution in COMPOSITE_TIERS else resolution,
                     mode="t2i",
                 )
                 if resolution in COMPOSITE_TIERS:
-                    await store.put(f"comp:{poll_token}", {"phase": "gen", "target": resolution}, ttl_s=_COMP_TTL)
+                    await store.put(f"comp:{poll_token}", {
+                        "phase": "gen", "target": resolution,
+                        "target_size": list(target_size) if target_size else None,
+                    }, ttl_s=_COMP_TTL)
+                elif target_size:
+                    await store.put(f"exact:{poll_token}",
+                                    {"w": target_size[0], "h": target_size[1]},
+                                    ttl_s=_COMP_TTL)
         except upstream.UpstreamError as exc:
             return _upstream_502(exc.message)
 
@@ -532,8 +751,14 @@ def register(app: FastAPI) -> None:
             # 失效；COS 凭证在 ⇒ 首次 Ready 时转存并回 24h 预签名链（幂等，
             # persisted_url 缓存在 state 里）。无凭证时退回代理链接。
             if not state.get("persisted_url"):
+                # 直连路径的精确尺寸：提交时记了 exact:{pollToken}，首次
+                # Ready 转存前再裁切，桥路径已在 _bridge_run 内完成同一件事。
+                exact = await store.get(f"exact:{id}")
                 if mps.configured():
                     media = await upstream.fetch_media(state["imageToken"])
+                    if exact:
+                        media = await asyncio.to_thread(
+                            _fit_exact, media, int(exact["w"]), int(exact["h"]))
                     key = f"results/{state['imageToken'][:16]}.png"
                     log.info("persist plain ready token=%s %d bytes",
                              state["imageToken"][:16], len(media))
@@ -541,6 +766,13 @@ def register(app: FastAPI) -> None:
                     state["persisted_url"] = mps.cos_presigned_get(
                         "/" + key, ttl_s=86400)
                 else:
+                    if exact:
+                        media = await upstream.fetch_media(state["imageToken"])
+                        media = await asyncio.to_thread(
+                            _fit_exact, media, int(exact["w"]), int(exact["h"]))
+                        await store.put_blob(
+                            f"bridge_bytes:{state['imageToken']}", media,
+                            ttl_s=3600)
                     # PUBLIC_BASE 优先：nginx 后面 request.base_url 会是 http，
                     # 交给调用方一个 http 链接会在 :80 吃 301（矩阵测试实测）。
                     base = PUBLIC_BASE or str(request.base_url).rstrip("/")
@@ -591,7 +823,14 @@ def register(app: FastAPI) -> None:
                 try:
                     up_bytes = await mps.ci_super_resolve_cos(
                         key, magnify=magnify, data=media)
-                    out_key = f"results/{token[:16]}.{mps.image_ext(up_bytes)}"
+                    target = composite.get("target_size")
+                    if target:
+                        up_bytes = await asyncio.to_thread(
+                            _fit_exact, up_bytes, *target)
+                        out_key = (f"results/{token[:16]}"
+                                   f"-{target[0]}x{target[1]}.png")
+                    else:
+                        out_key = f"results/{token[:16]}.{mps.image_ext(up_bytes)}"
                     await mps.upload_to_cos(up_bytes, out_key)
                     await store.drop(f"comp:{token}")
                     log.info("composite done (CI sync) token=%s %d bytes",
@@ -634,8 +873,20 @@ def register(app: FastAPI) -> None:
             out["details"] = {"error": state["error"]}
             return JSONResponse(out)
         log.info("composite done token=%s url=%s", token[:16], state["url"][:70])
+        sample = state["url"]
+        target = composite.get("target_size")
+        if target:
+            # 异步 MPS 只回 COS 链接；精确尺寸必须落地成本地字节再转存。
+            try:
+                raw = await asyncio.to_thread(_fetch_url_bytes, sample)
+                fitted = await asyncio.to_thread(_fit_exact, raw, *target)
+                out_key = f"results/{token[:16]}-{target[0]}x{target[1]}.png"
+                await mps.upload_to_cos(fitted, out_key)
+                sample = mps.cos_presigned_get("/" + out_key, ttl_s=86400)
+            except Exception as exc:  # noqa: BLE001 - 保留可用的放大结果
+                log.warning("exact-size fit skipped for composite url: %s", exc)
         out["status"] = "Ready"
-        out["result"] = {"sample": state["url"]}
+        out["result"] = {"sample": sample}
         return JSONResponse(out)
 
     @app.get("/v1/flux3-image/results/{image_token}")

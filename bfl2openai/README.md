@@ -79,6 +79,8 @@ MPS `ProcessImage`（COS 输入，Type=ultra，percent ×2/×4）→ `DescribeIm
 
 ```
 POST /v1/flux-3-image        官方 JSON：prompt*、images(string|[string]，URL/base64，≤10)、
+                             width/height(精确像素，[256,6256]；t2i ≤16.8MP、
+                               带参考图 ≤4MP；必须成对，覆盖 resolution/aspect_ratio)、
                              aspect_ratio(auto)、resolution(见上表，默认 1k)、
                              safety_tolerance/grounding/version(接受即丢弃，上游无对应旋钮)、
                              bounding_boxes(扩展：[{"id","bbox":[x1,y1,x2,y2],"desc"}]，0~1000 坐标，
@@ -104,6 +106,11 @@ POST /v1/flux3-image/upscale 同步超分：{"image":"<公网URL或imageToken>",
   `bounding_boxes` 扩展字段才走 Playground 的区域指令通道（每区域独立 instruction）。
 - **webhook 不支持**（仅轮询）；`images` 的 URL 输入由本服务代为下载。
 - t2i（无 `images`）按 `mode=t2i` 提交上游，2026-11-05 公网实测已出图。
+- **`width/height` 的落地方式**：Playground 上游只有「档位 + 比例」，没有精确宽高旋钮。
+  本服务按「能覆盖目标长边的最小档位 + 最近合法比例」提交，拿到图后先 cover-crop
+  到目标比例、再 LANCZOS 到精确像素（`2048×2048` 正好落在 2k/1:1，**不做任何重编码**）。
+  长边 >2048 走 2k 生成 + MPS ×2/×4 复合，再裁到精确尺寸；MPS 未配置时在生成前
+  返回 503。像素契约与官方一致，但非档位尺寸是「生成后裁切」，不是模型原生按该像素生成。
 
 ### curl 示例
 

@@ -104,6 +104,18 @@ def _nearest_ratio(ratio: float) -> str:
     return "auto"
 
 
+def nearest_ratio(ratio: float) -> str:
+    """最接近的合法枚举，**不设偏离上限**。
+
+    `_nearest_ratio` 的 12% 截断是给 OpenAI `size` 用的：比例不可映射时
+    交回 ``auto``（由画布决定）。原生 `width/height` 不能这样——调用方
+    给的是精确像素，``auto`` 在 t2i 下会塌成 1:1，等于把 21:9 请求静默
+    改成方图（2026-11-27 实测）。这里永远返回一个确定的枚举，剩余误差
+    由 `native._fit_exact` 的 cover-crop 吸收。
+    """
+    return min(_COMMON_RATIOS, key=lambda kv: abs(kv[1] - ratio))[0]
+
+
 #: 客户端实际出现过的分隔符：ASCII x、Unicode ×、乘号 *、比例冒号。
 #: 统一成一个入口解析，避免某一种写法静默落到 auto。
 _SIZE_SEPARATORS = ("x", "×", "*", ":")

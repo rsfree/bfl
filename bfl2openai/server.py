@@ -1446,3 +1446,9 @@ async def image_result(image_token: str, request: Request):
     except UpstreamError as exc:
         return wrap_upstream_error(exc)
     return Response(content=media, media_type="image/png")
+
+
+# Native `/v1/flux-3-image` must use the same 2090 slot pool as this module's
+# own doors: the plain sidecar client has no lease, no n403 accounting and no
+# 403/429 rotation. Injected at import time (native -> server would be a cycle).
+native.set_browser_generate(_browser_generate)
