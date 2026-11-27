@@ -26,12 +26,13 @@ x-egress: &egress
     options:
       max-size: "50m"
       max-file: "2"
-  mem_limit: 4g                      # 上限，不是占用。2026-11-18 实测 12 页 RSS
-                                     # 2.4–2.8G（chromium 多进程合计），留 1.2G 余量。
-                                     # 🔴 三台 4g + app 5g = 17G > 15.6G 物理，原来那行
-                                     # "9G+4G+0.5G=13.5G 不超卖"从页面数改成 12 起就失效。
-                                     # 实际合计约 9G 打不满；真同时暴涨先撞 cgroup 限额
-                                     # （容器 OOMKilled），不会拖垮宿主机。
+  mem_limit: 8g                      # 上限，不是占用。2026-11-25 实测 9 页 RSS 2.3–3.6G
+                                     # （chromium 多进程合计），原 4g 限额已用到 90%，
+                                     # 离 OOMKill 只差一张大图。core-2 物理 249G，
+                                     # 三台 8g + app 5g = 29G，不构成超卖。
+                                     # 注意：memory-swap 与 mem_limit 同为 8g ⇒ 不启用 swap，
+                                     # 触顶直接 OOMKill，不会用换页拖慢整池。
+                                     # 注：node-10（15.6G）仍用 4g，勿照抄。
   cpus: 6                            # 这不是"预留"，是单台上限。稳态一台只用 0.1–0.3 核，
                                      # 只有冷启动预热 12 页时才逼近 6 核。三台同时预热 =
                                      # 18 核抢 8 核（2026-11-18 事故形态，load 22.9），
@@ -41,17 +42,20 @@ x-egress: &egress
     interval: 30s
     timeout: 10s
     retries: 3
-    start_period: 180s                # 9 页分 3 片加载 + 预热生成需要时间
+    start_period: 240s                # 11 页分 3 片加载 + 预热生成需要时间
 
 x-egress-env: &egress-env
-  BFL2OPENAI_EGRESS_PAGES: "9"               # 页面池大小（每页=独立出口 IP）。
-                                             # 12→9：分片后每片多一份 Chromium 固定开销
-                                             # （主进程+zygote+gpu ≈150–200MB），12 页 × 3 片
-                                             # 会把 4G 限额推到 ~86%，必须回到安全水位。
+  BFL2OPENAI_EGRESS_PAGES: "11"              # 页面池大小（每页=独立出口 IP）。
+                                             # 2026-11-25：27→32 页（11/11/10）。原 9 页是
+                                             # 为 4G 限额压的；core-2 已把限额提到 8G，
+                                             # 11 页实测约 3.4–4.4G，且 CPU 只用 3–4/32 核。
+                                             # 分片后每片多一份 Chromium 固定开销
+                                             # （主进程+zygote+gpu ≈150–200MB）。
   BFL2OPENAI_EGRESS_SHARDS: "3"              # 每 3 页一个独立 Chromium。内存到水位只重建一片
                                              # ⇒ 容量瞬时降 1/3，池子不归零。整池重启的代价是
                                              # 该实例 40 秒零出口（14:13–14:15 全站 502 33 次）。
-  BFL2OPENAI_EGRESS_MAX_INFLIGHT: "20"       # 全局并发闸门（9 页 → 每页 cap 2.2）
+  BFL2OPENAI_EGRESS_MAX_INFLIGHT: "20"       # 全局并发闸门（11 页 → 每页 cap 1.8；
+                                             # 只做兜底，入口闸门 32 才是主限流）
   BFL2OPENAI_EGRESS_MAX_REQ_PER_CTX: "25"    # 单会话 25 次后换 IP/新 cookie（pin 模式下不生效）
   BFL2OPENAI_EGRESS_RELOAD_EVERY: "8"        # 单页累计 8 次提交后原地 reload：不换 context、
                                              # 不换 IP，只重载文档以清空 V8 堆。MEDIA_JS 每次
@@ -69,6 +73,12 @@ x-egress-env: &egress-env
   # ── 2090 pin 模式：账号=槽位 → 固定出口 IP ──────────────────────────
   # 不配这三个变量就是历史行为（2088 逐连接轮换），可作为一键回滚开关。
   # 槽位数 0 = 关闭。凭证只从 .env 注入，绝不写进本文件。
+  # 🔴 POOL_HOST 生产必须写**前置机 IP**，不要写域名：2090 的选路是
+  #    crc32(用户名) % 节点数，节点清单因前置机而异 —— 域名一漂，全池
+  #    588 个 slot 的出口 IP 静默重排，而 used/quota 是按 IP 记账的。
+  #    2026-11-27 实测：同名 poolclient-441 在 172.96.142.53 是
+  #    154.44.25.169，在 137.175.102.252 是 154.44.25.43。
+  #    换前置机 = 整池切换 + 重扫槽位表，不是改一条 DNS 的事。
   BFL2OPENAI_POOL_HOST: "${BFL2OPENAI_POOL_HOST:-}"
   BFL2OPENAI_POOL_PORT: "${BFL2OPENAI_POOL_PORT:-2090}"
   BFL2OPENAI_POOL_PASS: "${BFL2OPENAI_POOL_PASS:-}"
@@ -159,13 +169,15 @@ services:
       BFL2OPENAI_SLOT_ATTEMPTS: "${BFL2OPENAI_SLOT_ATTEMPTS:-6}"
       BFL2OPENAI_POOL_PREBIND: "${BFL2OPENAI_POOL_PREBIND:-1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36}"
       BFL2OPENAI_POOL_REBIND_SETTLE: "${BFL2OPENAI_POOL_REBIND_SETTLE:-3.0}"
-      # ---- 稳定性（2026-11-21）----
-      # 入口并发闸门：跨 worker 的在途生成数上限。实测 26 在途时宿主
-      # load 44（8 核），rebind 开始成批超时；但阈值压到 18 会在高峰期把
-      # 大量正常请求打成 429（请求日志回放：入口并发常驻 25~30，含 follower）。
-      # 24 只在真正越过实测水位时削峰；rebind/5xx 持续时再降到 20。
+      # ---- 稳定性（2026-11-21，2026-11-25 调整）----
+      # 入口并发闸门：跨 worker 的在途生成数上限（weight=出图数，1 单 1 格）。
+      # 它罩的是「页面占用」：3 台 sidecar × 11/11/10 = 32 页，闸门取 32 正好
+      # 一一对应 —— 32 以内每个请求都有页可用，第 33 个立即 429（Retry-After 5），
+      # 不排队。取值再高只会把快拒变成排队，吞吐不变（Little's law）。
+      # 历史：24 是 8 核/27 页时压出来的；那时 26 在途 load 44、rebind 成批超时。
+      # 换到 core-2（32 核）后 5xx 已降到 0.2%，闸门随页数放到 32。
       # 0 = 关闭（回滚开关）。
-      BFL2OPENAI_GATE_LIMIT: "${BFL2OPENAI_GATE_LIMIT:-24}"
+      BFL2OPENAI_GATE_LIMIT: "${BFL2OPENAI_GATE_LIMIT:-32}"
       # 单笔墙钟预算：必须小于 nginx proxy_read_timeout(300s) 与 gunicorn
       # timeout(300s)。超预算主动回 504 JSON，而不是被 nginx 掐成 HTML。
       BFL2OPENAI_JOB_BUDGET_S: "${BFL2OPENAI_JOB_BUDGET_S:-240}"
@@ -273,6 +285,7 @@ services:
         ipv4_address: 172.19.0.12
     environment:
       BFL2OPENAI_POOL_PREBIND_OFFSET: "2"
+      BFL2OPENAI_EGRESS_PAGES: "10"     # 11+11+10=32，避开 3 的整倍数让三片页数均衡
       <<: *egress-env
 
 # 复用已存在的项目网络：external 方式避免 compose 重建网络（重建会连带重启应用）。

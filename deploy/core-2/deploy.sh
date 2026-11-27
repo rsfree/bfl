@@ -15,7 +15,7 @@
 #   队列 39），期间 watchdog 还会把"慢启动"的实例判死再来一轮重启。
 #   现在一次只换一台，等 pages_ready 补齐再下一台：同一时刻最多 12 页
 #   在预热，峰值从 ~8 核降到 ~2.7 核。
-#   三台是静态 IP（172.18.0.10/11/12）+ external 网络，重建不会漂 IP。
+#   三台是静态 IP（172.19.0.10/11/12）+ external 网络，重建不会漂 IP。
 #
 # 用法: ./deploy.sh <image-tag>            例: ./deploy.sh 0.2.99
 #       STRATEGY=all ./deploy.sh <tag>     回到一次性全量重建（紧急修复用）
@@ -58,7 +58,7 @@ elif [ "$STRATEGY" = "rolling" ]; then
   ssh "$JUMP" "ssh $HOST bash -s" <<EOF
 set -u
 cd $DIR
-for pair in bfl-browser-egress:172.18.0.10 bfl-browser-egress-2:172.18.0.11 bfl-browser-egress-3:172.18.0.12; do
+for pair in bfl-browser-egress:172.19.0.10 bfl-browser-egress-2:172.19.0.11 bfl-browser-egress-3:172.19.0.12; do
   svc=\${pair%%:*}; ip=\${pair##*:}
   if ! docker compose up -d --no-deps "\$svc" >/dev/null 2>&1; then
     echo "    \$svc 重建失败，中止（其余实例保持原版本）"

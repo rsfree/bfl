@@ -171,6 +171,13 @@ services:
       BFL2OPENAI_JOB_BUDGET_S: "${BFL2OPENAI_JOB_BUDGET_S:-240}"
       # rebind 超时 / sidecar 500 / 传输超时的换槽重试次数（每次可能几十秒）。
       BFL2OPENAI_TRANSIENT_ATTEMPTS: "${BFL2OPENAI_TRANSIENT_ATTEMPTS:-2}"
+      # rebind 超时的槽位冷却（2026-11-23）：此前失败只记数、不参与调度，
+      # 坏链路每次都会被重新选中并重花一个 60s 的 rebind 超时。base 起指数
+      # 翻倍，封顶 1h；成功出图即清零档位。base=0 即关闭（回滚开关）。
+      BFL2OPENAI_POOL_FAIL_COOLDOWN_BASE: "${BFL2OPENAI_POOL_FAIL_COOLDOWN_BASE:-180}"
+      BFL2OPENAI_POOL_FAIL_COOLDOWN_MAX: "${BFL2OPENAI_POOL_FAIL_COOLDOWN_MAX:-3600}"
+      # 距上次失败超过该窗口 ⇒ 视为新一轮连续失败，退避从头算。
+      BFL2OPENAI_POOL_FAIL_RESET: "${BFL2OPENAI_POOL_FAIL_RESET:-3600}"
       # 槽位表定时重建：IP 是租来的会漂，旧表放三天等于拿失效出口继续打。
       # 0 = 关闭；首次扫描至少等 STARTUP_DELAY 秒，避免部署瞬间抢 CPU。
       BFL2OPENAI_POOL_SCAN_INTERVAL: "${BFL2OPENAI_POOL_SCAN_INTERVAL:-43200}"
