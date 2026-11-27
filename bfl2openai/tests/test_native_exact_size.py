@@ -234,6 +234,30 @@ def test_exact_above_2k_requires_mps(client, bridge):
     assert bridge == {}
 
 
+def test_server_wires_pool_generator_into_native():
+    """server.py 必须在 import 时把池化生成器注入 native（否则 403/429 无换槽）。"""
+    assert native._BROWSER_GENERATE is server._browser_generate
+
+
+def test_bridge_uses_injected_generator(client, monkeypatch):
+    monkeypatch.setattr(bec, "configured", lambda: True)
+    monkeypatch.setattr(native.mps, "configured", lambda: False)
+    seen: dict = {}
+
+    async def fake_generate(**kwargs):
+        seen.update(kwargs)
+        return _PNG
+
+    monkeypatch.setattr(native, "_BROWSER_GENERATE", fake_generate)
+    r = client.post("/v1/flux-3-image",
+                    json={"prompt": "x", "width": 512, "height": 512})
+    assert r.status_code == 200, r.text
+    body = _poll(client, r.json()["id"])
+    assert body["status"] == "Ready", body
+    assert seen["resolution"] == "768sq"
+    assert seen["aspect_ratio"] == "1:1"
+
+
 def test_exact_above_2k_fits_upgraded_bytes(client, bridge, monkeypatch):
     monkeypatch.setattr(native.mps, "configured", lambda: True)
     uploaded: list[str] = []

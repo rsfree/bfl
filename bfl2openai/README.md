@@ -73,7 +73,8 @@ MPS `ProcessImage`（COS 输入，Type=ultra，percent ×2/×4）→ `DescribeIm
 
 > **2026-10-26 起走「异步桥」**：上游封 curl_cffi 指纹后，原生方言若直连必 403=>502。
 > 现在 sidecar 在位时，`/v1/flux-3-image` 受理即回 `{id, polling_url}`，生成在后台任务里
-> 跑浏览器出口（20-30s），`/v1/get_result` 只读任务状态（Generating/Ready/Error），
+> **经 2090 槽位池**跑浏览器出口（20-30s；403/429 换槽，与 `/v1/images/*` 同一套账本），
+> `/v1/get_result` 只读任务状态（Generating/Ready/Error），
 > Ready 的 `result.sample` 是 24h COS 预签名链（无 COS 时是本服务代理链）。
 > 4k/8k 复合同样在后台任务里完成（2k 生成 + CI/MPS 超分）。sidecar 不在才回落直连。
 
